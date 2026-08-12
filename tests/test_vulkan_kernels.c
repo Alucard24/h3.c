@@ -3,11 +3,13 @@
  * device is available. */
 #include "h3_gpu.h"
 
+#include <fcntl.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int tests_run;
 static int failed;
@@ -1727,6 +1729,45 @@ static void test_token_pool_adaln(h3_gpu *gpu) {
     h3_gpu_tensor_free(base);
 }
 
+static void test_device_local_load(h3_gpu *gpu) {
+    /* Weight tensors are loaded into device-local memory through staging;
+     * verify a kernel can consume them and the readback round-trips. */
+    enum { N = 4096 };
+    uint16_t data[N], expected[N];
+    for (size_t index = 0; index < N; index++) {
+        data[index] = bf16_bits((float)(sin((double)index * 0.21) * 1.5));
+        expected[index] = bf16_bits(bf16_value(data[index]) +
+                                     bf16_value(data[index]));
+    }
+    char path[] = "/tmp/h3-vk-device-local-XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        CHECK(write(fd, data, sizeof(data)) == (ssize_t)sizeof(data));
+        close(fd);
+        h3_gpu_tensor *w = h3_gpu_tensor_load_bf16(gpu, path, 0, N);
+        h3_gpu_tensor *in = h3_gpu_tensor_from_bf16(gpu, data, N);
+        h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, N);
+        CHECK(w && in && out);
+        if (!failed) {
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_add_bf16(gpu, out, w, in, N) == 0);
+            CHECK(h3_gpu_submit(gpu) == 0);
+            uint16_t got[N];
+            CHECK(h3_gpu_tensor_read_bf16(out, got, N) == 0);
+            CHECK(memcmp(got, expected, sizeof(got)) == 0);
+            /* device-local readback */
+            uint16_t wgot[N];
+            CHECK(h3_gpu_tensor_read_bf16(w, wgot, N) == 0);
+            CHECK(memcmp(wgot, data, sizeof(wgot)) == 0);
+        }
+        h3_gpu_tensor_free(w);
+        h3_gpu_tensor_free(in);
+        h3_gpu_tensor_free(out);
+        unlink(path);
+    }
+}
+
 static void test_continue_chain(h3_gpu *gpu) {
     /* Two command buffers chained without a wait must preserve order:
      * add, then silu of the add result, all inside one begin/submit. */
@@ -1796,6 +1837,7 @@ int main(int argc, char **argv) {
     test_patch_linear_map_bf16(gpu);
     test_token_pool_expand(gpu);
     test_token_pool_adaln(gpu);
+    test_device_local_load(gpu);
     test_continue_chain(gpu);
     h3_gpu_free(gpu);
     if (failed) {

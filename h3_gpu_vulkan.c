@@ -173,6 +173,9 @@ struct h3_gpu_tensor {
     size_t elements;
     h3_gpu_dtype dtype;
     size_t byte_size;
+    /* Device-local buffers (weights) have no host mapping; transfers go
+     * through staging copies. */
+    int device_local;
 };
 
 static double h3_vk_now(void) {
@@ -790,8 +793,18 @@ const char *h3_gpu_error(const h3_gpu *gpu) {
 
 /* ---------------------------------------------------------------- tensors */
 
+static h3_gpu_tensor *h3_vk_tensor_new_mem(h3_gpu *gpu, size_t elements,
+                                           h3_gpu_dtype dtype,
+                                           int device_local);
+
 static h3_gpu_tensor *h3_vk_tensor_new(h3_gpu *gpu, size_t elements,
                                        h3_gpu_dtype dtype) {
+    return h3_vk_tensor_new_mem(gpu, elements, dtype, 0);
+}
+
+static h3_gpu_tensor *h3_vk_tensor_new_mem(h3_gpu *gpu, size_t elements,
+                                           h3_gpu_dtype dtype,
+                                           int device_local) {
     size_t dtype_size = h3_vk_dtype_size(dtype);
     size_t byte_size = dtype_size ? elements * dtype_size : 0;
     if (elements && !byte_size) {
@@ -806,7 +819,9 @@ static h3_gpu_tensor *h3_vk_tensor_new(h3_gpu *gpu, size_t elements,
     VkBufferCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = byte_size,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT
     };
     if (byte_size > 0 &&
         vkCreateBuffer(gpu->device, &info, NULL, &tensor->buffer) !=
@@ -825,14 +840,15 @@ static h3_gpu_tensor *h3_vk_tensor_new(h3_gpu *gpu, size_t elements,
         };
         VkPhysicalDeviceMemoryProperties properties;
         vkGetPhysicalDeviceMemoryProperties(gpu->physical, &properties);
+        VkMemoryPropertyFlags wanted = device_local ?
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT :
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         int found = 0;
         for (uint32_t index = 0; index < properties.memoryTypeCount; index++) {
             if ((requirements.memoryTypeBits & (1u << index)) &&
-                (properties.memoryTypes[index].propertyFlags &
-                 (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
-                    (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                (properties.memoryTypes[index].propertyFlags & wanted) ==
+                    wanted) {
                 memory_info.memoryTypeIndex = index;
                 found = 1;
                 break;
@@ -843,8 +859,9 @@ static h3_gpu_tensor *h3_vk_tensor_new(h3_gpu *gpu, size_t elements,
                              &tensor->memory) != VK_SUCCESS ||
             vkBindBufferMemory(gpu->device, tensor->buffer, tensor->memory,
                                0) != VK_SUCCESS ||
-            vkMapMemory(gpu->device, tensor->memory, 0, VK_WHOLE_SIZE, 0,
-                        &tensor->mapped) != VK_SUCCESS) {
+            (!device_local &&
+             vkMapMemory(gpu->device, tensor->memory, 0, VK_WHOLE_SIZE, 0,
+                         &tensor->mapped) != VK_SUCCESS)) {
             h3_vk_set_error(gpu, "tensor memory setup failed");
             if (tensor->buffer)
                 vkDestroyBuffer(gpu->device, tensor->buffer, NULL);
@@ -856,12 +873,107 @@ static h3_gpu_tensor *h3_vk_tensor_new(h3_gpu *gpu, size_t elements,
     tensor->dtype = dtype;
     tensor->byte_size = byte_size;
     tensor->gpu = gpu;
+    tensor->device_local = device_local;
     gpu->stats.tensor_allocations++;
     gpu->stats.allocated_bytes += byte_size;
     gpu->stats.live_bytes += byte_size;
     if (gpu->stats.live_bytes > gpu->stats.peak_live_bytes)
         gpu->stats.peak_live_bytes = gpu->stats.live_bytes;
     return tensor;
+}
+
+/* One-shot staging transfer through a dedicated command buffer. */
+static int h3_vk_staging_copy(h3_gpu *gpu, VkBuffer destination,
+                              VkBuffer source, VkDeviceSize bytes) {
+    VkCommandBufferAllocateInfo alloc = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = gpu->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+    VkCommandBuffer command;
+    if (vkAllocateCommandBuffers(gpu->device, &alloc, &command) !=
+        VK_SUCCESS) {
+        h3_vk_set_error(gpu, "staging: vkAllocateCommandBuffers failed");
+        return -1;
+    }
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    VkBufferCopy region = { .srcOffset = 0, .dstOffset = 0, .size = bytes };
+    vkBeginCommandBuffer(command, &begin);
+    vkCmdCopyBuffer(command, source, destination, 1, &region);
+    vkEndCommandBuffer(command);
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &command
+    };
+    int ok = vkQueueSubmit(gpu->queue, 1, &submit, VK_NULL_HANDLE) ==
+                 VK_SUCCESS &&
+             vkDeviceWaitIdle(gpu->device) == VK_SUCCESS;
+    vkFreeCommandBuffers(gpu->device, gpu->command_pool, 1, &command);
+    if (!ok) {
+        h3_vk_set_error(gpu, "staging copy failed");
+        return -1;
+    }
+    return 0;
+}
+
+/* Host-visible staging buffer covering `bytes`. */
+static int h3_vk_staging_alloc(h3_gpu *gpu, VkDeviceSize bytes,
+                               VkBuffer *buffer, VkDeviceMemory *memory,
+                               void **mapped) {
+    VkBufferCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT
+    };
+    if (vkCreateBuffer(gpu->device, &info, NULL, buffer) != VK_SUCCESS) {
+        h3_vk_set_error(gpu, "staging: vkCreateBuffer failed");
+        return -1;
+    }
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(gpu->device, *buffer, &requirements);
+    VkMemoryAllocateInfo memory_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = requirements.size
+    };
+    VkPhysicalDeviceMemoryProperties properties;
+    vkGetPhysicalDeviceMemoryProperties(gpu->physical, &properties);
+    int found = 0;
+    for (uint32_t index = 0; index < properties.memoryTypeCount; index++) {
+        if ((requirements.memoryTypeBits & (1u << index)) &&
+            (properties.memoryTypes[index].propertyFlags &
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            memory_info.memoryTypeIndex = index;
+            found = 1;
+            break;
+        }
+    }
+    if (!found ||
+        vkAllocateMemory(gpu->device, &memory_info, NULL, memory) !=
+            VK_SUCCESS ||
+        vkBindBufferMemory(gpu->device, *buffer, *memory, 0) != VK_SUCCESS ||
+        vkMapMemory(gpu->device, *memory, 0, VK_WHOLE_SIZE, 0, mapped) !=
+            VK_SUCCESS) {
+        h3_vk_set_error(gpu, "staging memory setup failed");
+        if (*buffer) vkDestroyBuffer(gpu->device, *buffer, NULL);
+        return -1;
+    }
+    return 0;
+}
+
+static void h3_vk_staging_free(h3_gpu *gpu, VkBuffer buffer,
+                               VkDeviceMemory memory, void *mapped) {
+    if (mapped) vkUnmapMemory(gpu->device, memory);
+    if (memory) vkFreeMemory(gpu->device, memory, NULL);
+    if (buffer) vkDestroyBuffer(gpu->device, buffer, NULL);
 }
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements) {
@@ -902,7 +1014,8 @@ h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
 
 static void h3_vk_tensor_destroy(h3_gpu *gpu, h3_gpu_tensor *tensor) {
     if (gpu && gpu->device && tensor->memory) {
-        vkUnmapMemory(gpu->device, tensor->memory);
+        if (tensor->mapped)
+            vkUnmapMemory(gpu->device, tensor->memory);
         vkFreeMemory(gpu->device, tensor->memory, NULL);
     }
     if (gpu && gpu->device && tensor->buffer)
@@ -945,14 +1058,59 @@ h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor) {
 static int h3_vk_tensor_read(h3_gpu *gpu, const h3_gpu_tensor *tensor,
                              size_t source_offset, void *values,
                              size_t elements) {
-    (void)gpu;
     if (!tensor || !values) return -1;
     if (source_offset > tensor->elements ||
         elements > tensor->elements - source_offset) return -1;
-    if (elements) memcpy(values, (const uint8_t *)tensor->mapped +
-                       source_offset * h3_vk_dtype_size(tensor->dtype),
-                       elements * h3_vk_dtype_size(tensor->dtype));
-    return 0;
+    if (!elements) return 0;
+    size_t bytes = elements * h3_vk_dtype_size(tensor->dtype);
+    size_t byte_offset = source_offset * h3_vk_dtype_size(tensor->dtype);
+    if (!tensor->device_local) {
+        memcpy(values, (const uint8_t *)tensor->mapped + byte_offset, bytes);
+        return 0;
+    }
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    void *mapped = NULL;
+    if (h3_vk_staging_alloc(gpu, bytes, &staging, &staging_memory,
+                            &mapped) != 0)
+        return -1;
+    /* Download through a temporary command buffer. */
+    VkCommandBufferAllocateInfo alloc = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = gpu->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+    VkCommandBuffer command;
+    int ok = vkAllocateCommandBuffers(gpu->device, &alloc, &command) ==
+                 VK_SUCCESS;
+    if (ok) {
+        VkCommandBufferBeginInfo begin = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+        };
+        VkBufferCopy region = {
+            .srcOffset = byte_offset, .dstOffset = 0, .size = bytes
+        };
+        vkBeginCommandBuffer(command, &begin);
+        vkCmdCopyBuffer(command, tensor->buffer, staging, 1, &region);
+        vkEndCommandBuffer(command);
+        VkSubmitInfo submit = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &command
+        };
+        ok = vkQueueSubmit(gpu->queue, 1, &submit, VK_NULL_HANDLE) ==
+                 VK_SUCCESS &&
+             vkDeviceWaitIdle(gpu->device) == VK_SUCCESS;
+        vkFreeCommandBuffers(gpu->device, gpu->command_pool, 1, &command);
+    }
+    if (ok)
+        memcpy(values, mapped, bytes);
+    else
+        h3_vk_set_error(gpu, "device-local readback failed");
+    h3_vk_staging_free(gpu, staging, staging_memory, mapped);
+    return ok ? 0 : -1;
 }
 
 int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
@@ -975,14 +1133,27 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
 static int h3_vk_tensor_write(h3_gpu *gpu, h3_gpu_tensor *tensor,
                               size_t destination_offset, const void *values,
                               size_t elements) {
-    (void)gpu;
     if (!tensor || !values) return -1;
     if (destination_offset > tensor->elements ||
         elements > tensor->elements - destination_offset) return -1;
-    if (elements) memcpy((uint8_t *)tensor->mapped +
-                       destination_offset * h3_vk_dtype_size(tensor->dtype),
-                       values, elements * h3_vk_dtype_size(tensor->dtype));
-    return 0;
+    if (!elements) return 0;
+    size_t bytes = elements * h3_vk_dtype_size(tensor->dtype);
+    size_t byte_offset = destination_offset * h3_vk_dtype_size(tensor->dtype);
+    if (!tensor->device_local) {
+        memcpy((uint8_t *)tensor->mapped + byte_offset, values, bytes);
+        return 0;
+    }
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    void *mapped = NULL;
+    if (h3_vk_staging_alloc(gpu, bytes, &staging, &staging_memory,
+                            &mapped) != 0)
+        return -1;
+    memcpy(mapped, values, bytes);
+    int ok = h3_vk_staging_copy(gpu, tensor->buffer, staging, bytes) == 0;
+    if (!ok) h3_vk_set_error(gpu, "device-local upload failed");
+    h3_vk_staging_free(gpu, staging, staging_memory, mapped);
+    return ok ? 0 : -1;
 }
 
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
@@ -1015,7 +1186,9 @@ static h3_gpu_tensor *h3_vk_tensor_load(h3_gpu *gpu, const char *path,
                                         uint64_t file_offset,
                                         size_t elements,
                                         h3_gpu_dtype dtype) {
-    h3_gpu_tensor *tensor = h3_vk_tensor_new(gpu, elements, dtype);
+    /* Checkpoint weights are resident in device-local memory; the payload
+     * is pread into a host staging buffer and copied once. */
+    h3_gpu_tensor *tensor = h3_vk_tensor_new_mem(gpu, elements, dtype, 1);
     if (!tensor || !elements) return tensor;
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -1024,12 +1197,22 @@ static h3_gpu_tensor *h3_vk_tensor_load(h3_gpu *gpu, const char *path,
         return NULL;
     }
     size_t byte_size = tensor->byte_size;
-    uint8_t *cursor = tensor->mapped;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    void *mapped = NULL;
+    if (h3_vk_staging_alloc(gpu, byte_size, &staging, &staging_memory,
+                            &mapped) != 0) {
+        close(fd);
+        h3_gpu_tensor_free(tensor);
+        return NULL;
+    }
+    uint8_t *cursor = mapped;
     while (byte_size > 0) {
         ssize_t got = pread(fd, cursor, byte_size, (off_t)file_offset);
         if (got <= 0) {
             h3_vk_set_error(gpu, "short read from %s", path);
             close(fd);
+            h3_vk_staging_free(gpu, staging, staging_memory, mapped);
             h3_gpu_tensor_free(tensor);
             return NULL;
         }
@@ -1038,6 +1221,13 @@ static h3_gpu_tensor *h3_vk_tensor_load(h3_gpu *gpu, const char *path,
         byte_size -= (size_t)got;
     }
     close(fd);
+    if (h3_vk_staging_copy(gpu, tensor->buffer, staging,
+                           tensor->byte_size) != 0) {
+        h3_vk_staging_free(gpu, staging, staging_memory, mapped);
+        h3_gpu_tensor_free(tensor);
+        return NULL;
+    }
+    h3_vk_staging_free(gpu, staging, staging_memory, mapped);
     return tensor;
 }
 
@@ -1057,7 +1247,6 @@ static int h3_vk_tensor_read_file(h3_gpu *gpu, h3_gpu_tensor *tensor,
                                   const char *path, uint64_t file_offset,
                                   size_t elements, char *error,
                                   size_t error_size) {
-    (void)gpu;
     if (!tensor || !elements) return 0;
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -1066,21 +1255,40 @@ static int h3_vk_tensor_read_file(h3_gpu *gpu, h3_gpu_tensor *tensor,
         return -1;
     }
     size_t byte_size = elements * h3_vk_dtype_size(tensor->dtype);
-    uint8_t *cursor = tensor->mapped;
-    while (byte_size > 0) {
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    void *mapped = NULL;
+    int failed = 0;
+    if (!tensor->device_local) {
+        mapped = tensor->mapped;
+    } else if (h3_vk_staging_alloc(gpu, byte_size, &staging,
+                                   &staging_memory, &mapped) != 0) {
+        failed = 1;
+    }
+    uint8_t *cursor = mapped;
+    while (!failed && byte_size > 0) {
         ssize_t got = pread(fd, cursor, byte_size, (off_t)file_offset);
         if (got <= 0) {
             if (error && error_size)
                 snprintf(error, error_size, "short read from %s", path);
-            close(fd);
-            return -1;
+            failed = 1;
+            break;
         }
         cursor += (size_t)got;
         file_offset += (uint64_t)got;
         byte_size -= (size_t)got;
     }
     close(fd);
-    return 0;
+    if (!failed && tensor->device_local)
+        failed = h3_vk_staging_copy(gpu, tensor->buffer, staging,
+                                    elements *
+                                        h3_vk_dtype_size(tensor->dtype)) != 0;
+    if (tensor->device_local)
+        h3_vk_staging_free(gpu, staging, staging_memory,
+                           tensor->device_local ? mapped : NULL);
+    if (failed && error && error_size && !error[0])
+        snprintf(error, error_size, "device-local file load failed");
+    return failed ? -1 : 0;
 }
 
 int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,

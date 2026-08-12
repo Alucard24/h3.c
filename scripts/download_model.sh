@@ -49,12 +49,26 @@ else
         exit 1
     fi
     if [ ! -d "$MODEL_DIR/.git" ]; then
-        GIT_LFS_SKIP_SMUDGE=1 git clone "https://huggingface.co/$REPO" "$MODEL_DIR"
-    fi
-    if [ "$REF2VA" = "1" ]; then
-        (cd "$MODEL_DIR" && git lfs pull --include="FL2VA/**,Ref2VA/**")
+        # The target may already hold a partial huggingface_hub tree;
+        # clone into a temporary directory and merge over it.
+        TMP_DIR="$MODEL_DIR.tmp-clone-$$"
+        rm -rf "$TMP_DIR"
+        GIT_LFS_SKIP_SMUDGE=1 git clone "https://huggingface.co/$REPO" "$TMP_DIR"
+        if [ "$REF2VA" = "1" ]; then
+            (cd "$TMP_DIR" && git lfs pull --include="FL2VA/**,Ref2VA/**")
+        else
+            (cd "$TMP_DIR" && git lfs pull --include="FL2VA/**")
+        fi
+        mkdir -p "$MODEL_DIR"
+        cp -a "$TMP_DIR/." "$MODEL_DIR/"
+        find "$MODEL_DIR" -name '*.incomplete' -delete
+        rm -rf "$TMP_DIR"
     else
-        (cd "$MODEL_DIR" && git lfs pull --include="FL2VA/**")
+        if [ "$REF2VA" = "1" ]; then
+            (cd "$MODEL_DIR" && git lfs pull --include="FL2VA/**,Ref2VA/**")
+        else
+            (cd "$MODEL_DIR" && git lfs pull --include="FL2VA/**")
+        fi
     fi
     echo "h3: checkpoint ready under $MODEL_DIR"
 fi

@@ -97,6 +97,9 @@ typedef enum {
     H3_VK_KERNEL_TOKEN_POOL_ADALN_BF16,
     H3_VK_KERNEL_TOKEN_EXPAND_DELTA_BF16,
     H3_VK_KERNEL_TOKEN_EXPAND_ADALN_BF16,
+    H3_VK_KERNEL_TEXT_QK_ROPE_BF16,
+    H3_VK_KERNEL_ROPE_TEXT_BF16,
+    H3_VK_KERNEL_GQA_CAUSAL_BF16,
     H3_VK_KERNEL_COUNT
 } h3_vk_kernel;
 
@@ -115,7 +118,9 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_sdpa_flash_bf16",
     "main_patch_linear_bf16", "main_patch_linear_bf16_map",
     "main_token_pool_bf16", "main_token_pool_adaln_bf16",
-    "main_token_expand_delta_bf16", "main_token_expand_adaln_bf16"
+    "main_token_expand_delta_bf16", "main_token_expand_adaln_bf16",
+    "main_text_qk_rope_bf16", "main_rope_text_bf16",
+    "main_gqa_causal_bf16"
 };
 
 /* Storage-buffer bindings consumed by each kernel (0..n-1 plus binding 7
@@ -124,14 +129,14 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
     2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2,
-    5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10
+    5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4
 };
 
 /* Workgroup layout per kernel: 0 = 256 threads, 1 = 16x16 tiles,
  * 2 = 128 threads (SDPA flash). */
 static const int h3_vk_kernel_layout[H3_VK_KERNEL_COUNT] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-    0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0
+    0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2
 };
 
 struct h3_gpu {
@@ -2225,6 +2230,88 @@ int h3_gpu_token_expand_adaln_bf16(
                           rows, 1, 1);
 }
 
+
+/* ------------------------------------------------------------ qwen text */
+
+int h3_gpu_text_qk_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query_output,
+                             h3_gpu_tensor *key_output,
+                             const h3_gpu_tensor *query_input,
+                             const h3_gpu_tensor *key_input,
+                             const h3_gpu_tensor *q_weight,
+                             const h3_gpu_tensor *k_weight,
+                             const h3_gpu_tensor *rope_cos,
+                             const h3_gpu_tensor *rope_sin,
+                             uint32_t sequence, uint32_t query_heads,
+                             uint32_t kv_heads, uint32_t head_dim,
+                             float epsilon) {
+    if (!h3_vk_check_tensors(gpu, 8, query_output, key_output, query_input,
+                             key_input, q_weight, k_weight, rope_cos,
+                             rope_sin))
+        return -1;
+    gpu->args->rows = sequence;
+    gpu->args->width = query_heads;
+    gpu->args->input_dim = kv_heads;
+    gpu->args->output_dim = head_dim;
+    gpu->args->epsilon = epsilon;
+    const h3_gpu_tensor *tensors[8] = { query_input, key_input, q_weight,
+                                        k_weight, rope_cos, rope_sin,
+                                        query_output, key_output };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_TEXT_QK_ROPE_BF16,
+                                        tensors, 8);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_TEXT_QK_ROPE_BF16, set,
+                          (head_dim + H3_VK_THREADS - 1) / H3_VK_THREADS,
+                          query_heads, sequence);
+}
+
+int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                          h3_gpu_tensor *key,
+                          const h3_gpu_tensor *rope_cos_f32,
+                          const h3_gpu_tensor *rope_sin_f32,
+                          uint32_t sequence, uint32_t query_heads,
+                          uint32_t kv_heads, uint32_t head_dim) {
+    if (!h3_vk_check_tensors(gpu, 4, query, key, rope_cos_f32,
+                             rope_sin_f32))
+        return -1;
+    gpu->args->rows = sequence;
+    gpu->args->width = query_heads;
+    gpu->args->input_dim = kv_heads;
+    gpu->args->output_dim = head_dim;
+    uint32_t maximum_heads = query_heads > kv_heads ? query_heads : kv_heads;
+    const h3_gpu_tensor *tensors[4] = { query, key, rope_cos_f32,
+                                        rope_sin_f32 };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_ROPE_TEXT_BF16,
+                                        tensors, 4);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_ROPE_TEXT_BF16, set,
+                          (sequence + 15) / 16, (maximum_heads + 15) / 16, 1);
+}
+
+int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *query,
+                           const h3_gpu_tensor *key,
+                           const h3_gpu_tensor *value, uint32_t sequence,
+                           uint32_t query_heads, uint32_t kv_heads,
+                           uint32_t head_dim, float scale) {
+    if (!h3_vk_check_tensors(gpu, 4, output, query, key, value)) return -1;
+    if (sequence > 4096) {
+        h3_vk_set_error(gpu, "GQA sequence exceeds the 4096-row score "
+                             "threadgroup buffer");
+        return -1;
+    }
+    gpu->args->rows = sequence;
+    gpu->args->width = query_heads;
+    gpu->args->input_dim = kv_heads;
+    gpu->args->output_dim = head_dim;
+    gpu->args->left_scale = scale;
+    const h3_gpu_tensor *tensors[4] = { query, key, value, output };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_GQA_CAUSAL_BF16,
+                                        tensors, 4);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_GQA_CAUSAL_BF16, set, sequence,
+                          query_heads, 1);
+}
+
 void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label) {
     (void)gpu;
     (void)label;
@@ -2612,43 +2699,6 @@ int h3_gpu_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        uint32_t width) {
 (void)gpu; (void)output; (void)fused; (void)rows; (void)width;
     return h3_vk_not_ported(gpu, "h3_gpu_swiglu_bf16");
-}
-
-int h3_gpu_text_qk_rope_bf16(h3_gpu *gpu,
-                             h3_gpu_tensor *query_output,
-                             h3_gpu_tensor *key_output,
-                             const h3_gpu_tensor *query_input,
-                             const h3_gpu_tensor *key_input,
-                             const h3_gpu_tensor *q_norm,
-                             const h3_gpu_tensor *k_norm,
-                             const h3_gpu_tensor *rope_cos,
-                             const h3_gpu_tensor *rope_sin,
-                             uint32_t sequence, uint32_t query_heads,
-                             uint32_t kv_heads, uint32_t head_dim,
-                             float epsilon) {
-(void)gpu; (void)query_output; (void)key_output; (void)query_input; (void)key_input; (void)q_norm; (void)k_norm; (void)rope_cos; (void)rope_sin; (void)sequence; (void)query_heads; (void)kv_heads; (void)head_dim; (void)epsilon;
-    return h3_vk_not_ported(gpu, "h3_gpu_text_qk_rope_bf16");
-}
-
-int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
-                          h3_gpu_tensor *key,
-                          const h3_gpu_tensor *rope_cos_f32,
-                          const h3_gpu_tensor *rope_sin_f32,
-                          uint32_t sequence, uint32_t query_heads,
-                          uint32_t kv_heads, uint32_t head_dim) {
-(void)gpu; (void)query; (void)key; (void)rope_cos_f32; (void)rope_sin_f32; (void)sequence; (void)query_heads; (void)kv_heads; (void)head_dim;
-    return h3_vk_not_ported(gpu, "h3_gpu_rope_text_bf16");
-}
-
-int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                           const h3_gpu_tensor *query,
-                           const h3_gpu_tensor *key,
-                           const h3_gpu_tensor *value,
-                           uint32_t sequence, uint32_t query_heads,
-                           uint32_t kv_heads, uint32_t head_dim,
-                           float scale) {
-(void)gpu; (void)output; (void)query; (void)key; (void)value; (void)sequence; (void)query_heads; (void)kv_heads; (void)head_dim; (void)scale;
-    return h3_vk_not_ported(gpu, "h3_gpu_gqa_causal_bf16");
 }
 
 

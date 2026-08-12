@@ -1108,6 +1108,187 @@ void main_token_expand_adaln_bf16() {
     }
 }
 
+
+
+/* ------------------------------------------------------- Qwen encoder */
+
+layout(set = 0, binding = 0) readonly buffer TQIn { uint16_t data[]; } tq_in;
+layout(set = 0, binding = 1) readonly buffer TKIn { uint16_t data[]; } tk_in;
+layout(set = 0, binding = 2) readonly buffer TQW { uint16_t data[]; } tq_w;
+layout(set = 0, binding = 3) readonly buffer TKW { uint16_t data[]; } tk_w;
+layout(set = 0, binding = 4) readonly buffer TQRC { uint16_t data[]; } tq_rc;
+layout(set = 0, binding = 5) readonly buffer TQRS { uint16_t data[]; } tq_rs;
+layout(set = 0, binding = 6) writeonly buffer TQOut { uint16_t data[]; } tq_out;
+layout(set = 0, binding = 7) writeonly buffer TKOut { uint16_t data[]; } tk_out;
+
+/* Qwen3 text Q/K RMS + RoPE from separate inputs; KV heads share one
+ * key/value projection, so the key branch runs only for head < kv_heads. */
+void main_text_qk_rope_bf16() {
+    uint dimension = gl_GlobalInvocationID.x;
+    uint head = gl_GlobalInvocationID.y;
+    uint row = gl_GlobalInvocationID.z;
+    uint query_heads = args.data.width;
+    uint kv_heads = args.data.input_dim;
+    uint head_dim = args.data.output_dim;
+    if (dimension >= head_dim || head >= query_heads ||
+        row >= args.data.rows)
+        return;
+    uint half_dim = head_dim / 2u;
+    uint pair = dimension < half_dim ? dimension + half_dim :
+                                        dimension - half_dim;
+    float c = H3_BF16_TO_F32(tq_rc.data[row * half_dim +
+                                        (dimension % half_dim)]);
+    float s = H3_BF16_TO_F32(tq_rs.data[row * half_dim +
+                                        (dimension % half_dim)]);
+    uint q_base = (row * query_heads + head) * head_dim;
+    float q_sum = 0.0f;
+    for (uint d = 0u; d < head_dim; d++) {
+        float value = H3_BF16_TO_F32(tq_in.data[q_base + d]);
+        q_sum = fma(value, value, q_sum);
+    }
+    float q_inverse = inversesqrt(q_sum / float(head_dim) +
+                                  args.data.epsilon);
+    float q0 = H3_BF16_TO_F32(tq_in.data[q_base + dimension]) * q_inverse *
+               H3_BF16_TO_F32(tq_w.data[dimension]);
+    float q1 = H3_BF16_TO_F32(tq_in.data[q_base + pair]) * q_inverse *
+               H3_BF16_TO_F32(tq_w.data[pair]);
+    float q_rotated = dimension < half_dim ? q0 * c - q1 * s :
+                                             q0 * c + q1 * s;
+    tq_out.data[q_base + dimension] = uint16_t(h3_f32_to_bf16(q_rotated));
+    if (head < kv_heads) {
+        uint k_base = (row * kv_heads + head) * head_dim;
+        float k_sum = 0.0f;
+        for (uint d = 0u; d < head_dim; d++) {
+            float value = H3_BF16_TO_F32(tk_in.data[k_base + d]);
+            k_sum = fma(value, value, k_sum);
+        }
+        float k_inverse = inversesqrt(k_sum / float(head_dim) +
+                                      args.data.epsilon);
+        float k0 = H3_BF16_TO_F32(tk_in.data[k_base + dimension]) *
+                   k_inverse * H3_BF16_TO_F32(tk_w.data[dimension]);
+        float k1 = H3_BF16_TO_F32(tk_in.data[k_base + pair]) * k_inverse *
+                   H3_BF16_TO_F32(tk_w.data[pair]);
+        float k_rotated = dimension < half_dim ? k0 * c - k1 * s :
+                                                 k0 * c + k1 * s;
+        tk_out.data[k_base + dimension] = uint16_t(h3_f32_to_bf16(k_rotated));
+    }
+}
+
+/* In-place Iris-style RoPE with F32 tables. */
+layout(set = 0, binding = 0) buffer TRQ { uint16_t data[]; } tr_q;
+layout(set = 0, binding = 1) buffer TRK { uint16_t data[]; } tr_k;
+layout(set = 0, binding = 2) readonly buffer TRC { float data[]; } tr_c;
+layout(set = 0, binding = 3) readonly buffer TRS { float data[]; } tr_s;
+
+void main_rope_text_bf16() {
+    uint row = gl_GlobalInvocationID.x;
+    uint head = gl_GlobalInvocationID.y;
+    uint query_heads = args.data.width;
+    uint kv_heads = args.data.input_dim;
+    uint head_dim = args.data.output_dim;
+    if (row >= args.data.rows) return;
+    uint half_dim = head_dim / 2u;
+    if (head < query_heads) {
+        uint base = (row * query_heads + head) * head_dim;
+        for (uint d = 0u; d < half_dim; d++) {
+            float first = H3_BF16_TO_F32(tr_q.data[base + d]);
+            float second = H3_BF16_TO_F32(tr_q.data[base + half_dim + d]);
+            float c = tr_c.data[row * half_dim + d];
+            float s = tr_s.data[row * half_dim + d];
+            tr_q.data[base + d] = uint16_t(h3_f32_to_bf16(first * c -
+                                                          second * s));
+            tr_q.data[base + half_dim + d] =
+                uint16_t(h3_f32_to_bf16(second * c + first * s));
+        }
+    }
+    if (head < kv_heads) {
+        uint base = (row * kv_heads + head) * head_dim;
+        for (uint d = 0u; d < half_dim; d++) {
+            float first = H3_BF16_TO_F32(tr_k.data[base + d]);
+            float second = H3_BF16_TO_F32(tr_k.data[base + half_dim + d]);
+            float c = tr_c.data[row * half_dim + d];
+            float s = tr_s.data[row * half_dim + d];
+            tr_k.data[base + d] = uint16_t(h3_f32_to_bf16(first * c -
+                                                          second * s));
+            tr_k.data[base + half_dim + d] =
+                uint16_t(h3_f32_to_bf16(second * c + first * s));
+        }
+    }
+}
+
+/* Causal GQA attention (Qwen3 text decoder). The scale is applied to Q
+ * before the contraction, matching MLX's fused SDPA order; scores live in
+ * threadgroup memory, so the host caps the sequence at 4096. */
+layout(set = 0, binding = 0) readonly buffer GqQ { uint16_t data[]; } gq_q;
+layout(set = 0, binding = 1) readonly buffer GqK { uint16_t data[]; } gq_k;
+layout(set = 0, binding = 2) readonly buffer GqV { uint16_t data[]; } gq_v;
+layout(set = 0, binding = 3) writeonly buffer GqOut { uint16_t data[]; } gq_out;
+
+shared float gq_scores[4096];
+shared float gq_reductions[128];
+shared float gq_shared_query[128];
+
+void main_gqa_causal_bf16() {
+    uint query_row = gl_WorkGroupID.x;
+    uint query_head = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint seq = args.data.rows;
+    uint query_heads = args.data.width;
+    uint kv_heads = args.data.input_dim;
+    uint head_dim = args.data.output_dim;
+    if (query_row >= seq || query_head >= query_heads) return;
+    uint kv_head = query_head / (query_heads / kv_heads);
+    uint q_base = (query_row * query_heads + query_head) * head_dim;
+    uint key_count = query_row + 1;
+    for (uint d = tid; d < head_dim; d += 128u) {
+        gq_shared_query[d] = H3_BF16_TO_F32(uint16_t(h3_f32_to_bf16(
+            H3_BF16_TO_F32(gq_q.data[q_base + d]) * args.data.left_scale)));
+    }
+    barrier();
+    float local_max = -3.402823466e+38f;
+    for (uint key_row = tid; key_row < key_count; key_row += 128u) {
+        uint k_base = (key_row * kv_heads + kv_head) * head_dim;
+        float dot = 0.0f;
+        for (uint d = 0u; d < head_dim; d++) {
+            dot = fma(gq_shared_query[d],
+                      H3_BF16_TO_F32(gq_k.data[k_base + d]), dot);
+        }
+        gq_scores[key_row] = dot;
+        local_max = max(local_max, dot);
+    }
+    gq_reductions[tid] = local_max;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1) {
+        if (tid < stride)
+            gq_reductions[tid] = max(gq_reductions[tid],
+                                     gq_reductions[tid + stride]);
+        barrier();
+    }
+    float maximum = gq_reductions[0];
+    float local_sum = 0.0f;
+    for (uint key_row = tid; key_row < key_count; key_row += 128u) {
+        float probability = exp(gq_scores[key_row] - maximum);
+        gq_scores[key_row] = probability;
+        local_sum += probability;
+    }
+    gq_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1) {
+        if (tid < stride) gq_reductions[tid] += gq_reductions[tid + stride];
+        barrier();
+    }
+    float inverse_sum = 1.0f / gq_reductions[0];
+    for (uint d = tid; d < head_dim; d += 128u) {
+        float sum = 0.0f;
+        for (uint key_row = 0u; key_row < key_count; key_row++) {
+            uint v_index = (key_row * kv_heads + kv_head) * head_dim + d;
+            sum = fma(gq_scores[key_row] * inverse_sum,
+                      H3_BF16_TO_F32(gq_v.data[v_index]), sum);
+        }
+        gq_out.data[q_base + d] = uint16_t(h3_f32_to_bf16(sum));
+    }
+}
+
 /* The runtime compiles one module per kernel with H3_ENTRY selecting the
  * kernel function; glslc testing uses -DH3_ENTRY=main_<kernel>. */
 void main() { H3_ENTRY(); }

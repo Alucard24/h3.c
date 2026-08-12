@@ -478,6 +478,13 @@ round-to-nearest-even is bit-exact):
   (bit-exact reference order), a 128-thread flash kernel with online
   softmax and tree-reduced dots at and above 128 rows, and a head-major
   output variant for layout-aware projections
+- Qwen3 text encoder: `text_qk_rope` bf16 (per-head Q/K RMS + RoPE from
+  separate inputs, KV sharing), in-place `rope_text` bf16 with F32 tables,
+  and causal GQA `gqa_causal` bf16 (scale applied to Q before the
+  contraction, scores kept in threadgroup memory, sequence capped at 4096)
+- weight residency: `h3_gpu_tensor_load_*` allocates device-local memory
+  and transfers through host staging buffers (one-shot copy command
+  buffer); device-local readbacks download through staging
 - `embedding` bf16 (out-of-vocab rows zeroed)
 - `rms_norm`/`layer_norm` f32 and bf16 with the 256-thread tree reduction
 

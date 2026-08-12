@@ -1,0 +1,336 @@
+/* Vulkan compute kernels for the h3 GPU backend.
+ *
+ * This file mirrors the portable kernels in h3_shaders.metal with identical
+ * arithmetic semantics. BF16 conversion uses the exact round-to-nearest-even
+ * sequence from the Metal source. Kernel-by-kernel, this file will grow to
+ * cover the full h3_gpu API.
+ *
+ * All kernels share one descriptor layout: set 0, storage-buffer bindings
+ * 0..7, and a single push-constant block whose layout must match
+ * h3_gpu_vulkan_push in h3_gpu_vulkan.c.
+ */
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#define H3_BF16_TO_F32(value) uintBitsToFloat(uint(value) << 16)
+
+uint h3_f32_to_bf16(float value) {
+    uint bits = floatBitsToUint(value);
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return bits >> 16;
+}
+
+/* glslang rejects push-constant blocks in modules that also declare 16-bit
+ * storage buffers, so kernel arguments travel through a small uniform args
+ * buffer (binding 7). The layout must match h3_gpu_vulkan_args in
+ * h3_gpu_vulkan.c. */
+struct H3Args {
+    uint count;
+    uint elements;
+    uint sample_offset;
+    uint tokens;
+    uint width;
+    uint rows;
+    uint vocab_size;
+    uint approximate;
+    float left_scale;
+    float right_scale;
+    float minimum;
+    float maximum;
+    float delta;
+    float ratio;
+    float epsilon;
+};
+layout(set = 0, binding = 7) readonly buffer ArgsBuf { H3Args data; } args;
+
+/* ------------------------------------------------------------------ casts */
+
+layout(set = 0, binding = 0) readonly buffer InF32 { float data[]; } in_f32;
+layout(set = 0, binding = 1) writeonly buffer OutBF16 { uint16_t data[]; } out_bf16;
+
+layout(local_size_x = 256) in;
+void main_cast_f32_to_bf16() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.count) return;
+    out_bf16.data[gid] = uint16_t(h3_f32_to_bf16(in_f32.data[gid]));
+}
+
+layout(set = 0, binding = 0) readonly buffer InBF16 { uint16_t data[]; } in_bf16;
+layout(set = 0, binding = 1) writeonly buffer OutF32 { float data[]; } out_f32;
+
+void main_cast_bf16_to_f32() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.count) return;
+    out_f32.data[gid] = H3_BF16_TO_F32(in_bf16.data[gid]);
+}
+
+/* ------------------------------------------------------------------ unary */
+
+void main_silu_f32() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.count) return;
+    float value = in_f32.data[gid];
+    out_f32.data[gid] = value / (1.0f + exp(-value));
+}
+
+void main_silu_bf16() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.count) return;
+    float value = H3_BF16_TO_F32(in_bf16.data[gid]);
+    out_bf16.data[gid] = uint16_t(h3_f32_to_bf16(value / (1.0f + exp(-value))));
+}
+
+layout(set = 0, binding = 1) readonly buffer InBF16B1 { uint16_t data[]; } in_bf16_b1;
+layout(set = 0, binding = 2) writeonly buffer OutBF16B2 { uint16_t data[]; } out_bf16_b2;
+void main_silu_mul_bf16() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.count) return;
+    float value = H3_BF16_TO_F32(in_bf16.data[gid]);
+    float other = H3_BF16_TO_F32(in_bf16_b1.data[gid]);
+    out_bf16_b2.data[gid] =
+        uint16_t(h3_f32_to_bf16(value / (1.0f + exp(-value)) * other));
+}
+
+void main_clip_f32() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.elements) return;
+    out_f32.data[gid] = clamp(in_f32.data[gid], args.data.minimum, args.data.maximum);
+}
+
+void main_gelu_bf16() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.elements) return;
+    float value = H3_BF16_TO_F32(in_bf16.data[gid]);
+    float activated;
+    if (args.data.approximate != 0u) {
+        float inner = 0.7978845608028654f *
+            (value + 0.044715f * value * value * value);
+        activated = inner <= -10.0f ? 0.0f :
+                    inner >= 10.0f ? value :
+                    0.5f * value * (1.0f + tanh(inner));
+    } else {
+        float x = abs(value);
+        float t = 1.0f / (1.0f + 0.3275911f * x);
+        float polynomial = (((((1.061405429f * t - 1.453152027f) * t) +
+                               1.421413741f) * t - 0.284496736f) * t +
+                               0.254829592f) * t;
+        float erf = (value < 0.0f ? -1.0f : 1.0f) *
+                    (1.0f - polynomial * exp(-x * x));
+        activated = value <= -10.0f ? 0.0f :
+                    value >= 10.0f ? value :
+                    0.5f * value * (1.0f + erf);
+    }
+    out_bf16.data[gid] = uint16_t(h3_f32_to_bf16(activated));
+}
+
+/* ------------------------------------------------------------------ binary */
+
+void main_add_bf16() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.count) return;
+    out_bf16_b2.data[gid] = uint16_t(h3_f32_to_bf16(
+        H3_BF16_TO_F32(in_bf16.data[gid]) + H3_BF16_TO_F32(in_bf16_b1.data[gid])));
+}
+
+void main_sub_bf16() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.count) return;
+    out_bf16_b2.data[gid] = uint16_t(h3_f32_to_bf16(
+        H3_BF16_TO_F32(in_bf16.data[gid]) - H3_BF16_TO_F32(in_bf16_b1.data[gid])));
+}
+
+layout(set = 0, binding = 1) readonly buffer InF32B1 { float data[]; } in_f32_b1;
+layout(set = 0, binding = 2) writeonly buffer OutF32B2 { float data[]; } out_f32_b2;
+
+void main_add_scaled_f32() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.elements) return;
+    out_f32_b2.data[gid] = in_f32.data[gid] * args.data.left_scale +
+                           in_f32_b1.data[gid] * args.data.right_scale;
+}
+
+void main_geglu_f32() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.count) return;
+    float x = in_f32.data[gid];
+    float cube = x * x * x;
+    float gelu = 0.5f * x *
+        (1.0f + tanh(0.7978845608028654f * (x + 0.044715f * cube)));
+    out_f32_b2.data[gid] = gelu * in_f32_b1.data[gid];
+}
+
+/* ------------------------------------------------------------------ euler */
+
+layout(set = 0, binding = 0) buffer SampleBuf { float data[]; } sample_buf;
+layout(set = 0, binding = 1) readonly buffer LastBuf { uint16_t data[]; } last_buf;
+layout(set = 0, binding = 2) readonly buffer PrevBuf { uint16_t data[]; } prev_buf;
+
+void main_euler_bf16() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.elements) return;
+    float last_value = H3_BF16_TO_F32(last_buf.data[gid]);
+    float velocity = fma(args.data.ratio,
+                         last_value - H3_BF16_TO_F32(prev_buf.data[gid]),
+                         last_value);
+    uint sample_index = args.data.sample_offset + gid;
+    sample_buf.data[sample_index] =
+        fma(args.data.delta, velocity, sample_buf.data[sample_index]);
+}
+
+/* -------------------------------------------------------------- embedding */
+
+layout(set = 0, binding = 0) readonly buffer EmbW { uint16_t data[]; } emb_w;
+layout(set = 0, binding = 1) readonly buffer EmbIds { uint data[]; } emb_ids;
+layout(set = 0, binding = 2) writeonly buffer EmbOut { uint16_t data[]; } emb_out;
+
+void main_embedding_bf16() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint token = gid / args.data.width;
+    uint column = gid - token * args.data.width;
+    if (token >= args.data.tokens || column >= args.data.width) return;
+    uint identifier = emb_ids.data[token];
+    emb_out.data[gid] = identifier < args.data.vocab_size ?
+        emb_w.data[identifier * args.data.width + column] : uint16_t(0);
+}
+
+/* ---------------------------------------------------------------- norms */
+
+layout(set = 0, binding = 0) readonly buffer NormIn { float data[]; } norm_in;
+layout(set = 0, binding = 1) readonly buffer NormW { float data[]; } norm_w;
+layout(set = 0, binding = 2) writeonly buffer NormOut { float data[]; } norm_out;
+
+shared float norm_reductions[256];
+
+void main_rms_norm_f32() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= args.data.rows) return;
+    uint base = row * args.data.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.data.width; k += 256u)
+        local_sum = fma(norm_in.data[base + k], norm_in.data[base + k],
+                        local_sum);
+    norm_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) norm_reductions[tid] += norm_reductions[tid + stride];
+        barrier();
+    }
+    float inverse = inversesqrt(norm_reductions[0] / float(args.data.width) +
+                                args.data.epsilon);
+    for (uint column = tid; column < args.data.width; column += 256u)
+        norm_out.data[base + column] =
+            norm_in.data[base + column] * inverse * norm_w.data[column];
+}
+
+layout(set = 0, binding = 3) readonly buffer NormBias { float data[]; } norm_bias;
+
+void main_layer_norm_f32() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= args.data.rows) return;
+    uint base = row * args.data.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.data.width; k += 256u)
+        local_sum += norm_in.data[base + k];
+    norm_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) norm_reductions[tid] += norm_reductions[tid + stride];
+        barrier();
+    }
+    float mean = norm_reductions[0] / float(args.data.width);
+    barrier();
+    local_sum = 0.0f;
+    for (uint k = tid; k < args.data.width; k += 256u) {
+        float centered = norm_in.data[base + k] - mean;
+        local_sum = fma(centered, centered, local_sum);
+    }
+    norm_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) norm_reductions[tid] += norm_reductions[tid + stride];
+        barrier();
+    }
+    float inverse = inversesqrt(norm_reductions[0] / float(args.data.width) +
+                                args.data.epsilon);
+    for (uint column = tid; column < args.data.width; column += 256u)
+        norm_out.data[base + column] =
+            (norm_in.data[base + column] - mean) * inverse *
+            norm_w.data[column] + norm_bias.data[column];
+}
+
+layout(set = 0, binding = 0) readonly buffer NormInB { uint16_t data[]; } norm_in_b;
+layout(set = 0, binding = 1) readonly buffer NormWB { uint16_t data[]; } norm_w_b;
+layout(set = 0, binding = 2) writeonly buffer NormOutB { uint16_t data[]; } norm_out_b;
+
+void main_rms_norm_bf16() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= args.data.rows) return;
+    uint base = row * args.data.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.data.width; k += 256u) {
+        float value = H3_BF16_TO_F32(norm_in_b.data[base + k]);
+        local_sum = fma(value, value, local_sum);
+    }
+    norm_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) norm_reductions[tid] += norm_reductions[tid + stride];
+        barrier();
+    }
+    float inverse = inversesqrt(norm_reductions[0] / float(args.data.width) +
+                                args.data.epsilon);
+    for (uint column = tid; column < args.data.width; column += 256u) {
+        float normalized = H3_BF16_TO_F32(norm_in_b.data[base + column]) *
+                           inverse;
+        norm_out_b.data[base + column] = uint16_t(h3_f32_to_bf16(
+            normalized * H3_BF16_TO_F32(norm_w_b.data[column])));
+    }
+}
+
+layout(set = 0, binding = 3) readonly buffer NormBiasB { uint16_t data[]; } norm_bias_b;
+
+void main_layer_norm_bf16() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= args.data.rows) return;
+    uint base = row * args.data.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.data.width; k += 256u)
+        local_sum += H3_BF16_TO_F32(norm_in_b.data[base + k]);
+    norm_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) norm_reductions[tid] += norm_reductions[tid + stride];
+        barrier();
+    }
+    float mean = norm_reductions[0] / float(args.data.width);
+    barrier();
+    local_sum = 0.0f;
+    for (uint k = tid; k < args.data.width; k += 256u) {
+        float centered = H3_BF16_TO_F32(norm_in_b.data[base + k]) - mean;
+        local_sum = fma(centered, centered, local_sum);
+    }
+    norm_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) norm_reductions[tid] += norm_reductions[tid + stride];
+        barrier();
+    }
+    float inverse = inversesqrt(norm_reductions[0] / float(args.data.width) +
+                                args.data.epsilon);
+    for (uint column = tid; column < args.data.width; column += 256u) {
+        float normalized = (H3_BF16_TO_F32(norm_in_b.data[base + column]) -
+                            mean) * inverse;
+        float value = fma(normalized, H3_BF16_TO_F32(norm_w_b.data[column]),
+                          H3_BF16_TO_F32(norm_bias_b.data[column]));
+        norm_out_b.data[base + column] = uint16_t(h3_f32_to_bf16(value));
+    }
+}
+
+/* The runtime compiles one module per kernel with H3_ENTRY selecting the
+ * kernel function; glslc testing uses -DH3_ENTRY=main_<kernel>. */
+void main() { H3_ENTRY(); }

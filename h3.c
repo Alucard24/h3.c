@@ -709,7 +709,7 @@ static h3_video_vae_decoder *h3_acquire_video_decoder(
         ctx->video_decoder_key = NULL;
     }
     h3_video_vae_decoder *decoder = h3_video_vae_decoder_load(
-        weight_directory, "h3_shaders.metal", latent_height, latent_width,
+        weight_directory, H3_SHADER_SOURCE, latent_height, latent_width,
         progress, progress_opaque, error, error_size);
     if (!decoder || !ctx->cache_enabled) return decoder;
     char *key_copy = strdup(key);
@@ -1172,7 +1172,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_audio_latent latent;
             memset(&latent, 0, sizeof(latent));
             if (!h3_audio_vae_encode(
-                    audio_vae_path, "h3_shaders.metal", pcm, samples,
+                    audio_vae_path, H3_SHADER_SOURCE, pcm, samples,
                     h3_audio_encoder_progress_bridge, &progress, &latent,
                     detail, sizeof(detail))) {
                 free(pcm);
@@ -1305,7 +1305,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_video_latent latent;
             memset(&latent, 0, sizeof(latent));
             if (!h3_video_vae_encode(
-                    vae_path, "h3_shaders.metal", condition_pixels[image],
+                    vae_path, H3_SHADER_SOURCE, condition_pixels[image],
                     condition_frames[image], condition_heights[image],
                     condition_widths[image],
                     h3_video_encoder_progress_bridge, &progress,
@@ -1345,7 +1345,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             if (!ref2va ||
                 params->references[reference_index].kind == H3_REFERENCE_IMAGE) {
                 if (!h3_vision_encode_bf16(
-                        text_path, "h3_shaders.metal", condition_pixels[image],
+                        text_path, H3_SHADER_SOURCE, condition_pixels[image],
                         1, condition_heights[image], condition_widths[image],
                         h3_vision_progress_bridge, &progress,
                         &vision_outputs[vision_cursor], detail, sizeof(detail))) {
@@ -1377,7 +1377,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                         goto cleanup;
                     }
                     int ok = h3_vision_encode_bf16(
-                        text_path, "h3_shaders.metal", pair, 2,
+                        text_path, H3_SHADER_SOURCE, pair, 2,
                         condition_heights[image], condition_widths[image],
                         h3_vision_progress_bridge, &progress,
                         &vision_outputs[vision_cursor], detail, sizeof(detail));
@@ -1400,12 +1400,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         h3_progress_emit(&progress, "text encoder", 0, 50);
         int text_ok = ref2va ? h3_multimodal_encode_ref2va_bf16(
-                tokenizer, text_path, "h3_shaders.metal", prompt,
+                tokenizer, text_path, H3_SHADER_SOURCE, prompt,
                 presentations, params->reference_count,
                 h3_text_progress_bridge, &progress, &text,
                 detail, sizeof(detail)) :
             h3_multimodal_encode_fl2va_bf16(
-                tokenizer, text_path, "h3_shaders.metal", prompt,
+                tokenizer, text_path, H3_SHADER_SOURCE, prompt,
                 vision_outputs, visual_count,
                 h3_text_progress_bridge, &progress, &text,
                 detail, sizeof(detail));
@@ -1423,7 +1423,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         h3_progress_emit(&progress, "text encoder", 0, 50);
         if (!h3_text_encode_bf16(
-                text_path, "h3_shaders.metal", ids, token_count,
+                text_path, H3_SHADER_SOURCE, ids, token_count,
                 h3_text_progress_bridge, &progress, &text,
                 detail, sizeof(detail))) {
             h3_set_error(ctx, "%s", detail);
@@ -1482,7 +1482,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         fprintf(stderr, "h3: prepared DiT cache hit\n");
     } else if (conditioned) {
         dit = h3_dit_load_conditioned(
-            dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            dit_path, H3_SHADER_SOURCE, &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,
@@ -1503,7 +1503,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else {
         dit = h3_dit_load_t2va(
-            dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            dit_path, H3_SHADER_SOURCE, &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,
@@ -1598,7 +1598,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     dit = NULL;
     if (progress.cancelled) goto cleanup;
     h3_progress_emit(&progress, "audio VAE", 0, 7);
-    if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
+    if (!h3_audio_vae_decode(audio_vae_path, H3_SHADER_SOURCE, audio,
                              temporal.audio_t, h3_audio_vae_progress_bridge,
                              &progress, &waveform, detail, sizeof(detail))) {
         h3_set_error(ctx, "%s", detail);
@@ -1625,7 +1625,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             preview_decoder, video, temporal.video_t, &frames,
             detail, sizeof(detail)) :
         h3_video_vae_decode(
-            vae_path, "h3_shaders.metal", video,
+            vae_path, H3_SHADER_SOURCE, video,
             temporal.video_t, latent_h, latent_w,
             h3_vae_progress_bridge, &progress, &frames,
             detail, sizeof(detail));

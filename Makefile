@@ -6,7 +6,8 @@ UNAME_S := $(shell uname -s)
 # strict -std=c11 on both platforms.
 ifeq ($(UNAME_S),Darwin)
 CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
-	-Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE
+	-Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE \
+	-DH3_SHADER_SOURCE=\"h3_shaders.metal\"
 OBJCFLAGS := $(CFLAGS) -fobjc-arc
 FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
@@ -24,12 +25,21 @@ LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
 # The Metal runtime and the Foundation tokenizer are macOS-only. Other
-# platforms link the host stubs until the Vulkan/CUDA backends land.
+# platforms link the Vulkan backend when its SDK is available, or host stubs
+# that fail cleanly (scaffolding entry point).
 LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 ifeq ($(UNAME_S),Darwin)
 GPU_STUB :=
 else
+VULKAN := $(shell pkg-config --exists vulkan shaderc && echo 1)
+ifeq ($(VULKAN),1)
+GPU_STUB := h3_gpu_vulkan.c h3_metal_stub.c h3_tokenizer_stub.c
+LDLIBS += $(shell pkg-config --libs vulkan shaderc)
+CFLAGS += -DH3_SHADER_SOURCE=\"h3_vulkan_shaders.comp\" -DH3_HAVE_VULKAN
+else
 GPU_STUB := h3_gpu_stub.c h3_metal_stub.c h3_tokenizer_stub.c
+CFLAGS += -DH3_SHADER_SOURCE=\"h3_shaders.metal\"
+endif
 LIB_M :=
 endif
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o) $(GPU_STUB:.c=.o)
@@ -61,6 +71,9 @@ h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_vulkan_kernels_test: tests/test_vulkan_kernels.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
@@ -117,8 +130,9 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 
 ifeq ($(UNAME_S),Linux)
 # Host-only build: deterministic CPU suite until a GPU backend lands.
-test: h3_tests
+test: h3_tests h3_vulkan_kernels_test
 	./h3_tests
+	./h3_vulkan_kernels_test
 
 parity:
 	@echo "parity requires the macOS Metal backend (run on an Apple Silicon Mac)"

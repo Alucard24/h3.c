@@ -446,6 +446,35 @@ This is the entry point for the Vulkan/CUDA backend work: `h3_gpu.h` is the
 stable backend contract, and the stub files are replaced incrementally by real
 implementations (kernel by kernel) as they land.
 
+## Vulkan backend (Linux/NVIDIA)
+
+When a Vulkan 1.3 SDK with libshaderc is detected (`pkg-config vulkan
+shaderc`), the Makefile links `h3_gpu_vulkan.c` instead of the generic stub
+and compiles compute shaders at runtime from `h3_vulkan_shaders.comp` through
+libshaderc, mirroring the Metal backend's runtime-compilation model. The
+device probe (`h3_metal_probe`) reports the selected Vulkan device.
+
+Currently ported kernels (semantics mirror `h3_shaders.metal`, BF16
+round-to-nearest-even is bit-exact):
+
+- casts `f32 -> bf16` and `bf16 -> f32`
+- `silu` f32/bf16, `silu_mul` bf16, `clip` f32, `gelu` bf16 (both modes)
+- `add`/`sub` bf16, `add_scaled` f32, `geglu` f32
+- `euler` bf16 sampler step
+- `embedding` bf16 (out-of-vocab rows zeroed)
+- `rms_norm`/`layer_norm` f32 and bf16 with the 256-thread tree reduction
+
+Every other `h3_gpu_*` operation fails cleanly with a "not ported" error.
+Tensors are host-visible coherent buffers and every dispatch takes a full
+memory barrier; the DiT-scale residency and barrier strategy arrives with the
+linear/int8 kernels.
+
+```sh
+make -j8
+make test   # host suite + Vulkan kernel parity tests
+H3_VK_VALIDATION=1 ./h3_vulkan_kernels_test   # with validation layers
+```
+
 ## Implementation and performance notes
 
 The remainder documents the implementation behind the tutorial presets and the

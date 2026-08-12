@@ -384,9 +384,14 @@ static void test_metal_probe(void) {
     CHECK(info.max_buffer_length > 0);
     CHECK(info.apple_gpu_family > 0);
 #else
-    /* Host builds without a Metal backend must fail cleanly. */
-    CHECK(!available);
-    CHECK(error[0] != '\0');
+    /* Host builds: with a Vulkan backend a device probe may succeed;
+     * without one it must fail cleanly. */
+    if (available) {
+        CHECK(info.name[0] != '\0');
+        CHECK(info.max_buffer_length > 0);
+    } else {
+        CHECK(error[0] != '\0');
+    }
 #endif
 }
 

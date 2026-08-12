@@ -130,10 +130,16 @@ static int h3_key_file(h3_key *key, const char *role, const char *path) {
     if (stat(path, &status) != 0)
         return h3_key_append(key, "|%s=%zu:%s:missing", role,
                              strlen(path), path);
-    return h3_key_append(key, "|%s=%zu:%s:%lld:%lld:%ld", role, strlen(path),
-                         path, (long long)status.st_size,
-                         (long long)status.st_mtimespec.tv_sec,
-                         status.st_mtimespec.tv_nsec);
+#if defined(__APPLE__)
+    long long mtime_sec = (long long)status.st_mtimespec.tv_sec;
+    long long mtime_nsec = (long long)status.st_mtimespec.tv_nsec;
+#else
+    long long mtime_sec = (long long)status.st_mtim.tv_sec;
+    long long mtime_nsec = (long long)status.st_mtim.tv_nsec;
+#endif
+    return h3_key_append(key, "|%s=%zu:%s:%lld:%lld:%lld", role, strlen(path),
+                         path, (long long)status.st_size, mtime_sec,
+                         mtime_nsec);
 }
 
 static char *h3_conditioning_key(const char *prompt, const h3_params *params,

@@ -1,6 +1,8 @@
 #include "h3_host.h"
 
+#if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
+#endif
 
 #include <float.h>
 #include <limits.h>
@@ -527,6 +529,46 @@ void h3_rng_fill_normal(h3_rng *rng, float *values, size_t count) {
     }
 }
 
+#if !defined(__APPLE__)
+/* Portable bilinear fallback for platforms without Accelerate/vImage.
+ * vImage's kvImageEdgeExtend clamping is approximated by edge replication. */
+static void h3_resize_rgb24_bilinear(const uint8_t *source,
+                                     uint8_t *destination,
+                                     int input_width, int input_height,
+                                     int output_width, int output_height) {
+    for (int y = 0; y < output_height; y++) {
+        double source_y = ((double)y + 0.5) * (double)input_height /
+                          (double)output_height - 0.5;
+        int y0 = (int)floor(source_y);
+        double fy = source_y - (double)y0;
+        if (y0 < 0) { y0 = 0; fy = 0.0; }
+        if (y0 > input_height - 2) { y0 = input_height - 2; fy = 1.0; }
+        const int y1 = y0 + 1;
+        for (int x = 0; x < output_width; x++) {
+            double source_x = ((double)x + 0.5) * (double)input_width /
+                              (double)output_width - 0.5;
+            int x0 = (int)floor(source_x);
+            double fx = source_x - (double)x0;
+            if (x0 < 0) { x0 = 0; fx = 0.0; }
+            if (x0 > input_width - 2) { x0 = input_width - 2; fx = 1.0; }
+            const int x1 = x0 + 1;
+            const uint8_t *p00 = source + ((size_t)y0 * input_width + x0) * 3;
+            const uint8_t *p01 = source + ((size_t)y0 * input_width + x1) * 3;
+            const uint8_t *p10 = source + ((size_t)y1 * input_width + x0) * 3;
+            const uint8_t *p11 = source + ((size_t)y1 * input_width + x1) * 3;
+            uint8_t *out = destination + ((size_t)y * output_width + x) * 3;
+            for (int channel = 0; channel < 3; channel++) {
+                double top = (double)p00[channel] +
+                             fx * ((double)p01[channel] - p00[channel]);
+                double bottom = (double)p10[channel] +
+                                fx * ((double)p11[channel] - p10[channel]);
+                out[channel] = (uint8_t)(top + fy * (bottom - top) + 0.5);
+            }
+        }
+    }
+}
+#endif
+
 int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
                                  int input_width, int input_height,
                                  int output_width, int output_height,
@@ -555,14 +597,15 @@ int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
         free(pixels);
         return 0;
     }
+    size_t input_frame_bytes = input_area * 3;
+    size_t output_frame_bytes = output_area * 3;
+#if defined(__APPLE__)
     uint8_t *source_argb = malloc(input_area * 4);
     uint8_t *output_argb = malloc(output_area * 4);
     if (!source_argb || !output_argb) {
         free(source_argb); free(output_argb); free(pixels);
         return 0;
     }
-    size_t input_frame_bytes = input_area * 3;
-    size_t output_frame_bytes = output_area * 3;
     vImage_Buffer source_buffer = {
         source_argb, (vImagePixelCount)input_height,
         (vImagePixelCount)input_width, (size_t)input_width * 4
@@ -594,6 +637,14 @@ int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
         }
     }
     free(source_argb); free(output_argb);
+#else
+    for (int frame = 0; frame < frames; frame++) {
+        h3_resize_rgb24_bilinear(
+            input + (size_t)frame * input_frame_bytes,
+            pixels + (size_t)frame * output_frame_bytes,
+            input_width, input_height, output_width, output_height);
+    }
+#endif
     *output = pixels;
     return 1;
 }

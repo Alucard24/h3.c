@@ -376,11 +376,18 @@ static void test_dit_row_conversions(void) {
 static void test_metal_probe(void) {
     h3_device_info info;
     char error[256];
-    CHECK(h3_metal_probe(&info, error, sizeof(error)));
+    int available = h3_metal_probe(&info, error, sizeof(error));
+#if defined(__APPLE__)
+    CHECK(available);
     CHECK(info.name[0] != '\0');
     CHECK(info.physical_memory >= UINT64_C(8) * 1024 * 1024 * 1024);
     CHECK(info.max_buffer_length > 0);
     CHECK(info.apple_gpu_family > 0);
+#else
+    /* Host builds without a Metal backend must fail cleanly. */
+    CHECK(!available);
+    CHECK(error[0] != '\0');
+#endif
 }
 
 static void test_terminal_zoom(void) {

@@ -424,6 +424,28 @@ FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 32 kHz stereo F32 PCM are fed through concurrent pipes; no intermediate
 uncompressed media file is created.
 
+## Linux host build (backend scaffolding)
+
+The Metal runtime (`h3_metal.m`, `h3_gpu.m`) and the Foundation tokenizer
+(`h3_tokenizer.m`) are macOS-only. On Linux the Makefile replaces them with
+host stubs (`h3_gpu_stub.c`, `h3_metal_stub.c`, `h3_tokenizer_stub.c`) that
+fail cleanly, so the deterministic CPU suite builds and runs without any GPU:
+
+```sh
+make -j8
+make test
+```
+
+The high-quality RGB resize falls back to a portable bilinear implementation
+(`h3_host.c`) when Accelerate/vImage is absent. `make test` on Linux runs only
+`h3_tests`; the Metal parity targets require an Apple Silicon Mac. GPU
+operations, tokenization, and media generation report a clear error in this
+configuration.
+
+This is the entry point for the Vulkan/CUDA backend work: `h3_gpu.h` is the
+stable backend contract, and the stub files are replaced incrementally by real
+implementations (kernel by kernel) as they land.
+
 ## Implementation and performance notes
 
 The remainder documents the implementation behind the tutorial presets and the

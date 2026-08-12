@@ -1,5 +1,10 @@
 CC := clang
 AR := ar
+UNAME_S := $(shell uname -s)
+
+# Feature-test macros expose POSIX functions (strdup, setenv, mkdtemp) under
+# strict -std=c11 on both platforms.
+ifeq ($(UNAME_S),Darwin)
 CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 	-Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE
 OBJCFLAGS := $(CFLAGS) -fobjc-arc
@@ -7,14 +12,27 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
 	-framework Accelerate
 LDLIBS := $(FRAMEWORKS) -licucore -lm
+else
+CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
+	-Wconversion -Wno-sign-conversion -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L
+LDLIBS := -lm
+endif
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 	h3_dit_schedule.c h3_dit.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
+# The Metal runtime and the Foundation tokenizer are macOS-only. Other
+# platforms link the host stubs until the Vulkan/CUDA backends land.
 LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
-LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
+ifeq ($(UNAME_S),Darwin)
+GPU_STUB :=
+else
+GPU_STUB := h3_gpu_stub.c h3_metal_stub.c h3_tokenizer_stub.c
+LIB_M :=
+endif
+LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o) $(GPU_STUB:.c=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity clean
@@ -97,6 +115,17 @@ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+ifeq ($(UNAME_S),Linux)
+# Host-only build: deterministic CPU suite until a GPU backend lands.
+test: h3_tests
+	./h3_tests
+
+parity:
+	@echo "parity requires the macOS Metal backend (run on an Apple Silicon Mac)"
+
+real-parity:
+	@echo "real-parity requires the macOS Metal backend (run on an Apple Silicon Mac)"
+else
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 	h3_av_mux_test \
@@ -186,6 +215,7 @@ parity: h3_metal_tests h3_bf16_tests h3_text_tests
 real-parity: h3_real_prompt_test h3_real_dit_block_test
 	./h3_real_prompt_test MiniMax-H3 misc/fixtures/h3_real_prompt_bf16.safetensors
 	./h3_real_dit_block_test MiniMax-H3 misc/fixtures/h3_real_dit_block0_bf16.safetensors
+endif
 
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@

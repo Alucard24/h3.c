@@ -48,6 +48,7 @@ struct H3Args {
     uint shift_slot;
     uint scale_slot;
     uint gate_slot;
+    uint grouped;
 };
 layout(set = 0, binding = 8) readonly buffer ArgsBuf { H3Args data; } args;
 
@@ -622,6 +623,145 @@ void main_head_rms_norm_bf16() {
 }
 
 
+
+
+
+/* --------------------------------------------------------- QKV + SDPA */
+
+layout(set = 0, binding = 0) readonly buffer QKVIn { uint16_t data[]; } qkv_in;
+layout(set = 0, binding = 1) readonly buffer QNorm { uint16_t data[]; } q_norm;
+layout(set = 0, binding = 2) readonly buffer KNorm { uint16_t data[]; } k_norm;
+layout(set = 0, binding = 3) readonly buffer RopeCos { uint16_t data[]; } rope_cos;
+layout(set = 0, binding = 4) readonly buffer RopeSin { uint16_t data[]; } rope_sin;
+layout(set = 0, binding = 5) writeonly buffer QueryOut { uint16_t data[]; } query_out;
+layout(set = 0, binding = 6) writeonly buffer KeyOut { uint16_t data[]; } key_out;
+layout(set = 0, binding = 7) writeonly buffer ValueOut { uint16_t data[]; } value_out;
+
+/* Checkpoint QKV rows are [head, q/k/v, dimension] when grouped, or
+ * [q/k/v, head, dimension] otherwise. Applies per-head Q/K RMS norm and
+ * the +/-half RoPE rotation, writing [row, head, dimension] heads. */
+void main_grouped_qkv_rope_bf16() {
+    uint dimension = gl_GlobalInvocationID.x;
+    uint head = gl_GlobalInvocationID.y;
+    uint row = gl_GlobalInvocationID.z;
+    if (dimension >= args.data.input_dim || head >= args.data.width ||
+        row >= args.data.rows)
+        return;
+    uint inner = args.data.width * args.data.input_dim;
+    uint row_base = row * inner * 3u;
+    uint q_base = row_base + head * args.data.input_dim;
+    uint k_base = q_base + inner;
+    uint v_base = q_base + inner * 2u;
+    if (args.data.grouped != 0u) {
+        q_base = row_base + head * args.data.input_dim * 3u;
+        k_base = q_base + args.data.input_dim;
+        v_base = k_base + args.data.input_dim;
+    }
+    float q_sum = 0.0f;
+    float k_sum = 0.0f;
+    for (uint d = 0u; d < args.data.input_dim; d++) {
+        float q = H3_BF16_TO_F32(qkv_in.data[q_base + d]);
+        float k = H3_BF16_TO_F32(qkv_in.data[k_base + d]);
+        q_sum = fma(q, q, q_sum);
+        k_sum = fma(k, k, k_sum);
+    }
+    float q_inverse = inversesqrt(q_sum / float(args.data.input_dim) +
+                                  args.data.epsilon);
+    float k_inverse = inversesqrt(k_sum / float(args.data.input_dim) +
+                                  args.data.epsilon);
+    float q0 = H3_BF16_TO_F32(qkv_in.data[q_base + dimension]) * q_inverse *
+               H3_BF16_TO_F32(q_norm.data[dimension]);
+    float k0 = H3_BF16_TO_F32(qkv_in.data[k_base + dimension]) * k_inverse *
+               H3_BF16_TO_F32(k_norm.data[dimension]);
+    if (dimension < args.data.output_dim) {
+        uint pair = dimension + args.data.output_dim;
+        float q1 = H3_BF16_TO_F32(qkv_in.data[q_base + pair]) * q_inverse *
+                   H3_BF16_TO_F32(q_norm.data[pair]);
+        float k1 = H3_BF16_TO_F32(qkv_in.data[k_base + pair]) * k_inverse *
+                   H3_BF16_TO_F32(k_norm.data[pair]);
+        float c = H3_BF16_TO_F32(rope_cos.data[row * args.data.output_dim +
+                                               dimension]);
+        float s = H3_BF16_TO_F32(rope_sin.data[row * args.data.output_dim +
+                                               dimension]);
+        q0 = q0 * c - q1 * s;
+        k0 = k0 * c - k1 * s;
+    } else if (dimension < args.data.output_dim * 2u) {
+        uint pair = dimension - args.data.output_dim;
+        float q1 = H3_BF16_TO_F32(qkv_in.data[q_base + pair]) * q_inverse *
+                   H3_BF16_TO_F32(q_norm.data[pair]);
+        float k1 = H3_BF16_TO_F32(qkv_in.data[k_base + pair]) * k_inverse *
+                   H3_BF16_TO_F32(k_norm.data[pair]);
+        float c = H3_BF16_TO_F32(rope_cos.data[row * args.data.output_dim +
+                                               pair]);
+        float s = H3_BF16_TO_F32(rope_sin.data[row * args.data.output_dim +
+                                               pair]);
+        q0 = q0 * c + q1 * s;
+        k0 = k0 * c + k1 * s;
+    }
+    uint output_index = (row * args.data.width + head) * args.data.input_dim +
+                        dimension;
+    query_out.data[output_index] = uint16_t(h3_f32_to_bf16(q0));
+    key_out.data[output_index] = uint16_t(h3_f32_to_bf16(k0));
+    value_out.data[output_index] = qkv_in.data[v_base + dimension];
+}
+
+/* Portable SDPA: one thread per (row, head), naive softmax with maximum
+ * subtraction and F32 accumulation. The Metal backend uses MPSGraph here;
+ * the reference semantics are the same. With grouped != 0 the output is
+ * written in native [head, row, dimension] order for a layout-aware
+ * projection. */
+layout(set = 0, binding = 0) readonly buffer SdpaQ { uint16_t data[]; } sdpa_q;
+layout(set = 0, binding = 1) readonly buffer SdpaK { uint16_t data[]; } sdpa_k;
+layout(set = 0, binding = 2) readonly buffer SdpaV { uint16_t data[]; } sdpa_v;
+layout(set = 0, binding = 3) writeonly buffer SdpaOut { uint16_t data[]; } sdpa_out;
+
+void main_sdpa_bf16() {
+    uint head = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    uint seq = args.data.rows;
+    uint heads = args.data.width;
+    uint dim = args.data.input_dim;
+    if (row >= seq || head >= heads) return;
+    float scale = args.data.left_scale;
+    uint qbase = (row * heads + head) * dim;
+    float maxv = -3.402823466e+38f;
+    for (uint s = 0u; s < seq; s++) {
+        uint kbase = (s * heads + head) * dim;
+        float dot = 0.0f;
+        for (uint d = 0u; d < dim; d++) {
+            dot = fma(H3_BF16_TO_F32(sdpa_q.data[qbase + d]),
+                      H3_BF16_TO_F32(sdpa_k.data[kbase + d]), dot);
+        }
+        dot *= scale;
+        maxv = max(maxv, dot);
+    }
+    float sum = 0.0f;
+    for (uint s = 0u; s < seq; s++) {
+        uint kbase = (s * heads + head) * dim;
+        float dot = 0.0f;
+        for (uint d = 0u; d < dim; d++) {
+            dot = fma(H3_BF16_TO_F32(sdpa_q.data[qbase + d]),
+                      H3_BF16_TO_F32(sdpa_k.data[kbase + d]), dot);
+        }
+        sum += exp(dot * scale - maxv);
+    }
+    for (uint d = 0u; d < dim; d++) {
+        float acc = 0.0f;
+        for (uint s = 0u; s < seq; s++) {
+            uint kbase = (s * heads + head) * dim;
+            float dot = 0.0f;
+            for (uint k = 0u; k < dim; k++) {
+                dot = fma(H3_BF16_TO_F32(sdpa_q.data[qbase + k]),
+                          H3_BF16_TO_F32(sdpa_k.data[kbase + k]), dot);
+            }
+            acc = fma(exp(dot * scale - maxv),
+                      H3_BF16_TO_F32(sdpa_v.data[kbase + d]), acc);
+        }
+        uint oindex = args.data.grouped != 0u ?
+            (head * seq + row) * dim + d : qbase + d;
+        sdpa_out.data[oindex] = uint16_t(h3_f32_to_bf16(acc / sum));
+    }
+}
 
 /* The runtime compiles one module per kernel with H3_ENTRY selecting the
  * kernel function; glslc testing uses -DH3_ENTRY=main_<kernel>. */

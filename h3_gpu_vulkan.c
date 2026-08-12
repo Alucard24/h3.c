@@ -59,6 +59,7 @@ typedef struct {
     uint32_t shift_slot;
     uint32_t scale_slot;
     uint32_t gate_slot;
+    uint32_t grouped;
 } h3_gpu_vulkan_args;
 
 typedef enum {
@@ -87,6 +88,8 @@ typedef enum {
     H3_VK_KERNEL_RMS_INVERSE_BF16,
     H3_VK_KERNEL_ADALN_LINEAR_BF16,
     H3_VK_KERNEL_HEAD_RMS_NORM_BF16,
+    H3_VK_KERNEL_GROUPED_QKV_ROPE_BF16,
+    H3_VK_KERNEL_SDPA_BF16,
     H3_VK_KERNEL_COUNT
 } h3_vk_kernel;
 
@@ -100,7 +103,8 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_linear_bf16", "main_swiglu_halves_bf16",
     "main_adaln_bf16", "main_gate_bf16", "main_gate_adaln_bf16",
     "main_rms_inverse_bf16", "main_adaln_linear_bf16",
-    "main_head_rms_norm_bf16"
+    "main_head_rms_norm_bf16",
+    "main_grouped_qkv_rope_bf16", "main_sdpa_bf16"
 };
 
 /* Storage-buffer bindings consumed by each kernel (0..n-1 plus binding 7
@@ -109,13 +113,13 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
     2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2,
-    5, 5, 8, 2, 8, 2
+    5, 5, 8, 2, 8, 2, 8, 4
 };
 
 /* Kernels with a 16x16 threadgroup need H3_LS16 at compile time. */
 static const int h3_vk_kernel_ls16[H3_VK_KERNEL_COUNT] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-    0, 1, 0, 0, 1, 1
+    0, 1, 0, 0, 1, 1, 0, 0
 };
 
 struct h3_gpu {
@@ -1669,6 +1673,104 @@ int h3_gpu_head_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *tensor,
                           (sequence + 15) / 16, (heads + 15) / 16, 1);
 }
 
+
+/* ------------------------------------------------------------ qkv/sdpa */
+
+static int h3_vk_qkv_rope(h3_gpu *gpu, h3_gpu_tensor *query,
+                          h3_gpu_tensor *key, h3_gpu_tensor *value,
+                          const h3_gpu_tensor *qkv,
+                          const h3_gpu_tensor *q_norm,
+                          const h3_gpu_tensor *k_norm,
+                          const h3_gpu_tensor *rope_cos,
+                          const h3_gpu_tensor *rope_sin,
+                          uint32_t sequence, uint32_t heads,
+                          uint32_t head_dim, uint32_t rope_half,
+                          float epsilon, int grouped) {
+    if (!h3_vk_check_tensors(gpu, 8, query, key, value, qkv, q_norm, k_norm,
+                             rope_cos, rope_sin))
+        return -1;
+    gpu->args->rows = sequence;
+    gpu->args->width = heads;
+    gpu->args->input_dim = head_dim;
+    gpu->args->output_dim = rope_half;
+    gpu->args->epsilon = epsilon;
+    gpu->args->grouped = grouped ? 1u : 0u;
+    const h3_gpu_tensor *tensors[8] = { qkv, q_norm, k_norm, rope_cos,
+                                        rope_sin, query, key, value };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_GROUPED_QKV_ROPE_BF16,
+                                        tensors, 8);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_GROUPED_QKV_ROPE_BF16, set,
+                          (head_dim + H3_VK_THREADS - 1) / H3_VK_THREADS,
+                          heads, sequence);
+}
+
+static int h3_vk_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                      const h3_gpu_tensor *value, uint32_t sequence,
+                      uint32_t heads, uint32_t head_dim, float scale,
+                      int head_major_output) {
+    if (!h3_vk_check_tensors(gpu, 4, output, query, key, value)) return -1;
+    gpu->args->rows = sequence;
+    gpu->args->width = heads;
+    gpu->args->input_dim = head_dim;
+    gpu->args->left_scale = scale;
+    gpu->args->grouped = head_major_output ? 1u : 0u;
+    const h3_gpu_tensor *tensors[4] = { query, key, value, output };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_SDPA_BF16, tensors,
+                                        4);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_SDPA_BF16, set, heads, sequence,
+                          1);
+}
+
+int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key, h3_gpu_tensor *value,
+                                 const h3_gpu_tensor *qkv,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos,
+                                 const h3_gpu_tensor *rope_sin,
+                                 uint32_t sequence, uint32_t heads,
+                                 uint32_t head_dim, uint32_t rope_half,
+                                 float epsilon) {
+    return h3_vk_qkv_rope(gpu, query, key, value, qkv, q_norm, k_norm,
+                          rope_cos, rope_sin, sequence, heads, head_dim,
+                          rope_half, epsilon, 1);
+}
+
+int h3_gpu_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                         h3_gpu_tensor *key, h3_gpu_tensor *value,
+                         const h3_gpu_tensor *qkv,
+                         const h3_gpu_tensor *q_norm,
+                         const h3_gpu_tensor *k_norm,
+                         const h3_gpu_tensor *rope_cos,
+                         const h3_gpu_tensor *rope_sin, uint32_t sequence,
+                         uint32_t heads, uint32_t head_dim,
+                         uint32_t rope_half, float epsilon) {
+    return h3_vk_qkv_rope(gpu, query, key, value, qkv, q_norm, k_norm,
+                          rope_cos, rope_sin, sequence, heads, head_dim,
+                          rope_half, epsilon, 0);
+}
+
+int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim, float scale) {
+    return h3_vk_sdpa(gpu, output, query, key, value, sequence, heads,
+                      head_dim, scale, 0);
+}
+
+int h3_gpu_sdpa_bf16_head_major_output(
+                     h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim, float scale) {
+    return h3_vk_sdpa(gpu, output, query, key, value, sequence, heads,
+                      head_dim, scale, 1);
+}
+
+
 void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label) {
     (void)gpu;
     (void)label;
@@ -2039,33 +2141,6 @@ int h3_gpu_gate_adaln_quantize_int8(
     return h3_vk_not_ported(gpu, "h3_gpu_gate_adaln_quantize_int8");
 }
 
-int h3_gpu_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
-                         h3_gpu_tensor *key, h3_gpu_tensor *value,
-                         const h3_gpu_tensor *qkv,
-                         const h3_gpu_tensor *q_norm,
-                         const h3_gpu_tensor *k_norm,
-                         const h3_gpu_tensor *rope_cos,
-                         const h3_gpu_tensor *rope_sin, uint32_t sequence,
-                         uint32_t heads, uint32_t head_dim,
-                         uint32_t rope_half, float epsilon) {
-(void)gpu; (void)query; (void)key; (void)value; (void)qkv; (void)q_norm; (void)k_norm; (void)rope_cos; (void)rope_sin; (void)sequence; (void)heads; (void)head_dim; (void)rope_half; (void)epsilon;
-    return h3_vk_not_ported(gpu, "h3_gpu_qkv_rope_bf16");
-}
-
-int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
-                                 h3_gpu_tensor *key, h3_gpu_tensor *value,
-                                 const h3_gpu_tensor *qkv,
-                                 const h3_gpu_tensor *q_norm,
-                                 const h3_gpu_tensor *k_norm,
-                                 const h3_gpu_tensor *rope_cos,
-                                 const h3_gpu_tensor *rope_sin,
-                                 uint32_t sequence, uint32_t heads,
-                                 uint32_t head_dim, uint32_t rope_half,
-                                 float epsilon) {
-(void)gpu; (void)query; (void)key; (void)value; (void)qkv; (void)q_norm; (void)k_norm; (void)rope_cos; (void)rope_sin; (void)sequence; (void)heads; (void)head_dim; (void)rope_half; (void)epsilon;
-    return h3_vk_not_ported(gpu, "h3_gpu_grouped_qkv_rope_bf16");
-}
-
 int h3_gpu_grouped_qkv_linear_rope_bf16(
                                  h3_gpu *gpu,
                                  h3_gpu_tensor *query,
@@ -2108,23 +2183,6 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int use_slower_uncached_int8_scales) {
 (void)gpu; (void)query; (void)key; (void)value; (void)quantized_input; (void)input_scales; (void)input; (void)weight; (void)weight_scales; (void)q_norm; (void)k_norm; (void)rope_cos; (void)rope_sin; (void)rows; (void)input_dim; (void)heads; (void)head_dim; (void)rope_half; (void)epsilon; (void)input_is_quantized; (void)use_slower_unfused_qkv_rope; (void)use_slower_scalar_qkv_rms; (void)use_slower_uncached_int8_scales;
     return h3_vk_not_ported(gpu, "h3_gpu_grouped_qkv_linear_rope_int8");
-}
-
-int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
-                     const h3_gpu_tensor *value, uint32_t sequence,
-                     uint32_t heads, uint32_t head_dim, float scale) {
-(void)gpu; (void)output; (void)query; (void)key; (void)value; (void)sequence; (void)heads; (void)head_dim; (void)scale;
-    return h3_vk_not_ported(gpu, "h3_gpu_sdpa_bf16");
-}
-
-int h3_gpu_sdpa_bf16_head_major_output(
-                     h3_gpu *gpu, h3_gpu_tensor *output,
-                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
-                     const h3_gpu_tensor *value, uint32_t sequence,
-                     uint32_t heads, uint32_t head_dim, float scale) {
-(void)gpu; (void)output; (void)query; (void)key; (void)value; (void)sequence; (void)heads; (void)head_dim; (void)scale;
-    return h3_vk_not_ported(gpu, "h3_gpu_sdpa_bf16_head_major_output");
 }
 
 int h3_gpu_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

@@ -468,6 +468,10 @@ round-to-nearest-even is bit-exact):
   `gate_adaln` bf16 (gated row kept in threadgroup memory), fused final
   `adaln_linear` bf16 (inverse RMS scalars + 16x16 projection), and the
   Qwen3 `head_rms_norm` bf16
+- attention: `grouped_qkv_rope` bf16 (checkpoint `[head, q/k/v, dim]` rows
+  and the plain `[q/k/v, head, dim]` variant, Q/K RMS + RoPE to
+  `[row, head, dim]`) and portable naive `sdpa` bf16 with maximum
+  subtraction, F32 accumulation, and a head-major output variant
 - `embedding` bf16 (out-of-vocab rows zeroed)
 - `rms_norm`/`layer_norm` f32 and bf16 with the 256-thread tree reduction
 

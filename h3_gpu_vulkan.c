@@ -839,7 +839,10 @@ int h3_gpu_has_nax_mlp(const h3_gpu *gpu) {
 
 int h3_gpu_has_int8_mlp(const h3_gpu *gpu) {
     (void)gpu;
-    return 0;
+    /* All int8 kernels are ported; the DiT enables the int8 MLP always and
+     * int8 QKV/attention-output at sequence >= 128. Use the
+     * --use-slower-bf16-* flags or H3_DISABLE_INT8_* to force BF16. */
+    return 1;
 }
 
 const char *h3_gpu_error(const h3_gpu *gpu) {

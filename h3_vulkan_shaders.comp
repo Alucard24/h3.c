@@ -61,6 +61,8 @@ layout(set = 0, binding = 1) writeonly buffer OutBF16 { uint16_t data[]; } out_b
 layout(local_size_x = 16, local_size_y = 16) in;
 #elif defined(H3_LS128)
 layout(local_size_x = 128) in;
+#elif defined(H3_LS512)
+layout(local_size_x = 128, local_size_y = 1) in;
 #else
 layout(local_size_x = 256) in;
 #endif
@@ -912,6 +914,7 @@ void main_sdpa_flash_bf16() {
         (head * seq + row) * dim + d : qbase + d;
     fl_out.data[oindex] = uint16_t(h3_f32_to_bf16(fl_acc[d] / fl_sum));
 }
+
 
 
 

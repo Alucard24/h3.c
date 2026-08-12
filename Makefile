@@ -33,13 +33,17 @@ GPU_STUB :=
 else
 VULKAN := $(shell pkg-config --exists vulkan shaderc && echo 1)
 ifeq ($(VULKAN),1)
-GPU_STUB := h3_gpu_vulkan.c h3_metal_stub.c h3_tokenizer_stub.c
+GPU_STUB := h3_gpu_vulkan.c h3_metal_stub.c
 LDLIBS += $(shell pkg-config --libs vulkan shaderc)
 CFLAGS += -DH3_SHADER_SOURCE=\"h3_vulkan_shaders.comp\" -DH3_HAVE_VULKAN
 else
-GPU_STUB := h3_gpu_stub.c h3_metal_stub.c h3_tokenizer_stub.c
+GPU_STUB := h3_gpu_stub.c h3_metal_stub.c
 CFLAGS += -DH3_SHADER_SOURCE=\"h3_shaders.metal\"
 endif
+# The Qwen BPE tokenizer is a portable C port of h3_tokenizer.m; it uses
+# ICU (libicuuc) on non-Darwin platforms, matching macOS's -licucore.
+GPU_STUB += h3_tokenizer.c
+LDLIBS += -licuuc
 LIB_M :=
 endif
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o) $(GPU_STUB:.c=.o)
@@ -77,6 +81,9 @@ h3_vulkan_kernels_test: tests/test_vulkan_kernels.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_vulkan_dit_block_test: tests/test_vulkan_dit_block.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_tokenizer_c_test: tests/test_tokenizer_c.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
@@ -133,10 +140,11 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 
 ifeq ($(UNAME_S),Linux)
 # Host-only build: deterministic CPU suite until a GPU backend lands.
-test: h3_tests h3_vulkan_kernels_test h3_vulkan_dit_block_test
+test: h3_tests h3_vulkan_kernels_test h3_vulkan_dit_block_test h3_tokenizer_c_test
 	./h3_tests
 	./h3_vulkan_kernels_test
 	./h3_vulkan_dit_block_test
+	./h3_tokenizer_c_test
 
 parity:
 	@echo "parity requires the macOS Metal backend (run on an Apple Silicon Mac)"

@@ -29,6 +29,10 @@
 #define H3_VK_BINDINGS 8
 #define H3_VK_THREADS 256u
 #define H3_VK_POOL_SETS 2048
+/* Kernel args are written by the host before submission but read by the GPU
+ * during execution, so each dispatch gets its own slot in the shared args
+ * buffer. One slot per dispatch; large graphs must call h3_gpu_continue. */
+#define H3_VK_ARGS_SLOTS 1024u
 
 /* Layout shared by every kernel; matches the H3Args block in
  * h3_vulkan_shaders.comp (binding 7). */
@@ -48,6 +52,9 @@ typedef struct {
     float delta;
     float ratio;
     float epsilon;
+    uint32_t has_bias;
+    uint32_t input_dim;
+    uint32_t output_dim;
 } h3_gpu_vulkan_args;
 
 typedef enum {
@@ -68,6 +75,8 @@ typedef enum {
     H3_VK_KERNEL_LAYER_NORM_F32,
     H3_VK_KERNEL_RMS_NORM_BF16,
     H3_VK_KERNEL_LAYER_NORM_BF16,
+    H3_VK_KERNEL_LINEAR_BF16,
+    H3_VK_KERNEL_SWIGLU_HALVES_BF16,
     H3_VK_KERNEL_COUNT
 } h3_vk_kernel;
 
@@ -77,7 +86,8 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_clip_f32", "main_gelu_bf16", "main_add_bf16", "main_sub_bf16",
     "main_add_scaled_f32", "main_geglu_f32", "main_euler_bf16",
     "main_embedding_bf16", "main_rms_norm_f32", "main_layer_norm_f32",
-    "main_rms_norm_bf16", "main_layer_norm_bf16"
+    "main_rms_norm_bf16", "main_layer_norm_bf16",
+    "main_linear_bf16", "main_swiglu_halves_bf16"
 };
 
 /* Storage-buffer bindings consumed by each kernel (0..n-1 plus binding 7
@@ -85,7 +95,12 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
 /* Highest storage-buffer binding used by each kernel plus one (bindings
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
-    2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4
+    2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2
+};
+
+/* Kernels with a 16x16 threadgroup need H3_LS16 at compile time. */
+static const int h3_vk_kernel_ls16[H3_VK_KERNEL_COUNT] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0
 };
 
 struct h3_gpu {
@@ -107,9 +122,16 @@ struct h3_gpu {
     VkBuffer args_buffer;
     VkDeviceMemory args_memory;
     h3_gpu_vulkan_args *args;
+    h3_gpu_vulkan_args *args_base;
+    uint32_t args_slot;
+    uint32_t args_dispatches;
     shaderc_compiler_t shaderc;
     double encode_start;
     double wait_start;
+    /* Tensors freed while their dispatches are still recorded or in flight.
+     * Metal keeps these alive through ARC; Vulkan must defer destruction. */
+    h3_gpu_tensor *pending[64];
+    uint32_t pending_count;
 };
 
 struct h3_gpu_tensor {
@@ -127,6 +149,8 @@ static double h3_vk_now(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
+
+static void h3_vk_drain_pending(h3_gpu *gpu);
 
 static void h3_vk_set_error(h3_gpu *gpu, const char *format, ...) {
     va_list args;
@@ -323,7 +347,7 @@ static int h3_vk_create_device(h3_gpu *gpu, char *error, size_t error_size) {
 
 static VkShaderModule h3_vk_compile(h3_gpu *gpu, const char *source,
                                     size_t source_size,
-                                    const char *entry_point) {
+                                    const char *entry_point, int ls16) {
     shaderc_compilation_result_t result = NULL;
     if (gpu->shaderc) {
         shaderc_compile_options_t options =
@@ -336,6 +360,9 @@ static VkShaderModule h3_vk_compile(h3_gpu *gpu, const char *source,
         shaderc_compile_options_add_macro_definition(
             options, "H3_ENTRY", strlen("H3_ENTRY"), entry_point,
             strlen(entry_point));
+        if (ls16)
+            shaderc_compile_options_add_macro_definition(
+                options, "H3_LS16", strlen("H3_LS16"), "1", 1);
         result = shaderc_compile_into_spv(
             gpu->shaderc, source, source_size,
             shaderc_compute_shader, "h3_vulkan_shaders.comp",
@@ -398,7 +425,8 @@ static int h3_vk_create_pipelines(h3_gpu *gpu, const char *source,
     }
     for (int kernel = 0; kernel < H3_VK_KERNEL_COUNT; kernel++) {
         VkShaderModule module = h3_vk_compile(gpu, source, source_size,
-                                              h3_vk_kernel_names[kernel]);
+                                              h3_vk_kernel_names[kernel],
+                                              h3_vk_kernel_ls16[kernel]);
         if (module == VK_NULL_HANDLE) {
             if (error && error_size)
                 snprintf(error, error_size, "%s", gpu->error);
@@ -468,12 +496,13 @@ static VkDescriptorSet h3_vk_alloc_set(h3_gpu *gpu, uint32_t binding_count) {
     return set;
 }
 
-static void h3_vk_set_buffer(h3_gpu *gpu, VkDescriptorSet set,
-                             uint32_t binding, VkBuffer buffer) {
+static void h3_vk_set_buffer_offset(h3_gpu *gpu, VkDescriptorSet set,
+                                    uint32_t binding, VkBuffer buffer,
+                                    VkDeviceSize offset) {
     (void)gpu;
     VkDescriptorBufferInfo info = {
         .buffer = buffer,
-        .offset = 0,
+        .offset = offset,
         .range = VK_WHOLE_SIZE
     };
     VkWriteDescriptorSet write = {
@@ -485,6 +514,11 @@ static void h3_vk_set_buffer(h3_gpu *gpu, VkDescriptorSet set,
         .pBufferInfo = &info
     };
     vkUpdateDescriptorSets(gpu->device, 1, &write, 0, NULL);
+}
+
+static void h3_vk_set_buffer(h3_gpu *gpu, VkDescriptorSet set,
+                             uint32_t binding, VkBuffer buffer) {
+    h3_vk_set_buffer_offset(gpu, set, binding, buffer, 0);
 }
 
 /* -------------------------------------------------------------- command */
@@ -539,6 +573,7 @@ static int h3_vk_submit_command(h3_gpu *gpu, int wait) {
         }
         gpu->stats.command_wait_seconds += h3_vk_now() - gpu->wait_start;
         gpu->stats.gpu_seconds += h3_vk_now() - gpu->wait_start;
+        h3_vk_drain_pending(gpu);
         vkResetCommandPool(gpu->device, gpu->command_pool, 0);
         for (uint32_t index = 0; index < gpu->desc_pool_count; index++)
             vkDestroyDescriptorPool(gpu->device, gpu->desc_pools[index], NULL);
@@ -631,7 +666,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
     /* Per-kernel args buffer (binding 7). */
     VkBufferCreateInfo args_info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = sizeof(h3_gpu_vulkan_args),
+        .size = sizeof(h3_gpu_vulkan_args) * H3_VK_ARGS_SLOTS,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
     };
     if (vkCreateBuffer(gpu->device, &args_info, NULL,
@@ -666,18 +701,20 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         vkBindBufferMemory(gpu->device, gpu->args_buffer, gpu->args_memory,
                            0) != VK_SUCCESS ||
         vkMapMemory(gpu->device, gpu->args_memory, 0, VK_WHOLE_SIZE, 0,
-                    (void **)&gpu->args) != VK_SUCCESS) {
+                    (void **)&gpu->args_base) != VK_SUCCESS) {
         if (error && error_size)
             snprintf(error, error_size, "args buffer setup failed");
         h3_gpu_free(gpu);
         return NULL;
     }
+    gpu->args = gpu->args_base;
     return gpu;
 }
 
 void h3_gpu_free(h3_gpu *gpu) {
     if (!gpu) return;
     if (gpu->device) {
+        h3_vk_drain_pending(gpu);
         if (gpu->args_memory) {
             vkUnmapMemory(gpu->device, gpu->args_memory);
             vkFreeMemory(gpu->device, gpu->args_memory, NULL);
@@ -834,20 +871,38 @@ h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
     return h3_vk_tensor_from(gpu, values, elements, H3_GPU_U32);
 }
 
+static void h3_vk_tensor_destroy(h3_gpu *gpu, h3_gpu_tensor *tensor) {
+    if (gpu && gpu->device && tensor->memory) {
+        vkUnmapMemory(gpu->device, tensor->memory);
+        vkFreeMemory(gpu->device, tensor->memory, NULL);
+    }
+    if (gpu && gpu->device && tensor->buffer)
+        vkDestroyBuffer(gpu->device, tensor->buffer, NULL);
+    if (gpu && gpu->stats.live_bytes >= tensor->byte_size)
+        gpu->stats.live_bytes -= tensor->byte_size;
+    free(tensor);
+}
+
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {
     if (!tensor) return;
     h3_gpu *gpu = tensor->gpu;
-    if (gpu && gpu->device) {
-        if (tensor->memory) {
-            vkUnmapMemory(gpu->device, tensor->memory);
-            vkFreeMemory(gpu->device, tensor->memory, NULL);
+    /* The Metal backend keeps buffers alive through ARC; here, a tensor
+     * freed while commands referencing it are recorded (or already
+     * submitted without a wait) must survive until the final submit's
+     * device wait. Defer those frees. */
+    if (gpu && gpu->device && (gpu->command_active || gpu->pending_count)) {
+        if (gpu->pending_count < 64) {
+            gpu->pending[gpu->pending_count++] = tensor;
+            return;
         }
-        if (tensor->buffer)
-            vkDestroyBuffer(gpu->device, tensor->buffer, NULL);
-        if (gpu->stats.live_bytes >= tensor->byte_size)
-            gpu->stats.live_bytes -= tensor->byte_size;
     }
-    free(tensor);
+    h3_vk_tensor_destroy(gpu, tensor);
+}
+
+static void h3_vk_drain_pending(h3_gpu *gpu) {
+    for (uint32_t index = 0; index < gpu->pending_count; index++)
+        h3_vk_tensor_destroy(gpu, gpu->pending[index]);
+    gpu->pending_count = 0;
 }
 
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor) {
@@ -1020,6 +1075,7 @@ int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
 
 int h3_gpu_begin(h3_gpu *gpu) {
     if (!gpu) return -1;
+    gpu->args_dispatches = 0;
     gpu->encode_start = h3_vk_now();
     return h3_vk_begin_command(gpu) ? 0 : -1;
 }
@@ -1029,6 +1085,7 @@ int h3_gpu_continue(h3_gpu *gpu) {
     if (!h3_vk_submit_command(gpu, 0)) return -1;
     gpu->stats.command_encode_seconds += h3_vk_now() - gpu->encode_start;
     gpu->encode_start = h3_vk_now();
+    gpu->args_dispatches = 0;
     return h3_vk_begin_command(gpu) ? 0 : -1;
 }
 
@@ -1084,11 +1141,21 @@ static VkDescriptorSet h3_vk_prepare(h3_gpu *gpu, h3_vk_kernel kernel,
                         h3_vk_kernel_names[kernel], bindings, tensor_count);
         return VK_NULL_HANDLE;
     }
+    if (gpu->args_dispatches >= H3_VK_ARGS_SLOTS) {
+        h3_vk_set_error(gpu, "too many dispatches between submits "
+                             "(call h3_gpu_continue)");
+        return VK_NULL_HANDLE;
+    }
     VkDescriptorSet set = h3_vk_alloc_set(gpu, bindings + 1);
     if (set == VK_NULL_HANDLE) return VK_NULL_HANDLE;
     for (uint32_t index = 0; index < tensor_count; index++)
         h3_vk_set_buffer(gpu, set, index, tensors[index]->buffer);
-    h3_vk_set_buffer(gpu, set, 7, gpu->args_buffer);
+    h3_vk_set_buffer_offset(gpu, set, 7, gpu->args_buffer,
+                            (VkDeviceSize)gpu->args_slot *
+                                sizeof(h3_gpu_vulkan_args));
+    gpu->args_slot = (gpu->args_slot + 1) % H3_VK_ARGS_SLOTS;
+    gpu->args = gpu->args_base + gpu->args_slot;
+    gpu->args_dispatches++;
     return set;
 }
 
@@ -1339,7 +1406,90 @@ int h3_gpu_layer_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                       output, rows, width, epsilon);
 }
 
-/* -------------------------------------------------------------- profile */
+
+/* ------------------------------------------------------------- linear/mlp */
+
+static int h3_vk_linear(h3_gpu *gpu, h3_gpu_tensor *output,
+                        const h3_gpu_tensor *input,
+                        const h3_gpu_tensor *weight,
+                        const h3_gpu_tensor *bias, uint32_t rows,
+                        uint32_t input_dim, uint32_t output_dim) {
+    if (!h3_vk_check_tensors(gpu, 3, output, input, weight)) return -1;
+    if ((size_t)rows * input_dim > h3_gpu_tensor_elements(input) ||
+        (size_t)output_dim * input_dim > h3_gpu_tensor_elements(weight) ||
+        (size_t)rows * output_dim > h3_gpu_tensor_elements(output) ||
+        (bias && output_dim > h3_gpu_tensor_elements(bias))) {
+        h3_vk_set_error(gpu, "linear tensor size mismatch");
+        return -1;
+    }
+    gpu->args->rows = rows;
+    gpu->args->input_dim = input_dim;
+    gpu->args->output_dim = output_dim;
+    gpu->args->has_bias = bias ? 1u : 0u;
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    const h3_gpu_tensor *tensors[4] = { input, weight, bias_buffer, output };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_BF16,
+                                        tensors, 4);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_BF16, set,
+                          (output_dim + 15) / 16, (rows + 15) / 16, 1);
+}
+
+int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *weight,
+                       const h3_gpu_tensor *bias, uint32_t rows,
+                       uint32_t input_dim, uint32_t output_dim) {
+    return h3_vk_linear(gpu, output, input, weight, bias, rows, input_dim,
+                        output_dim);
+}
+
+/* Fused fc1 -> SwiGLU -> fc2. The FC1 weight is [2*hidden, input_dim] with
+ * gate in the first half and up in the second, matching the checkpoint
+ * layout. Each boundary rounds to BF16 exactly once (fc1, silu*gate, fc2),
+ * the same numerical contract as the Metal silu_mul kernel. */
+int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *input,
+                    const h3_gpu_tensor *fc1_weight,
+                    const h3_gpu_tensor *fc2_weight, uint32_t rows,
+                    uint32_t input_dim, uint32_t hidden_dim,
+                    uint32_t output_dim) {
+    if (!h3_vk_check_tensors(gpu, 4, output, input, fc1_weight, fc2_weight))
+        return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    h3_gpu_tensor *fc1 = h3_gpu_tensor_new_bf16(gpu,
+                                                (size_t)rows * hidden_dim * 2);
+    h3_gpu_tensor *activated = h3_gpu_tensor_new_bf16(gpu,
+                                                      (size_t)rows * hidden_dim);
+    if (!fc1 || !activated) {
+        h3_gpu_tensor_free(fc1);
+        h3_gpu_tensor_free(activated);
+        h3_vk_set_error(gpu, "MLP scratch allocation failed");
+        return -1;
+    }
+    int ok = 0;
+    if (h3_vk_linear(gpu, fc1, input, fc1_weight, NULL, rows, input_dim,
+                     hidden_dim * 2) == 0) {
+        gpu->args->elements = rows * hidden_dim;
+        gpu->args->width = hidden_dim;
+        const h3_gpu_tensor *tensors[2] = { fc1, activated };
+        VkDescriptorSet set = h3_vk_prepare(gpu,
+                                            H3_VK_KERNEL_SWIGLU_HALVES_BF16,
+                                            tensors, 2);
+        if (set != VK_NULL_HANDLE &&
+            h3_vk_dispatch(gpu, H3_VK_KERNEL_SWIGLU_HALVES_BF16, set,
+                           (uint32_t)(((uint64_t)rows * hidden_dim +
+                                       H3_VK_THREADS - 1) / H3_VK_THREADS),
+                           1, 1) == 0 &&
+            h3_vk_linear(gpu, output, activated, fc2_weight, NULL, rows,
+                         hidden_dim, output_dim) == 0) {
+            ok = 1;
+        }
+    }
+    h3_gpu_tensor_free(fc1);
+    h3_gpu_tensor_free(activated);
+    return ok ? 0 : -1;
+}
 
 void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label) {
     (void)gpu;
@@ -1352,11 +1502,11 @@ void h3_gpu_profile_mark(h3_gpu *gpu, const char *phase) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Kernels not yet ported to Vulkan. They fail cleanly with a   */
-/* descriptive error; the callers' existing error paths handle it. */
-
+/* Kernels not yet ported to Vulkan. They fail cleanly with a
+ * descriptive error; the callers' existing error paths handle it. */
 static int h3_vk_not_ported(h3_gpu *gpu, const char *name) {
-    h3_vk_set_error(gpu, "kernel %s is not ported to the Vulkan backend yet", name);
+    h3_vk_set_error(gpu, "kernel %s is not ported to the Vulkan backend yet",
+                    name);
     return -1;
 }
 
@@ -1614,25 +1764,6 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
                       uint32_t channels, uint32_t groups, float epsilon) {
 (void)gpu; (void)output; (void)input; (void)weight; (void)bias; (void)batch; (void)depth; (void)height; (void)width; (void)channels; (void)groups; (void)epsilon;
     return h3_vk_not_ported(gpu, "h3_gpu_vae_encoder_group_norm_silu_f32");
-}
-
-int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                       const h3_gpu_tensor *input,
-                       const h3_gpu_tensor *weight,
-                       const h3_gpu_tensor *bias, uint32_t rows,
-                       uint32_t input_dim, uint32_t output_dim) {
-(void)gpu; (void)output; (void)input; (void)weight; (void)bias; (void)rows; (void)input_dim; (void)output_dim;
-    return h3_vk_not_ported(gpu, "h3_gpu_linear_bf16");
-}
-
-int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                    const h3_gpu_tensor *input,
-                    const h3_gpu_tensor *fc1_weight,
-                    const h3_gpu_tensor *fc2_weight, uint32_t rows,
-                    uint32_t input_dim, uint32_t hidden_dim,
-                    uint32_t output_dim) {
-(void)gpu; (void)output; (void)input; (void)fc1_weight; (void)fc2_weight; (void)rows; (void)input_dim; (void)hidden_dim; (void)output_dim;
-    return h3_vk_not_ported(gpu, "h3_gpu_mlp_bf16");
 }
 
 int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

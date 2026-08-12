@@ -461,6 +461,9 @@ round-to-nearest-even is bit-exact):
 - `silu` f32/bf16, `silu_mul` bf16, `clip` f32, `gelu` bf16 (both modes)
 - `add`/`sub` bf16, `add_scaled` f32, `geglu` f32
 - `euler` bf16 sampler step
+- `linear` bf16 (16x16 threadgroup tiles, bias, bit-exact FMA order)
+- fused `mlp` bf16 (fc1 -> SwiGLU -> fc2; FC1 carries `[gate | up]` halves,
+  one BF16 rounding per boundary)
 - `embedding` bf16 (out-of-vocab rows zeroed)
 - `rms_norm`/`layer_norm` f32 and bf16 with the 256-thread tree reduction
 

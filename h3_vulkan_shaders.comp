@@ -41,6 +41,9 @@ struct H3Args {
     float delta;
     float ratio;
     float epsilon;
+    uint has_bias;
+    uint input_dim;
+    uint output_dim;
 };
 layout(set = 0, binding = 7) readonly buffer ArgsBuf { H3Args data; } args;
 
@@ -49,7 +52,11 @@ layout(set = 0, binding = 7) readonly buffer ArgsBuf { H3Args data; } args;
 layout(set = 0, binding = 0) readonly buffer InF32 { float data[]; } in_f32;
 layout(set = 0, binding = 1) writeonly buffer OutBF16 { uint16_t data[]; } out_bf16;
 
+#if defined(H3_LS16)
+layout(local_size_x = 16, local_size_y = 16) in;
+#else
 layout(local_size_x = 256) in;
+#endif
 void main_cast_f32_to_bf16() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= args.data.count) return;
@@ -329,6 +336,64 @@ void main_layer_norm_bf16() {
                           H3_BF16_TO_F32(norm_bias_b.data[column]));
         norm_out_b.data[base + column] = uint16_t(h3_f32_to_bf16(value));
     }
+}
+
+
+/* ------------------------------------------------------------ linear bf16 */
+
+layout(set = 0, binding = 0) readonly buffer LinIn { uint16_t data[]; } lin_in;
+layout(set = 0, binding = 1) readonly buffer LinW { uint16_t data[]; } lin_w;
+layout(set = 0, binding = 2) readonly buffer LinB { uint16_t data[]; } lin_b;
+layout(set = 0, binding = 3) writeonly buffer LinOut { uint16_t data[]; } lin_out;
+
+shared float lin_input_tile[16][16];
+shared float lin_weight_tile[16][16];
+
+void main_linear_bf16() {
+    uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    float sum = (args.data.has_bias != 0u && column < args.data.output_dim) ?
+        H3_BF16_TO_F32(lin_b.data[column]) : 0.0f;
+    uint tile_count = (args.data.input_dim + 15u) / 16u;
+    for (uint tile = 0u; tile < tile_count; tile++) {
+        uint input_k = tile * 16u + gl_LocalInvocationID.x;
+        lin_input_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (row < args.data.rows && input_k < args.data.input_dim) ?
+            H3_BF16_TO_F32(lin_in.data[row * args.data.input_dim + input_k]) :
+            0.0f;
+        uint weight_k = tile * 16u + gl_LocalInvocationID.y;
+        lin_weight_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (column < args.data.output_dim && weight_k < args.data.input_dim) ?
+            H3_BF16_TO_F32(lin_w.data[column * args.data.input_dim +
+                                       weight_k]) : 0.0f;
+        barrier();
+        for (uint k = 0u; k < 16u; k++) {
+            sum = fma(lin_input_tile[gl_LocalInvocationID.y][k],
+                      lin_weight_tile[k][gl_LocalInvocationID.x], sum);
+        }
+        barrier();
+    }
+    if (row < args.data.rows && column < args.data.output_dim) {
+        lin_out.data[row * args.data.output_dim + column] =
+            uint16_t(h3_f32_to_bf16(sum));
+    }
+}
+
+/* Fused [gate | up] halves of one FC1 output: out = silu(gate) * up with a
+ * single BF16 rounding, matching h3_shaders.metal's silu_mul semantics. */
+layout(set = 0, binding = 0) readonly buffer SwiIn { uint16_t data[]; } swi_in;
+layout(set = 0, binding = 1) writeonly buffer SwiOut { uint16_t data[]; } swi_out;
+
+void main_swiglu_halves_bf16() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.elements) return;
+    uint row = gid / args.data.width;
+    uint column = gid - row * args.data.width;
+    uint base = row * args.data.width * 2u;
+    float gate = H3_BF16_TO_F32(swi_in.data[base + column]);
+    float up = H3_BF16_TO_F32(swi_in.data[base + args.data.width + column]);
+    swi_out.data[gid] = uint16_t(h3_f32_to_bf16(
+        gate / (1.0f + exp(-gate)) * up));
 }
 
 /* The runtime compiles one module per kernel with H3_ENTRY selecting the

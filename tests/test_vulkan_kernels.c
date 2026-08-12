@@ -2199,6 +2199,139 @@ static void test_gate_adaln_quantize_int8(h3_gpu *gpu) {
     h3_gpu_tensor_free(qsc);
 }
 
+static void test_mlp_int8_grouped(h3_gpu *gpu) {
+    /* Default FC2 path: per-1024-group activation scales, dequantized per
+     * group and summed in f32 with one BF16 rounding (reference order
+     * (acc * input_scale) * weight_scale).  Half-way quantization values
+     * can round to either side on different FPUs, so comparisons allow
+     * one BF16 ULP. */
+    enum { ROWS = 3, INPUT_DIM = 29, HIDDEN = 2048, OUTPUT_DIM = 13,
+           GROUPS = 2 };
+    size_t input_count = (size_t)ROWS * INPUT_DIM;
+    size_t fc1_count = (size_t)HIDDEN * 2 * INPUT_DIM;
+    size_t fc2_count = (size_t)OUTPUT_DIM * HIDDEN;
+    uint16_t input[input_count], fc1[fc1_count], fc2[fc2_count];
+    int8_t qfc1[fc1_count], qfc2[fc2_count], qinput[input_count];
+    float fc1_scales[HIDDEN * 2], fc2_scales[OUTPUT_DIM];
+    float input_scales[ROWS];
+    for (size_t index = 0; index < input_count; index++)
+        input[index] = bf16_bits((float)(sin((double)index * 0.31) * 1.8));
+    for (size_t index = 0; index < fc1_count; index++)
+        fc1[index] = bf16_bits((float)(cos((double)index * 0.61) * 0.5));
+    for (size_t index = 0; index < fc2_count; index++)
+        fc2[index] = bf16_bits((float)(sin((double)index * 0.47) * 0.5));
+    int8_quantize_reference(fc1, qfc1, fc1_scales, HIDDEN * 2, INPUT_DIM,
+                            1.0f);
+    int8_quantize_reference(fc2, qfc2, fc2_scales, OUTPUT_DIM, HIDDEN, 1.0f);
+    int8_quantize_reference(input, qinput, input_scales, ROWS, INPUT_DIM,
+                            1.0f);
+    uint16_t activated[ROWS * HIDDEN];
+    for (uint32_t row = 0; row < ROWS; row++) {
+        for (uint32_t column = 0; column < HIDDEN; column++) {
+            int acc_gate = 0, acc_up = 0;
+            for (uint32_t k = 0; k < INPUT_DIM; k++) {
+                int value = (int)qinput[row * INPUT_DIM + k];
+                acc_gate += value * (int)qfc1[column * INPUT_DIM + k];
+                acc_up += value *
+                          (int)qfc1[(HIDDEN + column) * INPUT_DIM + k];
+            }
+            float gate = (float)acc_gate * input_scales[row] *
+                         fc1_scales[column];
+            float up = (float)acc_up * input_scales[row] *
+                       fc1_scales[HIDDEN + column];
+            activated[row * HIDDEN + column] =
+                bf16_bits(gate / (1.0f + expf(-gate)) * up);
+        }
+    }
+    int8_t qact[ROWS * HIDDEN];
+    float act_scales[ROWS * GROUPS];
+    for (uint32_t row = 0; row < ROWS; row++) {
+        for (uint32_t g = 0; g < GROUPS; g++) {
+            float local_max = 0.0f;
+            for (uint32_t k = 0; k < 1024; k++) {
+                float value = bf16_value(activated[row * HIDDEN +
+                                                   g * 1024 + k]);
+                float a = value < 0.0f ? -value : value;
+                if (a > local_max) local_max = a;
+            }
+            float scale = local_max > 0.0f ? local_max / 127.0f
+                                           : 1.0f / 127.0f;
+            float inverse = local_max > 0.0f ? 127.0f / local_max : 127.0f;
+            act_scales[row * GROUPS + g] = scale;
+            for (uint32_t k = 0; k < 1024; k++) {
+                float q = rintf(bf16_value(activated[row * HIDDEN +
+                                                     g * 1024 + k]) *
+                                inverse);
+                if (q > 127.0f) q = 127.0f;
+                if (q < -127.0f) q = -127.0f;
+                qact[row * HIDDEN + g * 1024 + k] = (int8_t)q;
+            }
+        }
+    }
+    uint16_t expected[ROWS * OUTPUT_DIM];
+    for (uint32_t row = 0; row < ROWS; row++) {
+        for (uint32_t column = 0; column < OUTPUT_DIM; column++) {
+            int acc[GROUPS];
+            for (uint32_t g = 0; g < GROUPS; g++) acc[g] = 0;
+            for (uint32_t k = 0; k < HIDDEN; k++)
+                acc[k / 1024] += (int)qact[row * HIDDEN + k] *
+                                 (int)qfc2[column * HIDDEN + k];
+            float total = 0.0f;
+            for (uint32_t g = 0; g < GROUPS; g++)
+                total += (float)acc[g] * act_scales[row * GROUPS + g] *
+                         fc2_scales[column];
+            expected[row * OUTPUT_DIM + column] = bf16_bits(total);
+        }
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_bf16(gpu, input, input_count);
+    h3_gpu_tensor *w1 = h3_gpu_tensor_from_bf16(gpu, fc1, fc1_count);
+    h3_gpu_tensor *w2 = h3_gpu_tensor_from_bf16(gpu, fc2, fc2_count);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, ROWS * OUTPUT_DIM);
+    h3_gpu_tensor *act = h3_gpu_tensor_new_bf16(gpu, ROWS * HIDDEN);
+    h3_gpu_tensor *qa = h3_gpu_tensor_new_i8(gpu, ROWS * HIDDEN);
+    h3_gpu_tensor *qs = h3_gpu_tensor_new_f32(gpu, ROWS * GROUPS);
+    h3_gpu_tensor *w1q = h3_gpu_tensor_new_i8(gpu, fc1_count);
+    h3_gpu_tensor *w1s = h3_gpu_tensor_new_f32(gpu, HIDDEN * 2);
+    h3_gpu_tensor *w2q = h3_gpu_tensor_new_i8(gpu, fc2_count);
+    h3_gpu_tensor *w2s = h3_gpu_tensor_new_f32(gpu, OUTPUT_DIM);
+    CHECK(in && w1 && w2 && out && act && qa && qs && w1q && w1s && w2q &&
+          w2s);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_quantize_weight_int8(gpu, w1q, w1s, w1, HIDDEN * 2,
+                                          INPUT_DIM) == 1);
+        CHECK(h3_gpu_quantize_weight_int8(gpu, w2q, w2s, w2, OUTPUT_DIM,
+                                          HIDDEN) == 1);
+        CHECK(h3_gpu_mlp_int8_bf16(gpu, out, act, qa, qs, in, w1q, w1s, w2q,
+                                   w2s, w1, w2, ROWS, INPUT_DIM, HIDDEN,
+                                   OUTPUT_DIM, 0, 0, 0, 0) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        uint16_t got[ROWS * OUTPUT_DIM];
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUTPUT_DIM) == 1);
+        for (size_t index = 0; index < ROWS * OUTPUT_DIM && !failed;
+             index++) {
+            float gv = bf16_value(got[index]);
+            float ev = bf16_value(expected[index]);
+            /* Half-way quantization products round differently on
+             * different FPUs; each off-by-one quantized weight shifts the
+             * dequant by its own scale, so allow a small absolute band. */
+            float tol = fmaxf(0.05f, fabsf(ev) * 0.05f);
+            CHECK(fabsf(gv - ev) <= tol);
+        }
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(w1);
+    h3_gpu_tensor_free(w2);
+    h3_gpu_tensor_free(out);
+    h3_gpu_tensor_free(act);
+    h3_gpu_tensor_free(qa);
+    h3_gpu_tensor_free(qs);
+    h3_gpu_tensor_free(w1q);
+    h3_gpu_tensor_free(w1s);
+    h3_gpu_tensor_free(w2q);
+    h3_gpu_tensor_free(w2s);
+}
+
 static void test_adaln_bf16(h3_gpu *gpu) {
     enum { ROWS = 4, WIDTH = 128, SLOTS = 3 };
     const float epsilon = 1e-5f;
@@ -3692,6 +3825,7 @@ int main(int argc, char **argv) {
     test_quantize_int8(gpu);
     test_linear_int8(gpu);
     test_mlp_int8(gpu);
+    test_mlp_int8_grouped(gpu);
     test_gate_adaln_quantize_int8(gpu);
     test_adaln_bf16(gpu);
     test_adaln_offset(gpu);

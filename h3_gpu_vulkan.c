@@ -140,38 +140,73 @@ typedef enum {
     H3_VK_KERNEL_LINEAR_INT8_BF16,
     H3_VK_KERNEL_FC1_SWIGLU_INT8_BF16,
     H3_VK_KERNEL_GATE_ADALN_QUANTIZE_INT8,
+    H3_VK_KERNEL_QUANTIZE_ROWS_GROUPS_BF16_I8,
+    H3_VK_KERNEL_LINEAR_INT8_GROUPED_BF16,
     H3_VK_KERNEL_COUNT
 } h3_vk_kernel;
 
 static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
-    "main_cast_f32_to_bf16", "main_cast_bf16_to_f32",
-    "main_silu_f32", "main_silu_bf16", "main_silu_mul_bf16",
-    "main_clip_f32", "main_gelu_bf16", "main_add_bf16", "main_sub_bf16",
-    "main_add_scaled_f32", "main_geglu_f32", "main_euler_bf16",
-    "main_embedding_bf16", "main_rms_norm_f32", "main_layer_norm_f32",
-    "main_rms_norm_bf16", "main_layer_norm_bf16",
-    "main_linear_bf16", "main_swiglu_halves_bf16",
-    "main_adaln_bf16", "main_gate_bf16", "main_gate_adaln_bf16",
-    "main_rms_inverse_bf16", "main_adaln_linear_bf16",
+    "main_cast_f32_to_bf16",
+    "main_cast_bf16_to_f32",
+    "main_silu_f32",
+    "main_silu_bf16",
+    "main_silu_mul_bf16",
+    "main_clip_f32",
+    "main_gelu_bf16",
+    "main_add_bf16",
+    "main_sub_bf16",
+    "main_add_scaled_f32",
+    "main_geglu_f32",
+    "main_euler_bf16",
+    "main_embedding_bf16",
+    "main_rms_norm_f32",
+    "main_layer_norm_f32",
+    "main_rms_norm_bf16",
+    "main_layer_norm_bf16",
+    "main_linear_bf16",
+    "main_swiglu_halves_bf16",
+    "main_adaln_bf16",
+    "main_gate_bf16",
+    "main_gate_adaln_bf16",
+    "main_rms_inverse_bf16",
+    "main_adaln_linear_bf16",
     "main_head_rms_norm_bf16",
-    "main_grouped_qkv_rope_bf16", "main_sdpa_bf16",
+    "main_grouped_qkv_rope_bf16",
+    "main_sdpa_bf16",
     "main_sdpa_flash_bf16",
-    "main_patch_linear_bf16", "main_patch_linear_bf16_map",
-    "main_token_pool_bf16", "main_token_pool_adaln_bf16",
-    "main_token_expand_delta_bf16", "main_token_expand_adaln_bf16",
-    "main_text_qk_rope_bf16", "main_rope_text_bf16",
+    "main_patch_linear_bf16",
+    "main_patch_linear_bf16_map",
+    "main_token_pool_bf16",
+    "main_token_pool_adaln_bf16",
+    "main_token_expand_delta_bf16",
+    "main_token_expand_adaln_bf16",
+    "main_text_qk_rope_bf16",
+    "main_rope_text_bf16",
     "main_gqa_causal_bf16",
-    "main_linear_f32", "main_scale_add_f32",
-    "main_swiglu_f32", "main_video_qkv_rope_f32",
-    "main_vae_encoder_pad_f32", "main_vae_encoder_group_norm_silu_f32",
-    "main_sdpa_f32", "main_sdpa_flash_f32", "main_conv3d_f32",
-    "main_weight_norm_f32", "main_snake1d_f32",
-    "main_alias_free_snake_f32", "main_audio_qkv_split_f32",
-    "main_audio_attention_pool_f32", "main_conv1d_stride_f32",
-    "main_conv_transpose1d_f32", "main_sdpa_causal_f32",
+    "main_linear_f32",
+    "main_scale_add_f32",
+    "main_swiglu_f32",
+    "main_video_qkv_rope_f32",
+    "main_vae_encoder_pad_f32",
+    "main_vae_encoder_group_norm_silu_f32",
+    "main_sdpa_f32",
+    "main_sdpa_flash_f32",
+    "main_conv3d_f32",
+    "main_weight_norm_f32",
+    "main_snake1d_f32",
+    "main_alias_free_snake_f32",
+    "main_audio_qkv_split_f32",
+    "main_audio_attention_pool_f32",
+    "main_conv1d_stride_f32",
+    "main_conv_transpose1d_f32",
+    "main_sdpa_causal_f32",
     "main_vision_qkv_rope_bf16",
-    "main_quantize_rows_bf16_i8", "main_linear_int8_bf16",
-    "main_fc1_swiglu_int8_bf16", "main_gate_adaln_quantize_int8"
+    "main_quantize_rows_bf16_i8",
+    "main_linear_int8_bf16",
+    "main_fc1_swiglu_int8_bf16",
+    "main_gate_adaln_quantize_int8",
+    "main_quantize_rows_groups_bf16_i8",
+    "main_linear_int8_grouped_bf16"
 };
 
 /* Storage-buffer bindings consumed by each kernel (0..n-1 plus binding 7
@@ -179,17 +214,13 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
 /* Highest storage-buffer binding used by each kernel plus one (bindings
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
-    2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2, 5,
-    5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2,
-    6, 2, 4, 4, 4, 4, 3, 3, 6, 7, 2, 4, 4, 4, 6, 3, 5, 5, 9
+    2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2, 5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2, 6, 2, 4, 4, 4, 4, 3, 3, 6, 7, 2, 4, 4, 4, 6, 3, 5, 5, 9, 3, 5
 };
 
 /* Workgroup layout per kernel: 0 = 256 threads, 1 = 16x16 tiles,
  * 2 = 128 threads (SDPA flash). */
 static const int h3_vk_kernel_layout[H3_VK_KERNEL_COUNT] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-    1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1,
-    1, 1, 0, 0, 2, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1, 1, 1, 0, 0, 2, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1
 };
 
 struct h3_gpu {
@@ -3188,7 +3219,11 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     (void)fc2_bf16;
     (void)use_slower_grouped_quantizer;
     (void)use_slower_dynamic_fc1_k;
-    (void)use_int8_row_fc2;
+    uint32_t groups = use_int8_row_fc2 ? 0u : hidden_dim / 1024u;
+    if (!use_int8_row_fc2 && hidden_dim % 1024u) {
+        h3_vk_set_error(gpu, "grouped int8 FC2 requires hidden_dim % 1024 == 0");
+        return 0;
+    }
     size_t fc1_count = (size_t)hidden_dim * 2 * input_dim;
     size_t fc2_count = (size_t)output_dim * hidden_dim;
     if ((size_t)rows * input_dim > h3_gpu_tensor_elements(input) ||
@@ -3196,9 +3231,10 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         hidden_dim * 2 > h3_gpu_tensor_elements(fc1_scales) ||
         fc2_count > h3_gpu_tensor_elements(fc2_weight) ||
         output_dim > h3_gpu_tensor_elements(fc2_scales) ||
-        (size_t)rows * input_dim >
+        (size_t)rows * (use_int8_row_fc2 ? input_dim : hidden_dim) >
             h3_gpu_tensor_elements(quantized_activation) ||
-        rows > h3_gpu_tensor_elements(activation_scales) ||
+        (size_t)rows * (use_int8_row_fc2 ? 1u : groups) >
+            h3_gpu_tensor_elements(activation_scales) ||
         (size_t)rows * hidden_dim > h3_gpu_tensor_elements(activated) ||
         (size_t)rows * output_dim > h3_gpu_tensor_elements(output)) {
         h3_vk_set_error(gpu, "int8 MLP tensor size mismatch");
@@ -3234,31 +3270,65 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            (hidden_dim + 15) / 16, (rows + 15) / 16, 1) == 0)
             return 0;
     }
-    /* Quantize the SwiGLU activation for FC2. */
+    if (use_int8_row_fc2) {
+        /* Per-row activation scales for FC2 (Metal row-fc2 path). */
+        gpu->args->rows = rows;
+        gpu->args->width = hidden_dim;
+        gpu->args->left_scale = 1.0f;
+        {
+            const h3_gpu_tensor *q[3] = { activated, quantized_activation,
+                                          activation_scales };
+            VkDescriptorSet set = h3_vk_prepare(
+                gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, q, 3);
+            if (set == VK_NULL_HANDLE) return 0;
+            if (h3_vk_dispatch(gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, set,
+                               rows, 1, 1) == 0)
+                return 0;
+        }
+        gpu->args->rows = rows;
+        gpu->args->input_dim = hidden_dim;
+        gpu->args->output_dim = output_dim;
+        {
+            const h3_gpu_tensor *l[5] = { quantized_activation, fc2_weight,
+                                          activation_scales, fc2_scales,
+                                          output };
+            VkDescriptorSet set = h3_vk_prepare(
+                gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, l, 5);
+            if (set == VK_NULL_HANDLE) return 0;
+            return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
+                                  (output_dim + 15) / 16,
+                                  (rows + 15) / 16, 1);
+        }
+    }
+    /* Default grouped FC2 (Metal grouped_nax path): one max-abs scale per
+     * 1024-wide activation group, dequantized per group with a single
+     * BF16 rounding. */
     gpu->args->rows = rows;
     gpu->args->width = hidden_dim;
-    gpu->args->left_scale = 1.0f;
+    gpu->args->output_dim = groups;
+    gpu->args->elements = 1024u;
     {
         const h3_gpu_tensor *q[3] = { activated, quantized_activation,
                                       activation_scales };
         VkDescriptorSet set = h3_vk_prepare(
-            gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, q, 3);
+            gpu, H3_VK_KERNEL_QUANTIZE_ROWS_GROUPS_BF16_I8, q, 3);
         if (set == VK_NULL_HANDLE) return 0;
-        if (h3_vk_dispatch(gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, set,
-                           rows, 1, 1) == 0)
+        if (h3_vk_dispatch(gpu, H3_VK_KERNEL_QUANTIZE_ROWS_GROUPS_BF16_I8,
+                           set, rows, 1, 1) == 0)
             return 0;
     }
-    /* FC2 projection. */
     gpu->args->rows = rows;
     gpu->args->input_dim = hidden_dim;
     gpu->args->output_dim = output_dim;
+    gpu->args->width = 1024u;
+    gpu->args->elements = groups;
     {
         const h3_gpu_tensor *l[5] = { quantized_activation, fc2_weight,
                                       activation_scales, fc2_scales, output };
-        VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16,
-                                            l, 5);
+        VkDescriptorSet set = h3_vk_prepare(
+            gpu, H3_VK_KERNEL_LINEAR_INT8_GROUPED_BF16, l, 5);
         if (set == VK_NULL_HANDLE) return 0;
-        return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
+        return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_GROUPED_BF16, set,
                               (output_dim + 15) / 16, (rows + 15) / 16, 1);
     }
 }

@@ -934,6 +934,60 @@ void main_sdpa_flash_bf16() {
     fl_out.data[oindex] = uint16_t(h3_f32_to_bf16(fl_acc[d] / fl_sum));
 }
 
+/* 16x16 tiled int8 matmuls: integer accumulation is exact and order
+ * independent, so the dequantized result is bit-identical to the naive
+ * kernel while the weights are staged through shared memory. */
+shared int lin8_in_tile[16][16];
+shared int lin8_w_tile[16][16];
+layout(set = 0, binding = 0) readonly buffer L8In { int8_t data[]; } l8_in;
+layout(set = 0, binding = 1) readonly buffer L8W { int8_t data[]; } l8_w;
+layout(set = 0, binding = 2) readonly buffer L8IS { float data[]; } l8_is;
+layout(set = 0, binding = 3) readonly buffer L8WS { float data[]; } l8_ws;
+layout(set = 0, binding = 4) writeonly buffer L8Out { uint16_t data[]; } l8_out;
+
+/* Grouped FC2 (Metal h3_linear_int8_grouped_nax_r128x64): one int
+ * accumulator per 1024-wide input group, dequantized per group and summed
+ * in f32 with a single BF16 rounding, matching the reference order
+ * (acc * input_scale) * weight_scale. */
+void main_linear_int8_grouped_bf16() {
+    uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    /* args: rows/input_dim/output_dim as usual; width = group size,
+     * elements = number of groups. */
+    uint groups = args.data.elements;
+    uint group_size = args.data.width;
+    if (groups > 16u) return;
+    int acc[16];
+    for (uint g = 0u; g < groups; g++) acc[g] = 0;
+    uint tile_count = (args.data.input_dim + 15u) / 16u;
+    for (uint tile = 0u; tile < tile_count; tile++) {
+        uint input_k = tile * 16u + gl_LocalInvocationID.x;
+        lin8_in_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (row < args.data.rows && input_k < args.data.input_dim) ?
+            int(l8_in.data[row * args.data.input_dim + input_k]) : 0;
+        uint weight_k = tile * 16u + gl_LocalInvocationID.y;
+        lin8_w_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (column < args.data.output_dim && weight_k < args.data.input_dim) ?
+            int(l8_w.data[column * args.data.input_dim + weight_k]) : 0;
+        barrier();
+        uint group = (tile * 16u) / group_size;
+        for (uint k = 0u; k < 16u; k++) {
+            acc[group] += lin8_in_tile[gl_LocalInvocationID.y][k] *
+                          lin8_w_tile[k][gl_LocalInvocationID.x];
+        }
+        barrier();
+    }
+    if (row < args.data.rows && column < args.data.output_dim) {
+        float total = 0.0f;
+        for (uint g = 0u; g < groups; g++) {
+            total += float(acc[g]) * l8_is.data[row * groups + g] *
+                     l8_ws.data[column];
+        }
+        l8_out.data[row * args.data.output_dim + column] =
+            uint16_t(h3_f32_to_bf16(total));
+    }
+}
+
 /* F32 sibling of the flash kernel: one workgroup per (head, row) with an
  * online-softmax sweep over the sequence; used for long sequences where
  * the one-thread-per-output naive kernel would trip the GPU watchdog. */
@@ -2031,17 +2085,6 @@ void main_quantize_rows_bf16_i8() {
 
 /* int8 matmul: acc = sum(q_in * w) in int32, out = bf16(acc * in_s * w_s). */
 
-layout(set = 0, binding = 0) readonly buffer L8In { int8_t data[]; } l8_in;
-layout(set = 0, binding = 1) readonly buffer L8W { int8_t data[]; } l8_w;
-layout(set = 0, binding = 2) readonly buffer L8IS { float data[]; } l8_is;
-layout(set = 0, binding = 3) readonly buffer L8WS { float data[]; } l8_ws;
-layout(set = 0, binding = 4) writeonly buffer L8Out { uint16_t data[]; } l8_out;
-
-/* 16x16 tiled int8 matmul: integer accumulation is exact and order
- * independent, so the dequantized result is bit-identical to the naive
- * kernel while the weights are staged through shared memory. */
-shared int lin8_in_tile[16][16];
-shared int lin8_w_tile[16][16];
 
 void main_linear_int8_bf16() {
     uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
@@ -2068,6 +2111,51 @@ void main_linear_int8_bf16() {
         float dequant = float(acc) * l8_is.data[row] * l8_ws.data[column];
         l8_out.data[row * args.data.output_dim + column] =
             uint16_t(h3_f32_to_bf16(dequant));
+    }
+}
+
+/* Grouped quantizer (Metal h3_quantize_bf16_int8_groups_scalar128): one
+ * workgroup per row, one max-abs scale per 1024-wide column group.  The
+ * MLP FC2 path uses this so each group carries its own quantization. */
+void main_quantize_rows_groups_bf16_i8() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint columns = args.data.width;
+    uint groups = args.data.output_dim;
+    uint group_size = args.data.elements;
+    uint base = row * columns;
+    if (row >= args.data.rows) {
+        for (uint column = tid; column < columns; column += 256u)
+            q_out.data[base + column] = int8_t(0);
+        for (uint group = tid; group < groups; group += 256u)
+            q_scales.data[row * groups + group] = 1.0f;
+        return;
+    }
+    for (uint group = 0u; group < groups; group++) {
+        uint start = group * group_size;
+        float local_max = 0.0f;
+        for (uint local = tid; local < group_size; local += 256u)
+            local_max = max(local_max,
+                            abs(H3_BF16_TO_F32(q_in.data[base + start + local])));
+        q_reductions[tid] = local_max;
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride >>= 1) {
+            if (tid < stride) q_reductions[tid] = max(q_reductions[tid],
+                                                      q_reductions[tid + stride]);
+            barrier();
+        }
+        float max_abs = q_reductions[0];
+        float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+        float inverse = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+        if (tid == 0u) {
+            q_scales.data[row * groups + group] = scale;
+        }
+        for (uint local = tid; local < group_size; local += 256u) {
+            int quantized = int(roundEven(H3_BF16_TO_F32(q_in.data[base + start + local]) *
+                                     inverse));
+            q_out.data[base + start + local] = int8_t(clamp(quantized, -127, 127));
+        }
+        barrier();
     }
 }
 

@@ -763,6 +763,89 @@ void main_sdpa_bf16() {
     }
 }
 
+
+
+/* ------------------------------------------------------- patch linear */
+
+layout(set = 0, binding = 0) readonly buffer PIn { float data[]; } p_in;
+layout(set = 0, binding = 1) readonly buffer PW { float data[]; } p_w;
+layout(set = 0, binding = 2) readonly buffer PB { float data[]; } p_b;
+layout(set = 0, binding = 3) writeonly buffer POut { uint16_t data[]; } p_out;
+
+/* F32 patch projection (video 96->5376, audio 32->5376) writing BF16
+ * directly into the packed hidden stream. */
+void main_patch_linear_bf16() {
+    uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    float sum = (args.data.has_bias != 0u && column < args.data.output_dim) ?
+        p_b.data[column] : 0.0f;
+    uint tile_count = (args.data.input_dim + 15u) / 16u;
+    for (uint tile = 0u; tile < tile_count; tile++) {
+        uint input_k = tile * 16u + gl_LocalInvocationID.x;
+        lin_input_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (row < args.data.rows && input_k < args.data.input_dim) ?
+            p_in.data[row * args.data.input_dim + input_k] : 0.0f;
+        uint weight_k = tile * 16u + gl_LocalInvocationID.y;
+        lin_weight_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (column < args.data.output_dim && weight_k < args.data.input_dim) ?
+            p_w.data[column * args.data.input_dim + weight_k] : 0.0f;
+        barrier();
+        for (uint k = 0u; k < 16u; k++) {
+            sum = fma(lin_input_tile[gl_LocalInvocationID.y][k],
+                      lin_weight_tile[k][gl_LocalInvocationID.x], sum);
+        }
+        barrier();
+    }
+    if (row < args.data.rows && column < args.data.output_dim) {
+        p_out.data[row * args.data.output_dim + column] =
+            uint16_t(h3_f32_to_bf16(sum));
+    }
+}
+
+/* Mapped variant: row_map compacts destination rows (FL2VA/Ref2VA packed
+ * layouts), read once per threadgroup row. */
+layout(set = 0, binding = 0) readonly buffer PMIn { float data[]; } pm_in;
+layout(set = 0, binding = 1) readonly buffer PMW { float data[]; } pm_w;
+layout(set = 0, binding = 2) readonly buffer PMB { float data[]; } pm_b;
+layout(set = 0, binding = 3) writeonly buffer PMOut { uint16_t data[]; } pm_out;
+layout(set = 0, binding = 4) readonly buffer PMMap { uint data[]; } pm_map;
+
+shared uint patch_output_rows[16];
+
+void main_patch_linear_bf16_map() {
+    uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    if (gl_LocalInvocationID.x == 0u) {
+        patch_output_rows[gl_LocalInvocationID.y] =
+            row < args.data.rows ? pm_map.data[row] : 0u;
+    }
+    barrier();
+    float sum = (args.data.has_bias != 0u && column < args.data.output_dim) ?
+        pm_b.data[column] : 0.0f;
+    uint tile_count = (args.data.input_dim + 15u) / 16u;
+    for (uint tile = 0u; tile < tile_count; tile++) {
+        uint input_k = tile * 16u + gl_LocalInvocationID.x;
+        lin_input_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (row < args.data.rows && input_k < args.data.input_dim) ?
+            pm_in.data[row * args.data.input_dim + input_k] : 0.0f;
+        uint weight_k = tile * 16u + gl_LocalInvocationID.y;
+        lin_weight_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (column < args.data.output_dim && weight_k < args.data.input_dim) ?
+            pm_w.data[column * args.data.input_dim + weight_k] : 0.0f;
+        barrier();
+        for (uint k = 0u; k < 16u; k++) {
+            sum = fma(lin_input_tile[gl_LocalInvocationID.y][k],
+                      lin_weight_tile[k][gl_LocalInvocationID.x], sum);
+        }
+        barrier();
+    }
+    if (row < args.data.rows && column < args.data.output_dim) {
+        pm_out.data[patch_output_rows[gl_LocalInvocationID.y] *
+                    args.data.output_dim + column] =
+            uint16_t(h3_f32_to_bf16(sum));
+    }
+}
+
 /* The runtime compiles one module per kernel with H3_ENTRY selecting the
  * kernel function; glslc testing uses -DH3_ENTRY=main_<kernel>. */
 void main() { H3_ENTRY(); }

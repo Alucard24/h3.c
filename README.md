@@ -462,6 +462,9 @@ round-to-nearest-even is bit-exact):
 - `add`/`sub` bf16, `add_scaled` f32, `geglu` f32
 - `euler` bf16 sampler step
 - `linear` bf16 (16x16 threadgroup tiles, bias, bit-exact FMA order)
+- fused patch projections `patch_linear` bf16 (F32 96/32 -> 5376 tiles
+  writing BF16 directly into the packed hidden stream, input/output offset
+  views, and the row-mapped compact FL2VA/Ref2VA destination variant)
 - fused `mlp` bf16 (fc1 -> SwiGLU -> fc2; FC1 carries `[gate | up]` halves,
   one BF16 rounding per boundary)
 - DiT modulation: `adaln` bf16 (+ offset views), `gate` bf16, fused

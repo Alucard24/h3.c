@@ -90,6 +90,8 @@ typedef enum {
     H3_VK_KERNEL_HEAD_RMS_NORM_BF16,
     H3_VK_KERNEL_GROUPED_QKV_ROPE_BF16,
     H3_VK_KERNEL_SDPA_BF16,
+    H3_VK_KERNEL_PATCH_LINEAR_BF16,
+    H3_VK_KERNEL_PATCH_LINEAR_BF16_MAP,
     H3_VK_KERNEL_COUNT
 } h3_vk_kernel;
 
@@ -104,7 +106,8 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_adaln_bf16", "main_gate_bf16", "main_gate_adaln_bf16",
     "main_rms_inverse_bf16", "main_adaln_linear_bf16",
     "main_head_rms_norm_bf16",
-    "main_grouped_qkv_rope_bf16", "main_sdpa_bf16"
+    "main_grouped_qkv_rope_bf16", "main_sdpa_bf16",
+    "main_patch_linear_bf16", "main_patch_linear_bf16_map"
 };
 
 /* Storage-buffer bindings consumed by each kernel (0..n-1 plus binding 7
@@ -113,13 +116,13 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
     2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2,
-    5, 5, 8, 2, 8, 2, 8, 4
+    5, 5, 8, 2, 8, 2, 8, 4, 4, 5
 };
 
 /* Kernels with a 16x16 threadgroup need H3_LS16 at compile time. */
 static const int h3_vk_kernel_ls16[H3_VK_KERNEL_COUNT] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-    0, 1, 0, 0, 1, 1, 0, 0
+    0, 1, 0, 0, 1, 1, 0, 0, 1, 1
 };
 
 struct h3_gpu {
@@ -1149,7 +1152,8 @@ static int h3_vk_dispatch(h3_gpu *gpu, h3_vk_kernel kernel,
 static VkDescriptorSet h3_vk_prepare_off(h3_gpu *gpu, h3_vk_kernel kernel,
                                          const h3_gpu_tensor *const *tensors,
                                          uint32_t tensor_count,
-                                         VkDeviceSize first_offset) {
+                                         VkDeviceSize first_offset,
+                                         VkDeviceSize last_offset) {
     uint32_t bindings = h3_vk_kernel_bindings[kernel];
     if (tensor_count != bindings) {
         h3_vk_set_error(gpu, "kernel %s expects %u bindings, got %u",
@@ -1164,7 +1168,9 @@ static VkDescriptorSet h3_vk_prepare_off(h3_gpu *gpu, h3_vk_kernel kernel,
     VkDescriptorSet set = h3_vk_alloc_set(gpu, bindings + 1);
     if (set == VK_NULL_HANDLE) return VK_NULL_HANDLE;
     for (uint32_t index = 0; index < tensor_count; index++) {
-        VkDeviceSize offset = (index == 0) ? first_offset : 0;
+        VkDeviceSize offset = 0;
+        if (index == 0) offset = first_offset;
+        if (index == tensor_count - 1) offset = last_offset;
         h3_vk_set_buffer_offset(gpu, set, index, tensors[index]->buffer,
                                 offset);
     }
@@ -1180,7 +1186,7 @@ static VkDescriptorSet h3_vk_prepare_off(h3_gpu *gpu, h3_vk_kernel kernel,
 static VkDescriptorSet h3_vk_prepare(h3_gpu *gpu, h3_vk_kernel kernel,
                                      const h3_gpu_tensor *const *tensors,
                                      uint32_t tensor_count) {
-    return h3_vk_prepare_off(gpu, kernel, tensors, tensor_count, 0);
+    return h3_vk_prepare_off(gpu, kernel, tensors, tensor_count, 0, 0);
 }
 
 int h3_gpu_cast_f32_to_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -1537,7 +1543,8 @@ int h3_gpu_adaln_bf16_offset(h3_gpu *gpu, h3_gpu_tensor *output,
                                         row_map, output };
     VkDescriptorSet set = h3_vk_prepare_off(gpu, H3_VK_KERNEL_ADALN_BF16,
                                             tensors, 5,
-                                            (VkDeviceSize)input_offset * 2);
+                                            (VkDeviceSize)input_offset * 2,
+                                            0);
     if (set == VK_NULL_HANDLE) return -1;
     return h3_vk_dispatch(gpu, H3_VK_KERNEL_ADALN_BF16, set, rows, 1, 1);
 }
@@ -1631,7 +1638,7 @@ int h3_gpu_adaln_linear_bf16(
     const h3_gpu_tensor *rms_tensors[2] = { input, inverse };
     VkDescriptorSet rms_set = h3_vk_prepare_off(
         gpu, H3_VK_KERNEL_RMS_INVERSE_BF16, rms_tensors, 2,
-        (VkDeviceSize)input_offset * 2);
+        (VkDeviceSize)input_offset * 2, 0);
     if (rms_set == VK_NULL_HANDLE ||
         h3_vk_dispatch(gpu, H3_VK_KERNEL_RMS_INVERSE_BF16, rms_set, rows, 1,
                        1) != 0)
@@ -1650,7 +1657,8 @@ int h3_gpu_adaln_linear_bf16(
     VkDescriptorSet set = h3_vk_prepare_off(gpu,
                                             H3_VK_KERNEL_ADALN_LINEAR_BF16,
                                             tensors, 8,
-                                            (VkDeviceSize)input_offset * 2);
+                                            (VkDeviceSize)input_offset * 2,
+                                            0);
     if (set == VK_NULL_HANDLE) return -1;
     return h3_vk_dispatch(gpu, H3_VK_KERNEL_ADALN_LINEAR_BF16, set,
                           (output_dim + 15) / 16, (rows + 15) / 16, 1);
@@ -1675,6 +1683,30 @@ int h3_gpu_head_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *tensor,
 
 
 /* ------------------------------------------------------------ qkv/sdpa */
+
+
+static int h3_vk_patch_linear(h3_gpu *gpu, h3_gpu_tensor *output,
+                              size_t output_offset,
+                              const h3_gpu_tensor *input,
+                              size_t input_offset,
+                              const h3_gpu_tensor *weight,
+                              const h3_gpu_tensor *bias, uint32_t rows,
+                              uint32_t input_dim, uint32_t output_dim) {
+    if (!h3_vk_check_tensors(gpu, 3, output, input, weight)) return -1;
+    gpu->args->rows = rows;
+    gpu->args->input_dim = input_dim;
+    gpu->args->output_dim = output_dim;
+    gpu->args->has_bias = bias ? 1u : 0u;
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    const h3_gpu_tensor *tensors[4] = { input, weight, bias_buffer, output };
+    VkDescriptorSet set = h3_vk_prepare_off(gpu, H3_VK_KERNEL_PATCH_LINEAR_BF16,
+                                            tensors, 4,
+                                            (VkDeviceSize)input_offset * 4,
+                                            (VkDeviceSize)output_offset * 2);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_PATCH_LINEAR_BF16, set,
+                          (output_dim + 15) / 16, (rows + 15) / 16, 1);
+}
 
 static int h3_vk_qkv_rope(h3_gpu *gpu, h3_gpu_tensor *query,
                           h3_gpu_tensor *key, h3_gpu_tensor *value,
@@ -1771,6 +1803,56 @@ int h3_gpu_sdpa_bf16_head_major_output(
 }
 
 
+
+/* ------------------------------------------------------------ patch */
+
+int h3_gpu_patch_linear_bf16_offset(
+                             h3_gpu *gpu, h3_gpu_tensor *output,
+                             size_t output_offset,
+                             const h3_gpu_tensor *input, size_t input_offset,
+                             const h3_gpu_tensor *weight,
+                             const h3_gpu_tensor *bias, uint32_t rows,
+                             uint32_t input_dim, uint32_t output_dim) {
+    return h3_vk_patch_linear(gpu, output, output_offset, input, input_offset,
+                              weight, bias, rows, input_dim, output_dim);
+}
+
+int h3_gpu_patch_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight,
+                             const h3_gpu_tensor *bias, uint32_t rows,
+                             uint32_t input_dim, uint32_t output_dim) {
+    return h3_gpu_patch_linear_bf16_offset(gpu, output, 0, input, 0, weight,
+                                           bias, rows, input_dim, output_dim);
+}
+
+int h3_gpu_patch_linear_bf16_map(
+                             h3_gpu *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight,
+                             const h3_gpu_tensor *bias,
+                             const h3_gpu_tensor *row_map,
+                             uint32_t output_rows, uint32_t rows,
+                             uint32_t input_dim, uint32_t output_dim) {
+    if (!h3_vk_check_tensors(gpu, 4, output, input, weight, row_map))
+        return -1;
+    if (bias && !h3_vk_check_tensors(gpu, 1, bias)) return -1;
+    (void)output_rows;
+    gpu->args->rows = rows;
+    gpu->args->input_dim = input_dim;
+    gpu->args->output_dim = output_dim;
+    gpu->args->has_bias = bias ? 1u : 0u;
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    const h3_gpu_tensor *tensors[5] = { input, weight, bias_buffer, output,
+                                        row_map };
+    VkDescriptorSet set = h3_vk_prepare(gpu,
+                                        H3_VK_KERNEL_PATCH_LINEAR_BF16_MAP,
+                                        tensors, 5);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_PATCH_LINEAR_BF16_MAP, set,
+                          (output_dim + 15) / 16, (rows + 15) / 16, 1);
+}
+
 void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label) {
     (void)gpu;
     (void)label;
@@ -1796,38 +1878,6 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       uint32_t input_dim, uint32_t output_dim) {
 (void)gpu; (void)output; (void)input; (void)weight; (void)bias; (void)rows; (void)input_dim; (void)output_dim;
     return h3_vk_not_ported(gpu, "h3_gpu_linear_f32");
-}
-
-int h3_gpu_patch_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                             const h3_gpu_tensor *input,
-                             const h3_gpu_tensor *weight,
-                             const h3_gpu_tensor *bias, uint32_t rows,
-                             uint32_t input_dim, uint32_t output_dim) {
-(void)gpu; (void)output; (void)input; (void)weight; (void)bias; (void)rows; (void)input_dim; (void)output_dim;
-    return h3_vk_not_ported(gpu, "h3_gpu_patch_linear_bf16");
-}
-
-int h3_gpu_patch_linear_bf16_offset(
-                             h3_gpu *gpu, h3_gpu_tensor *output,
-                             size_t output_offset,
-                             const h3_gpu_tensor *input, size_t input_offset,
-                             const h3_gpu_tensor *weight,
-                             const h3_gpu_tensor *bias, uint32_t rows,
-                             uint32_t input_dim, uint32_t output_dim) {
-(void)gpu; (void)output; (void)output_offset; (void)input; (void)input_offset; (void)weight; (void)bias; (void)rows; (void)input_dim; (void)output_dim;
-    return h3_vk_not_ported(gpu, "h3_gpu_patch_linear_bf16_offset");
-}
-
-int h3_gpu_patch_linear_bf16_map(
-                             h3_gpu *gpu, h3_gpu_tensor *output,
-                             const h3_gpu_tensor *input,
-                             const h3_gpu_tensor *weight,
-                             const h3_gpu_tensor *bias,
-                             const h3_gpu_tensor *row_map,
-                             uint32_t output_rows, uint32_t rows,
-                             uint32_t input_dim, uint32_t output_dim) {
-(void)gpu; (void)output; (void)input; (void)weight; (void)bias; (void)row_map; (void)output_rows; (void)rows; (void)input_dim; (void)output_dim;
-    return h3_vk_not_ported(gpu, "h3_gpu_patch_linear_bf16_map");
 }
 
 int h3_gpu_copy_bf16(h3_gpu *gpu, h3_gpu_tensor *destination,

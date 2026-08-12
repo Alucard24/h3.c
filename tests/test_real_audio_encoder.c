@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "test_util.h"
 
 static void die(const char *message) {
     fprintf(stderr, "FAIL tests/test_real_audio_encoder.c: %s\n", message);
@@ -48,7 +49,7 @@ int main(int argc, char **argv) {
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/audio_vae", model_root);
     h3_audio_latent got;
-    if (!h3_audio_vae_encode(weights, "h3_shaders.metal", waveform,
+    if (!h3_audio_vae_encode(weights, h3_test_shader(), waveform,
                              (int)waveform_tensor->shape[2], progress, NULL,
                              &got, error, sizeof(error))) die(error);
     if (got.channels != 32 || got.stereo != 2 ||

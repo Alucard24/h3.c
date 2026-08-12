@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "test_util.h"
 
 static void die(const char *message) {
     fprintf(stderr, "FAIL tests/test_real_video_encoder.c: %s\n", message);
@@ -62,7 +63,7 @@ int main(int argc, char **argv) {
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/video_vae/source", model_root);
     h3_video_latent got;
-    if (!h3_video_vae_encode(weights, "h3_shaders.metal", pixels, frames,
+    if (!h3_video_vae_encode(weights, h3_test_shader(), pixels, frames,
                              height, width,
                              progress, NULL, &got, error, sizeof(error)))
         die(error);

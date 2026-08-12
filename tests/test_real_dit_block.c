@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_util.h"
 
 enum {
     TEXT_ROWS = 6, AUDIO_ROWS = 16, VIDEO_ROWS = 2, SEQUENCE = 24,
@@ -361,7 +362,7 @@ int main(int argc, char **argv) {
         die(error);
     test.weights = h3_weight_store_open(weights_path, error, sizeof(error));
     if (!test.weights) die(error);
-    test.gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
+    test.gpu = h3_gpu_create(h3_test_shader(), error, sizeof(error));
     if (!test.gpu) die(error);
 
     h3_gpu_tensor *text_qwen = fixture_bf16(&test, "x.text_qwen",

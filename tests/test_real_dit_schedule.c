@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_util.h"
 
 enum { BLOCK_OUTPUT = 3 * 6 * 5376 };
 
@@ -39,7 +40,7 @@ int main(int argc, char **argv) {
     h3_weight_store *weights = h3_weight_store_open(weight_path, error,
                                                      sizeof(error));
     if (!weights) die(error);
-    h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
+    h3_gpu *gpu = h3_gpu_create(h3_test_shader(), error, sizeof(error));
     if (!gpu) die(error);
     h3_sigma_schedule sigmas;
     if (!h3_schedule_build(20, &sigmas)) die("cannot build 20-step schedule");

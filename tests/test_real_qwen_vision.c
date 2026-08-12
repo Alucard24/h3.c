@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_util.h"
 
 enum { WIDTH = 5120 };
 
@@ -97,7 +98,7 @@ int main(int argc, char **argv) {
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/text_encoder", model_root);
     h3_vision_output output;
-    if (!h3_vision_encode_bf16(weights, "h3_shaders.metal", pixels,
+    if (!h3_vision_encode_bf16(weights, h3_test_shader(), pixels,
                                 frames, height, width, progress, NULL, &output,
                                 error, sizeof(error))) die(error);
     if (output.grid_h != height / 16 || output.grid_w != width / 16 ||

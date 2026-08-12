@@ -147,10 +147,44 @@ test: h3_tests h3_vulkan_kernels_test h3_vulkan_dit_block_test h3_tokenizer_c_te
 	./h3_tokenizer_c_test
 
 parity:
-	@echo "parity requires the macOS Metal backend (run on an Apple Silicon Mac)"
+	@echo "parity (Metal/MLX fixtures) requires macOS; on Linux run 'make real-parity'"
 
 real-parity:
-	@echo "real-parity requires the macOS Metal backend (run on an Apple Silicon Mac)"
+	@test -f MiniMax-H3/FL2VA/transformer/config.json || \
+		{ echo "model missing: run 'make model' first (scripts/download_model.sh)"; exit 1; }
+	@for f in misc/fixtures/h3_real_prompt_bf16.safetensors \
+		misc/fixtures/h3_real_dit_block0_bf16.safetensors \
+		misc/fixtures/h3_real_dit_step0_bf16.safetensors \
+		misc/fixtures/h3_real_dit_denoise20_bf16.safetensors; do \
+		if [ ! -f "$$f" ]; then \
+			echo "warning: fixture $$f missing (real-parity needs the MLX fixtures)"; \
+		fi; \
+	done
+	H3_SHADER_SOURCE="h3_vulkan_shaders.comp" ./h3_real_prompt_test MiniMax-H3
+	H3_SHADER_SOURCE="h3_vulkan_shaders.comp" ./h3_real_dit_block_test MiniMax-H3 misc/fixtures/h3_real_dit_block0_bf16.safetensors
+	H3_SHADER_SOURCE="h3_vulkan_shaders.comp" ./h3_real_dit_schedule_test MiniMax-H3
+	H3_SHADER_SOURCE="h3_vulkan_shaders.comp" ./h3_real_dit_test MiniMax-H3
+
+# Checkpoint download: FL2VA (~37 GiB), optional Ref2VA (~62 GiB).
+model:
+	scripts/download_model.sh MiniMax-H3
+
+model-ref2va:
+	scripts/download_model.sh MiniMax-H3 --ref2va
+
+# Fast end-to-end generation on the current backend (Vulkan on Linux).
+smoke:
+	@test -f MiniMax-H3/FL2VA/transformer/config.json || \
+		{ echo "model missing: run 'make model' first (scripts/download_model.sh)"; exit 1; }
+	rm -f /tmp/h3-smoke.mp4
+	./h3 -d MiniMax-H3 -p "A red fox walking through snow" \
+		-o /tmp/h3-smoke.mp4 --width 256 --height 256 --frames 8 \
+		--steps 5 --reuse 3 --layers 5
+	@if command -v ffprobe >/dev/null 2>&1; then \
+		ffprobe -v error -show_entries format=duration /tmp/h3-smoke.mp4; \
+	else \
+		echo "smoke output written to /tmp/h3-smoke.mp4"; \
+	fi
 else
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \

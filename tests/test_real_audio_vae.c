@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "test_util.h"
 
 enum {
     LATENT_LENGTH = 37,
@@ -49,7 +50,7 @@ int main(int argc, char **argv) {
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/audio_vae", model_root);
     h3_audio_waveform got;
-    if (!h3_audio_vae_decode(weights, "h3_shaders.metal", latent,
+    if (!h3_audio_vae_decode(weights, h3_test_shader(), latent,
                              LATENT_LENGTH, progress, NULL, &got,
                              error, sizeof(error))) die(error);
     if (got.channels != 2 || got.samples != SAMPLES ||

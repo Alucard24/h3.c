@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_util.h"
 
 static void die(const char *message) {
     fprintf(stderr, "FAIL tests/test_real_ref_video_text.c: %s\n", message);
@@ -101,7 +102,7 @@ int main(int argc, char **argv) {
     if (!tokenizer) die(error);
     h3_text_embedding got;
     int ok = h3_multimodal_encode_ref2va_bf16(
-        tokenizer, weights, "h3_shaders.metal",
+        tokenizer, weights, h3_test_shader(),
         "A red fox walking through snow", &reference, 1,
         NULL, NULL, &got, error, sizeof(error));
     h3_tokenizer_free(tokenizer);

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_util.h"
 
 static void die(const char *message) {
     fprintf(stderr, "FAIL tests/test_real_multimodal_text.c: %s\n", message);
@@ -130,13 +131,13 @@ int main(int argc, char **argv) {
             tokenizer_path, error, sizeof(error));
         if (!tokenizer) die(error);
         int ok = h3_multimodal_encode_fl2va_bf16(
-            tokenizer, weights, "h3_shaders.metal",
+            tokenizer, weights, h3_test_shader(),
             "A red fox walking through snow", &vision_output, 1,
             progress, NULL, &got, error, sizeof(error));
         h3_tokenizer_free(tokenizer);
         if (!ok) die(error);
     } else if (!h3_text_encode_multimodal_layers_bf16(
-                   weights, "h3_shaders.metal", ids, tokens, &span, 1,
+                   weights, h3_test_shader(), ids, tokens, &span, 1,
                    positions, tags, layers, progress, NULL, &got,
                    error, sizeof(error))) {
         die(error);

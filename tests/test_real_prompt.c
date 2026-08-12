@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "test_util.h"
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL tests/test_real_prompt.c: %s\n", message);
@@ -138,7 +139,7 @@ int main(int argc, char **argv) {
 
     h3_text_embedding embedding;
     double start = seconds();
-    if (!h3_text_encode_bf16(weights_path, "h3_shaders.metal", ids,
+    if (!h3_text_encode_bf16(weights_path, h3_test_shader(), ids,
                               token_count, progress, NULL, &embedding,
                               error, sizeof(error))) fail(error);
     double elapsed = seconds() - start;

@@ -507,6 +507,26 @@ verified against a CPU reference with the same arithmetic order: the
 modulated attention lands within 1 BF16 ulp and the final hidden within
 0.5% relative max.
 
+## End-to-end on Linux (Vulkan)
+
+All 54 kernels on the video-generation path are ported (DiT BF16 native,
+Qwen3 text encoder, video/audio VAE, video condition encoder, vision
+encoder, and the full int8 quantization mode); only three unused f32
+variants remain stubbed. To run the real checkpoint:
+
+```sh
+make model          # downloads MiniMax-H3 FL2VA (~37 GiB) via huggingface_hub
+make model-ref2va   # optional: adds the Ref2VA transformer (~62 GiB)
+./h3 -d MiniMax-H3 --info
+make smoke          # fast end-to-end generation: 256x256, 8 frames, 5 steps
+make real-parity    # real-checkpoint tests (needs the MLX fixtures under
+                    # misc/fixtures/, generated on macOS)
+```
+
+The real-* integration tests are backend-agnostic: they pick the shader
+source through `H3_SHADER_SOURCE` (Metal by default, Vulkan on Linux) and
+skip the model-dependent targets when the checkpoint is absent.
+
 ## Implementation and performance notes
 
 The remainder documents the implementation behind the tutorial presets and the

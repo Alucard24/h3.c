@@ -214,7 +214,8 @@ static int h3_json_string(h3_json *json, char **out) {
                 }
                 default: goto fail;
             }
-            json->cursor++;
+            /* The trailing json->cursor += units advances past the escape
+             * byte; \u already advanced through its hex digits. */
             units = 1;
         } else {
             /* raw UTF-8 continuation handling */
@@ -293,7 +294,7 @@ static int h3_json_skip_value(h3_json *json) {
                 continue;
             }
             if (current == '{' || current == '[') depth++;
-            if (current == closing) depth--;
+            if (current == '}' || current == ']') depth--;
             json->cursor++;
         }
         return depth == 0;
@@ -954,6 +955,10 @@ h3_tokenizer *h3_tokenizer_load(const char *path, char *error,
                             if (merges->cursor < merges->end &&
                                 *merges->cursor == ']') merges->cursor++;
                         }
+                    } else {
+                        /* Unhandled model keys (dropout, suffix flags, ...)
+                         * carry values that must be consumed. */
+                        h3_json_skip_value(model);
                     }
                     free(model_key);
                     model_key = NULL;

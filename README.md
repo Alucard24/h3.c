@@ -515,8 +515,8 @@ encoder, and the full int8 quantization mode); only three unused f32
 variants remain stubbed. To run the real checkpoint:
 
 ```sh
-make model          # downloads MiniMax-H3 FL2VA (~37 GiB) via huggingface_hub
-make model-ref2va   # optional: adds the Ref2VA transformer (~62 GiB)
+make model          # downloads MiniMax-H3 FL2VA (~134 GiB) via huggingface_hub
+make model-ref2va   # optional: adds the Ref2VA transformer (~134 GiB more)
 ./h3 -d MiniMax-H3 --info
 make smoke          # fast end-to-end generation: 256x256, 8 frames, 5 steps
 make real-parity    # real-checkpoint tests (needs the MLX fixtures under
@@ -526,6 +526,36 @@ make real-parity    # real-checkpoint tests (needs the MLX fixtures under
 The real-* integration tests are backend-agnostic: they pick the shader
 source through `H3_SHADER_SOURCE` (Metal by default, Vulkan on Linux) and
 skip the model-dependent targets when the checkpoint is absent.
+
+### Int8 quantization on Vulkan
+
+As on M5, the int8 mode is now the default: the DiT quantizes each block's
+MLP weights at load time (always), and the QKV projection and
+attention-output projection at sequence >= 128. The BF16 weights are
+released after quantization, so the resident transformer storage drops by
+roughly 2x. All int8 kernels are scalar and deterministic (no TensorOps
+hardware): per-row activation quantization (`max/127`, round-to-nearest-
+even, clamp to [-127, 127]), int32 accumulation, and per-output-column
+weight scales; the sensitive FC2 input gets one scale per row rather than
+per 1,024 channels.
+
+| Control | Effect |
+|---|---|
+| (default) | int8 MLP + int8 QKV + int8 attention output |
+| `--use-slower-bf16-mlp` | keep the fused BF16 fc1/SwiGLU/fc2 path |
+| `--use-slower-bf16-qkv` | keep the close-reference BF16 QKV projection |
+| `--use-slower-bf16-attention-output` | keep the BF16 attention-output projection |
+| `--use-int8-row-fc2` | one FC2 activation scale per row (less conservative, ~2.6% faster) |
+| `--ssd-streaming` | BF16 layers stream from SSD; int8 is disabled (cannot combine with `--use-int8-row-fc2`) |
+| `H3_DISABLE_INT8_QKV=1` | force the BF16 QKV path at runtime |
+| `H3_INT8_MLP_STAGE=fc1` / `fc2` / `bf16` | int8/bf16 A-B split for the MLP |
+| `H3_INT8_KEEP_BF16_MLP=1` (or `_QKV`, `_ATTENTION_OUT`) | retain both weight copies for A/B diagnosis |
+
+Runtime weight quantization adds startup time. To compare the two paths on
+one render, run `make smoke` with the defaults and again with
+`--use-slower-bf16-mlp --use-slower-bf16-qkv --use-slower-bf16-attention-output`;
+the quantized path can change small edge and fur details (as on Metal) but
+keeps subject, composition, and motion.
 
 ## Implementation and performance notes
 

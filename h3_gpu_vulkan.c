@@ -26,7 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define H3_VK_BINDINGS 9
+#define H3_VK_BINDINGS 11
 #define H3_VK_THREADS 256u
 #define H3_VK_POOL_SETS 2048
 /* Kernel args are written by the host before submission but read by the GPU
@@ -93,6 +93,10 @@ typedef enum {
     H3_VK_KERNEL_SDPA_FLASH_BF16,
     H3_VK_KERNEL_PATCH_LINEAR_BF16,
     H3_VK_KERNEL_PATCH_LINEAR_BF16_MAP,
+    H3_VK_KERNEL_TOKEN_POOL_BF16,
+    H3_VK_KERNEL_TOKEN_POOL_ADALN_BF16,
+    H3_VK_KERNEL_TOKEN_EXPAND_DELTA_BF16,
+    H3_VK_KERNEL_TOKEN_EXPAND_ADALN_BF16,
     H3_VK_KERNEL_COUNT
 } h3_vk_kernel;
 
@@ -109,7 +113,9 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_head_rms_norm_bf16",
     "main_grouped_qkv_rope_bf16", "main_sdpa_bf16",
     "main_sdpa_flash_bf16",
-    "main_patch_linear_bf16", "main_patch_linear_bf16_map"
+    "main_patch_linear_bf16", "main_patch_linear_bf16_map",
+    "main_token_pool_bf16", "main_token_pool_adaln_bf16",
+    "main_token_expand_delta_bf16", "main_token_expand_adaln_bf16"
 };
 
 /* Storage-buffer bindings consumed by each kernel (0..n-1 plus binding 7
@@ -118,14 +124,14 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
     2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2,
-    5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5
+    5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10
 };
 
 /* Workgroup layout per kernel: 0 = 256 threads, 1 = 16x16 tiles,
  * 2 = 128 threads (SDPA flash). */
 static const int h3_vk_kernel_layout[H3_VK_KERNEL_COUNT] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-    0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1
+    0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0
 };
 
 struct h3_gpu {
@@ -1180,7 +1186,7 @@ static VkDescriptorSet h3_vk_prepare_off(h3_gpu *gpu, h3_vk_kernel kernel,
         h3_vk_set_buffer_offset(gpu, set, index, tensors[index]->buffer,
                                 offset);
     }
-    h3_vk_set_buffer_offset(gpu, set, 8, gpu->args_buffer,
+    h3_vk_set_buffer_offset(gpu, set, 10, gpu->args_buffer,
                             (VkDeviceSize)gpu->args_slot *
                                 sizeof(h3_gpu_vulkan_args));
     gpu->args_slot = (gpu->args_slot + 1) % H3_VK_ARGS_SLOTS;
@@ -1863,6 +1869,154 @@ int h3_gpu_patch_linear_bf16_map(
                           (output_dim + 15) / 16, (rows + 15) / 16, 1);
 }
 
+
+/* ---------------------------------------------------------- token pool */
+
+int h3_gpu_token_pool_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input, size_t input_offset,
+                           h3_gpu_tensor *original, size_t original_offset,
+                           h3_gpu_tensor *baseline, size_t baseline_offset,
+                           const h3_gpu_tensor *baseline_indices,
+                           const h3_gpu_tensor *pairs, uint32_t input_rows,
+                           uint32_t rows, uint32_t baseline_rows,
+                           uint32_t width) {
+    if (!h3_vk_check_tensors(gpu, 6, output, input, original, baseline,
+                             baseline_indices, pairs))
+        return -1;
+    (void)input_rows;
+    (void)baseline_rows;
+    gpu->args->sample_offset = (uint32_t)input_offset;
+    gpu->args->tokens = (uint32_t)original_offset;
+    gpu->args->vocab_size = (uint32_t)baseline_offset;
+    gpu->args->rows = rows;
+    gpu->args->width = width;
+    const h3_gpu_tensor *tensors[6] = { input, pairs, output, baseline,
+                                        baseline_indices, original };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_TOKEN_POOL_BF16,
+                                        tensors, 6);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_TOKEN_POOL_BF16, set,
+                          (width + 15) / 16, (rows + 15) / 16, 1);
+}
+
+int h3_gpu_token_pool_adaln_bf16(
+                           h3_gpu *gpu, h3_gpu_tensor *residual,
+                           h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input, size_t input_offset,
+                           h3_gpu_tensor *original, size_t original_offset,
+                           h3_gpu_tensor *baseline, size_t baseline_offset,
+                           const h3_gpu_tensor *baseline_indices,
+                           const h3_gpu_tensor *pairs,
+                           const h3_gpu_tensor *norm_weight,
+                           const h3_gpu_tensor *modulation,
+                           const h3_gpu_tensor *row_map,
+                           uint32_t input_rows, uint32_t rows,
+                           uint32_t baseline_rows, uint32_t width,
+                           uint32_t slots, uint32_t shift_slot,
+                           uint32_t scale_slot, float epsilon) {
+    if (!h3_vk_check_tensors(gpu, 10, residual, output, input, original,
+                             baseline, baseline_indices, pairs, norm_weight,
+                             modulation, row_map))
+        return -1;
+    (void)input_rows;
+    (void)baseline_rows;
+    gpu->args->sample_offset = (uint32_t)input_offset;
+    gpu->args->tokens = (uint32_t)original_offset;
+    gpu->args->vocab_size = (uint32_t)baseline_offset;
+    gpu->args->rows = rows;
+    gpu->args->width = width;
+    gpu->args->slots = slots;
+    gpu->args->shift_slot = shift_slot;
+    gpu->args->scale_slot = scale_slot;
+    gpu->args->epsilon = epsilon;
+    const h3_gpu_tensor *tensors[10] = {
+        input, pairs, residual, baseline, baseline_indices, original,
+        norm_weight, modulation, row_map, output
+    };
+    VkDescriptorSet set = h3_vk_prepare(
+        gpu, H3_VK_KERNEL_TOKEN_POOL_ADALN_BF16, tensors, 10);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_TOKEN_POOL_ADALN_BF16, set,
+                          rows, 1, 1);
+}
+
+int h3_gpu_token_expand_delta_bf16(
+                           h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *original,
+                           size_t original_offset,
+                           const h3_gpu_tensor *reduced,
+                           const h3_gpu_tensor *baseline,
+                           size_t baseline_offset,
+                           const h3_gpu_tensor *baseline_indices,
+                           const h3_gpu_tensor *parents, uint32_t rows,
+                           uint32_t reduced_rows, uint32_t baseline_rows,
+                           uint32_t width, uint32_t exact_prefix_rows,
+                           float update_scale) {
+    if (!h3_vk_check_tensors(gpu, 6, output, original, reduced, baseline,
+                             baseline_indices, parents))
+        return -1;
+    (void)reduced_rows;
+    (void)baseline_rows;
+    gpu->args->tokens = (uint32_t)original_offset;
+    gpu->args->vocab_size = (uint32_t)baseline_offset;
+    gpu->args->rows = rows;
+    gpu->args->width = width;
+    gpu->args->elements = exact_prefix_rows;
+    gpu->args->left_scale = update_scale;
+    const h3_gpu_tensor *tensors[6] = { original, reduced, baseline,
+                                        baseline_indices, parents, output };
+    VkDescriptorSet set = h3_vk_prepare(
+        gpu, H3_VK_KERNEL_TOKEN_EXPAND_DELTA_BF16, tensors, 6);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_TOKEN_EXPAND_DELTA_BF16, set,
+                          (width + 15) / 16, (rows + 15) / 16, 1);
+}
+
+int h3_gpu_token_expand_adaln_bf16(
+                           h3_gpu *gpu, h3_gpu_tensor *residual,
+                           h3_gpu_tensor *output,
+                           const h3_gpu_tensor *original,
+                           size_t original_offset,
+                           const h3_gpu_tensor *reduced,
+                           const h3_gpu_tensor *baseline,
+                           size_t baseline_offset,
+                           const h3_gpu_tensor *baseline_indices,
+                           const h3_gpu_tensor *parents,
+                           const h3_gpu_tensor *norm_weight,
+                           const h3_gpu_tensor *modulation,
+                           const h3_gpu_tensor *row_map, uint32_t rows,
+                           uint32_t reduced_rows, uint32_t baseline_rows,
+                           uint32_t width, uint32_t exact_prefix_rows,
+                           float update_scale, uint32_t slots,
+                           uint32_t shift_slot, uint32_t scale_slot,
+                           float epsilon) {
+    if (!h3_vk_check_tensors(gpu, 10, residual, output, original, reduced,
+                             baseline, baseline_indices, parents, norm_weight,
+                             modulation, row_map))
+        return -1;
+    (void)reduced_rows;
+    (void)baseline_rows;
+    gpu->args->tokens = (uint32_t)original_offset;
+    gpu->args->vocab_size = (uint32_t)baseline_offset;
+    gpu->args->rows = rows;
+    gpu->args->width = width;
+    gpu->args->elements = exact_prefix_rows;
+    gpu->args->left_scale = update_scale;
+    gpu->args->slots = slots;
+    gpu->args->shift_slot = shift_slot;
+    gpu->args->scale_slot = scale_slot;
+    gpu->args->epsilon = epsilon;
+    const h3_gpu_tensor *tensors[10] = {
+        original, reduced, baseline, baseline_indices, parents, residual,
+        norm_weight, modulation, row_map, output
+    };
+    VkDescriptorSet set = h3_vk_prepare(
+        gpu, H3_VK_KERNEL_TOKEN_EXPAND_ADALN_BF16, tensors, 10);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_TOKEN_EXPAND_ADALN_BF16, set,
+                          rows, 1, 1);
+}
+
 void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label) {
     (void)gpu;
     (void)label;
@@ -2287,79 +2441,6 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            float scale) {
 (void)gpu; (void)output; (void)query; (void)key; (void)value; (void)sequence; (void)query_heads; (void)kv_heads; (void)head_dim; (void)scale;
     return h3_vk_not_ported(gpu, "h3_gpu_gqa_causal_bf16");
-}
-
-int h3_gpu_token_pool_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                           const h3_gpu_tensor *input,
-                           size_t input_offset,
-                           h3_gpu_tensor *original,
-                           size_t original_offset,
-                           h3_gpu_tensor *baseline,
-                           size_t baseline_offset,
-                           const h3_gpu_tensor *baseline_indices,
-                           const h3_gpu_tensor *pairs, uint32_t input_rows,
-                           uint32_t rows, uint32_t baseline_rows,
-                           uint32_t width) {
-(void)gpu; (void)output; (void)input; (void)input_offset; (void)original; (void)original_offset; (void)baseline; (void)baseline_offset; (void)baseline_indices; (void)pairs; (void)input_rows; (void)rows; (void)baseline_rows; (void)width;
-    return h3_vk_not_ported(gpu, "h3_gpu_token_pool_bf16");
-}
-
-int h3_gpu_token_pool_adaln_bf16(
-                           h3_gpu *gpu, h3_gpu_tensor *residual,
-                           h3_gpu_tensor *output,
-                           const h3_gpu_tensor *input, size_t input_offset,
-                           h3_gpu_tensor *original, size_t original_offset,
-                           h3_gpu_tensor *baseline, size_t baseline_offset,
-                           const h3_gpu_tensor *baseline_indices,
-                           const h3_gpu_tensor *pairs,
-                           const h3_gpu_tensor *norm_weight,
-                           const h3_gpu_tensor *modulation,
-                           const h3_gpu_tensor *row_map,
-                           uint32_t input_rows, uint32_t rows,
-                           uint32_t baseline_rows, uint32_t width,
-                           uint32_t slots, uint32_t shift_slot,
-                           uint32_t scale_slot, float epsilon) {
-(void)gpu; (void)residual; (void)output; (void)input; (void)input_offset; (void)original; (void)original_offset; (void)baseline; (void)baseline_offset; (void)baseline_indices; (void)pairs; (void)norm_weight; (void)modulation; (void)row_map; (void)input_rows; (void)rows; (void)baseline_rows; (void)width; (void)slots; (void)shift_slot; (void)scale_slot; (void)epsilon;
-    return h3_vk_not_ported(gpu, "h3_gpu_token_pool_adaln_bf16");
-}
-
-int h3_gpu_token_expand_delta_bf16(
-                           h3_gpu *gpu, h3_gpu_tensor *output,
-                           const h3_gpu_tensor *original,
-                           size_t original_offset,
-                           const h3_gpu_tensor *reduced,
-                           const h3_gpu_tensor *baseline,
-                           size_t baseline_offset,
-                           const h3_gpu_tensor *baseline_indices,
-                           const h3_gpu_tensor *parents, uint32_t rows,
-                           uint32_t reduced_rows, uint32_t baseline_rows,
-                           uint32_t width,
-                           uint32_t exact_prefix_rows,
-                           float update_scale) {
-(void)gpu; (void)output; (void)original; (void)original_offset; (void)reduced; (void)baseline; (void)baseline_offset; (void)baseline_indices; (void)parents; (void)rows; (void)reduced_rows; (void)baseline_rows; (void)width; (void)exact_prefix_rows; (void)update_scale;
-    return h3_vk_not_ported(gpu, "h3_gpu_token_expand_delta_bf16");
-}
-
-int h3_gpu_token_expand_adaln_bf16(
-                           h3_gpu *gpu, h3_gpu_tensor *residual,
-                           h3_gpu_tensor *output,
-                           const h3_gpu_tensor *original,
-                           size_t original_offset,
-                           const h3_gpu_tensor *reduced,
-                           const h3_gpu_tensor *baseline,
-                           size_t baseline_offset,
-                           const h3_gpu_tensor *baseline_indices,
-                           const h3_gpu_tensor *parents,
-                           const h3_gpu_tensor *norm_weight,
-                           const h3_gpu_tensor *modulation,
-                           const h3_gpu_tensor *row_map,
-                           uint32_t rows, uint32_t reduced_rows,
-                           uint32_t baseline_rows, uint32_t width,
-                           uint32_t exact_prefix_rows, float update_scale,
-                           uint32_t slots, uint32_t shift_slot,
-                           uint32_t scale_slot, float epsilon) {
-(void)gpu; (void)residual; (void)output; (void)original; (void)original_offset; (void)reduced; (void)baseline; (void)baseline_offset; (void)baseline_indices; (void)parents; (void)norm_weight; (void)modulation; (void)row_map; (void)rows; (void)reduced_rows; (void)baseline_rows; (void)width; (void)exact_prefix_rows; (void)update_scale; (void)slots; (void)shift_slot; (void)scale_slot; (void)epsilon;
-    return h3_vk_not_ported(gpu, "h3_gpu_token_expand_adaln_bf16");
 }
 
 

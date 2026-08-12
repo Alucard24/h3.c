@@ -50,7 +50,7 @@ struct H3Args {
     uint gate_slot;
     uint grouped;
 };
-layout(set = 0, binding = 8) readonly buffer ArgsBuf { H3Args data; } args;
+layout(set = 0, binding = 10) readonly buffer ArgsBuf { H3Args data; } args;
 
 /* ------------------------------------------------------------------ casts */
 
@@ -911,6 +911,198 @@ void main_sdpa_flash_bf16() {
     uint oindex = args.data.grouped != 0u ?
         (head * seq + row) * dim + d : qbase + d;
     fl_out.data[oindex] = uint16_t(h3_f32_to_bf16(fl_acc[d] / fl_sum));
+}
+
+
+
+/* -------------------------------------------------------- token pool */
+
+layout(set = 0, binding = 0) readonly buffer TpIn { uint16_t data[]; } tp_in;
+layout(set = 0, binding = 1) readonly buffer TpPairs { uvec2 data[]; } tp_pairs;
+layout(set = 0, binding = 2) writeonly buffer TpOut { uint16_t data[]; } tp_out;
+layout(set = 0, binding = 3) writeonly buffer TpBase { uint16_t data[]; } tp_base;
+layout(set = 0, binding = 4) readonly buffer TpBaseIdx { uint data[]; } tp_base_idx;
+layout(set = 0, binding = 5) writeonly buffer TpOrig { uint16_t data[]; } tp_orig;
+
+/* Pool adjacent horizontal token pairs into `rows` rows, snapshotting both
+ * source rows into the full-resolution bypass. Singleton pairs (x == y)
+ * repeat their source index so non-video prefixes stay bit exact. */
+void main_token_pool_bf16() {
+    uint column = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= args.data.rows || column >= args.data.width) return;
+    uvec2 pair = tp_pairs.data[row];
+    uint16_t first = tp_in.data[args.data.sample_offset +
+                                pair.x * args.data.width + column];
+    tp_orig.data[args.data.tokens + pair.x * args.data.width + column] =
+        first;
+    uint16_t pooled = first;
+    if (pair.x != pair.y) {
+        uint16_t second = tp_in.data[args.data.sample_offset +
+                                     pair.y * args.data.width + column];
+        tp_orig.data[args.data.tokens + pair.y * args.data.width + column] =
+            second;
+        float average = (H3_BF16_TO_F32(first) + H3_BF16_TO_F32(second)) *
+                        0.5f;
+        pooled = uint16_t(h3_f32_to_bf16(average));
+    }
+    tp_out.data[row * args.data.width + column] = pooled;
+    uint baseline_index = tp_base_idx.data[row];
+    if (baseline_index != 0xffffffffu) {
+        tp_base.data[args.data.vocab_size +
+                     baseline_index * args.data.width + column] = pooled;
+    }
+}
+
+layout(set = 0, binding = 6) readonly buffer TpW { uint16_t data[]; } tp_w;
+layout(set = 0, binding = 7) readonly buffer TpMod { uint16_t data[]; } tp_mod;
+layout(set = 0, binding = 8) readonly buffer TpMap { uint data[]; } tp_map;
+layout(set = 0, binding = 9) writeonly buffer TpAdOut { uint16_t data[]; } tp_adout;
+
+/* Pooling fused with the first reduced block's attention AdaLN: the pooled
+ * row stays in threadgroup memory for the norm. */
+void main_token_pool_adaln_bf16() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= args.data.rows) return;
+    uvec2 pair = tp_pairs.data[row];
+    uint baseline_index = tp_base_idx.data[row];
+    float local_sum = 0.0f;
+    for (uint column = tid; column < args.data.width; column += 256u) {
+        uint16_t first = tp_in.data[args.data.sample_offset +
+                                    pair.x * args.data.width + column];
+        tp_orig.data[args.data.tokens + pair.x * args.data.width + column] =
+            first;
+        uint16_t pooled = first;
+        if (pair.x != pair.y) {
+            uint16_t second = tp_in.data[args.data.sample_offset +
+                                         pair.y * args.data.width + column];
+            tp_orig.data[args.data.tokens +
+                         pair.y * args.data.width + column] = second;
+            pooled = uint16_t(h3_f32_to_bf16(
+                (H3_BF16_TO_F32(first) + H3_BF16_TO_F32(second)) * 0.5f));
+        }
+        uint destination = row * args.data.width + column;
+        tp_out.data[destination] = pooled;
+        gated_values[column] = pooled;
+        if (baseline_index != 0xffffffffu) {
+            tp_base.data[args.data.vocab_size +
+                         baseline_index * args.data.width + column] = pooled;
+        }
+        float value = H3_BF16_TO_F32(pooled);
+        local_sum = fma(value, value, local_sum);
+    }
+    norm_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) norm_reductions[tid] += norm_reductions[tid + stride];
+        barrier();
+    }
+    float inverse = inversesqrt(norm_reductions[0] / float(args.data.width) +
+                                args.data.epsilon);
+    uint base = tp_map.data[row] * args.data.slots * args.data.width;
+    for (uint column = tid; column < args.data.width; column += 256u) {
+        float normalized = H3_BF16_TO_F32(gated_values[column]) * inverse *
+                           H3_BF16_TO_F32(tp_w.data[column]);
+        float shift = H3_BF16_TO_F32(
+            tp_mod.data[base + args.data.shift_slot * args.data.width +
+                        column]);
+        float scale = H3_BF16_TO_F32(
+            tp_mod.data[base + args.data.scale_slot * args.data.width +
+                        column]);
+        tp_adout.data[row * args.data.width + column] =
+            uint16_t(h3_f32_to_bf16(normalized * (1.0f + scale) + shift));
+    }
+}
+
+layout(set = 0, binding = 0) readonly buffer TxOrig { uint16_t data[]; } tx_orig;
+layout(set = 0, binding = 1) readonly buffer TxReduced { uint16_t data[]; } tx_reduced;
+layout(set = 0, binding = 2) readonly buffer TxBase { uint16_t data[]; } tx_base;
+layout(set = 0, binding = 3) readonly buffer TxBaseIdx { uint data[]; } tx_base_idx;
+layout(set = 0, binding = 4) readonly buffer TxParents { uint data[]; } tx_parents;
+layout(set = 0, binding = 5) writeonly buffer TxOut { uint16_t data[]; } tx_out;
+
+/* Restore the full grid: reduced rows contribute only their update relative
+ * to the pooled baseline, keeping the original within-pair detail. */
+void main_token_expand_delta_bf16() {
+    uint column = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= args.data.rows || column >= args.data.width) return;
+    uint parent = tx_parents.data[row];
+    uint destination = row * args.data.width + column;
+    uint reduced_index = parent * args.data.width + column;
+    if (row < args.data.elements) {
+        tx_out.data[destination] = tx_reduced.data[reduced_index];
+        return;
+    }
+    uint baseline_row = tx_base_idx.data[parent];
+    if (baseline_row == 0xffffffffu) {
+        tx_out.data[destination] = tx_reduced.data[reduced_index];
+        return;
+    }
+    uint baseline_index = args.data.vocab_size +
+                          baseline_row * args.data.width + column;
+    float update = H3_BF16_TO_F32(tx_reduced.data[reduced_index]) -
+                   H3_BF16_TO_F32(tx_base.data[baseline_index]);
+    tx_out.data[destination] = uint16_t(h3_f32_to_bf16(
+        H3_BF16_TO_F32(tx_orig.data[args.data.tokens + destination]) +
+        args.data.left_scale * update));
+}
+
+layout(set = 0, binding = 6) readonly buffer TxW { uint16_t data[]; } tx_w;
+layout(set = 0, binding = 7) readonly buffer TxMod { uint16_t data[]; } tx_mod;
+layout(set = 0, binding = 8) readonly buffer TxMap { uint data[]; } tx_map;
+layout(set = 0, binding = 9) writeonly buffer TxAdOut { uint16_t data[]; } tx_adout;
+
+/* Expansion fused with the first full-resolution block's attention AdaLN. */
+void main_token_expand_adaln_bf16() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= args.data.rows) return;
+    uint parent = tx_parents.data[row];
+    uint baseline_row = tx_base_idx.data[parent];
+    bool direct = row < args.data.elements ||
+                  baseline_row == 0xffffffffu;
+    float local_sum = 0.0f;
+    for (uint column = tid; column < args.data.width; column += 256u) {
+        uint destination = row * args.data.width + column;
+        uint reduced_index = parent * args.data.width + column;
+        uint16_t restored = tx_reduced.data[reduced_index];
+        if (!direct) {
+            uint baseline_index = args.data.vocab_size +
+                                  baseline_row * args.data.width + column;
+            float update = H3_BF16_TO_F32(restored) -
+                           H3_BF16_TO_F32(tx_base.data[baseline_index]);
+            restored = uint16_t(h3_f32_to_bf16(
+                H3_BF16_TO_F32(tx_orig.data[args.data.tokens + destination]) +
+                args.data.left_scale * update));
+        }
+        gated_values[column] = restored;
+        tx_out.data[destination] = restored;
+        float value = H3_BF16_TO_F32(restored);
+        local_sum = fma(value, value, local_sum);
+    }
+    norm_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) norm_reductions[tid] += norm_reductions[tid + stride];
+        barrier();
+    }
+    float inverse = inversesqrt(norm_reductions[0] / float(args.data.width) +
+                                args.data.epsilon);
+    uint base = tx_map.data[row] * args.data.slots * args.data.width;
+    for (uint column = tid; column < args.data.width; column += 256u) {
+        float normalized = H3_BF16_TO_F32(gated_values[column]) * inverse *
+                           H3_BF16_TO_F32(tx_w.data[column]);
+        float shift = H3_BF16_TO_F32(
+            tx_mod.data[base + args.data.shift_slot * args.data.width +
+                        column]);
+        float scale = H3_BF16_TO_F32(
+            tx_mod.data[base + args.data.scale_slot * args.data.width +
+                        column]);
+        tx_adout.data[row * args.data.width + column] =
+            uint16_t(h3_f32_to_bf16(normalized * (1.0f + scale) + shift));
+    }
 }
 
 /* The runtime compiles one module per kernel with H3_ENTRY selecting the

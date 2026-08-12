@@ -1473,6 +1473,260 @@ static void test_sdpa_flash_bench(h3_gpu *gpu) {
     free(q); free(k); free(v);
 }
 
+static void test_token_pool_expand(h3_gpu *gpu) {
+    enum { INPUT_ROWS = 6, ROWS = 3, WIDTH = 64, BASELINE_ROWS = 2 };
+    uint16_t input[INPUT_ROWS * WIDTH];
+    uint32_t pairs[ROWS * 2] = {0, 1, 2, 3, 4, 4};
+    uint32_t baseline_indices[ROWS] = {0, 0xffffffffu, 1};
+    uint16_t expected_out[ROWS * WIDTH];
+    uint16_t expected_orig[INPUT_ROWS * WIDTH];
+    uint16_t expected_base[BASELINE_ROWS * WIDTH];
+    for (size_t index = 0; index < INPUT_ROWS * WIDTH; index++)
+        input[index] = bf16_bits((float)(sin((double)index * 0.29) * 1.5));
+    memset(expected_orig, 0, sizeof(expected_orig));
+    memset(expected_base, 0, sizeof(expected_base));
+    for (uint32_t row = 0; row < ROWS; row++) {
+        uint32_t first = pairs[row * 2], second = pairs[row * 2 + 1];
+        for (uint32_t column = 0; column < WIDTH; column++) {
+            expected_orig[first * WIDTH + column] =
+                input[first * WIDTH + column];
+            uint16_t pooled = input[first * WIDTH + column];
+            if (first != second) {
+                expected_orig[second * WIDTH + column] =
+                    input[second * WIDTH + column];
+                float average = (bf16_value(input[first * WIDTH + column]) +
+                                 bf16_value(input[second * WIDTH + column])) *
+                                0.5f;
+                pooled = bf16_bits(average);
+            }
+            expected_out[row * WIDTH + column] = pooled;
+            if (baseline_indices[row] != 0xffffffffu)
+                expected_base[baseline_indices[row] * WIDTH + column] =
+                    pooled;
+        }
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_bf16(gpu, input, INPUT_ROWS * WIDTH);
+    h3_gpu_tensor *pr = h3_gpu_tensor_from_u32(gpu, pairs, ROWS * 2);
+    h3_gpu_tensor *bi = h3_gpu_tensor_from_u32(gpu, baseline_indices, ROWS);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, ROWS * WIDTH);
+    h3_gpu_tensor *orig = h3_gpu_tensor_new_bf16(gpu, INPUT_ROWS * WIDTH);
+    h3_gpu_tensor *base = h3_gpu_tensor_new_bf16(gpu, BASELINE_ROWS * WIDTH);
+    CHECK(in && pr && bi && out && orig && base);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_token_pool_bf16(gpu, out, in, 0, orig, 0, base, 0, bi,
+                                     pr, INPUT_ROWS, ROWS, BASELINE_ROWS,
+                                     WIDTH) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        uint16_t got[ROWS * WIDTH], got_orig[INPUT_ROWS * WIDTH],
+                 got_base[BASELINE_ROWS * WIDTH];
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 0);
+        CHECK(memcmp(got, expected_out, sizeof(got)) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(orig, got_orig,
+                                      INPUT_ROWS * WIDTH) == 0);
+        CHECK(memcmp(got_orig, expected_orig, sizeof(got_orig)) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(base, got_base,
+                                      BASELINE_ROWS * WIDTH) == 0);
+        CHECK(memcmp(got_base, expected_base, sizeof(got_base)) == 0);
+
+        /* expand: parents map every full row to its pooled row; reduced
+         * rows 0..2 hold the pooled values. */
+        enum { FULL_ROWS = 6, REDUCED = 3 };
+        uint32_t parents[FULL_ROWS] = {0, 0, 1, 1, 2, 2};
+        uint32_t parent_bi[REDUCED] = {0, 1, 0xffffffffu};
+        uint16_t expected_full[FULL_ROWS * WIDTH];
+        for (uint32_t row = 0; row < FULL_ROWS; row++) {
+            uint32_t parent = parents[row];
+            for (uint32_t column = 0; column < WIDTH; column++) {
+                uint32_t baseline_row = parent_bi[parent];
+                float update;
+                if (baseline_row == 0xffffffffu) {
+                    expected_full[row * WIDTH + column] =
+                        expected_out[parent * WIDTH + column];
+                    continue;
+                }
+                update = bf16_value(expected_out[parent * WIDTH + column]) -
+                         bf16_value(expected_base[baseline_row * WIDTH +
+                                                  column]);
+                expected_full[row * WIDTH + column] = bf16_bits(
+                    bf16_value(expected_orig[row * WIDTH + column]) +
+                    0.5f * update);
+            }
+        }
+        h3_gpu_tensor *pr2 = h3_gpu_tensor_from_u32(gpu, parents, FULL_ROWS);
+        h3_gpu_tensor *bi2 = h3_gpu_tensor_from_u32(gpu, parent_bi, REDUCED);
+        h3_gpu_tensor *full = h3_gpu_tensor_new_bf16(gpu, FULL_ROWS * WIDTH);
+        CHECK(pr2 && bi2 && full);
+        if (!failed) {
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_token_expand_delta_bf16(gpu, full, orig, 0, out,
+                                                 base, 0, bi2, pr2, FULL_ROWS,
+                                                 REDUCED, BASELINE_ROWS, WIDTH,
+                                                 0, 0.5f) == 0);
+            CHECK(h3_gpu_submit(gpu) == 0);
+            uint16_t got_full[FULL_ROWS * WIDTH];
+            CHECK(h3_gpu_tensor_read_bf16(full, got_full,
+                                          FULL_ROWS * WIDTH) == 0);
+            CHECK(memcmp(got_full, expected_full, sizeof(got_full)) == 0);
+        }
+        h3_gpu_tensor_free(pr2);
+        h3_gpu_tensor_free(bi2);
+        h3_gpu_tensor_free(full);
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(pr);
+    h3_gpu_tensor_free(bi);
+    h3_gpu_tensor_free(out);
+    h3_gpu_tensor_free(orig);
+    h3_gpu_tensor_free(base);
+}
+
+static void test_token_pool_adaln(h3_gpu *gpu) {
+    enum { INPUT_ROWS = 4, ROWS = 2, FULL_ROWS_ALIAS = 4, WIDTH = 256,
+           SLOTS = 2, BASELINE_ROWS = 1 };
+    const float epsilon = 1e-5f;
+    uint16_t input[INPUT_ROWS * WIDTH], nw[WIDTH], mod[ROWS * SLOTS * WIDTH];
+    uint32_t pairs[ROWS * 2] = {0, 1, 2, 3};
+    uint32_t baseline_indices[ROWS] = {0, 0xffffffffu};
+    /* 4 entries: the expansion phase maps all four full rows. */
+    uint32_t row_map[FULL_ROWS_ALIAS] = {1, 0, 1, 0};
+    uint16_t expected_out[ROWS * WIDTH], expected_res[ROWS * WIDTH];
+    for (size_t index = 0; index < INPUT_ROWS * WIDTH; index++)
+        input[index] = bf16_bits((float)(cos((double)index * 0.23) * 1.5));
+    for (size_t index = 0; index < WIDTH; index++)
+        nw[index] = bf16_bits(1.0f);
+    for (size_t index = 0; index < ROWS * SLOTS * WIDTH; index++)
+        mod[index] = bf16_bits((float)sin((double)index * 0.13) * 0.2f);
+    for (uint32_t row = 0; row < ROWS; row++) {
+        uint32_t first = pairs[row * 2], second = pairs[row * 2 + 1];
+        float squared[WIDTH];
+        for (uint32_t column = 0; column < WIDTH; column++) {
+            uint16_t pooled = input[first * WIDTH + column];
+            if (first != second) {
+                float average = (bf16_value(input[first * WIDTH + column]) +
+                                 bf16_value(input[second * WIDTH + column])) *
+                                0.5f;
+                pooled = bf16_bits(average);
+            }
+            expected_res[row * WIDTH + column] = pooled;
+            float value = bf16_value(pooled);
+            squared[column] = fmaf(value, value, 0.0f);
+        }
+        float inverse = 1.0f / sqrtf(tree_sum256(squared, WIDTH) /
+                                     (float)WIDTH + epsilon);
+        uint32_t base = row_map[row] * SLOTS * WIDTH;
+        for (uint32_t column = 0; column < WIDTH; column++) {
+            float normalized = bf16_value(expected_res[row * WIDTH + column]) *
+                               inverse * bf16_value(nw[column]);
+            float shift = bf16_value(mod[base + column]);
+            float scale = bf16_value(mod[base + WIDTH + column]);
+            expected_out[row * WIDTH + column] =
+                bf16_bits(normalized * (1.0f + scale) + shift);
+        }
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_bf16(gpu, input, INPUT_ROWS * WIDTH);
+    h3_gpu_tensor *pr = h3_gpu_tensor_from_u32(gpu, pairs, ROWS * 2);
+    h3_gpu_tensor *bi = h3_gpu_tensor_from_u32(gpu, baseline_indices, ROWS);
+    h3_gpu_tensor *w = h3_gpu_tensor_from_bf16(gpu, nw, WIDTH);
+    h3_gpu_tensor *m = h3_gpu_tensor_from_bf16(gpu, mod, ROWS * SLOTS * WIDTH);
+    h3_gpu_tensor *map = h3_gpu_tensor_from_u32(gpu, row_map,
+                                                FULL_ROWS_ALIAS);
+    h3_gpu_tensor *res = h3_gpu_tensor_new_bf16(gpu, ROWS * WIDTH);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, ROWS * WIDTH);
+    h3_gpu_tensor *orig = h3_gpu_tensor_new_bf16(gpu, INPUT_ROWS * WIDTH);
+    h3_gpu_tensor *base = h3_gpu_tensor_new_bf16(gpu, BASELINE_ROWS * WIDTH);
+    CHECK(in && pr && bi && w && m && map && res && out && orig && base);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_token_pool_adaln_bf16(gpu, res, out, in, 0, orig, 0,
+                                           base, 0, bi, pr, w, m, map,
+                                           INPUT_ROWS, ROWS, BASELINE_ROWS,
+                                           WIDTH, SLOTS, 0, 1, epsilon) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        uint16_t got[ROWS * WIDTH];
+        CHECK(h3_gpu_tensor_read_bf16(res, got, ROWS * WIDTH) == 0);
+        CHECK(memcmp(got, expected_res, sizeof(got)) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 0);
+        CHECK(check_bf16_ulp(got, expected_out, ROWS * WIDTH, 2,
+                             "pool_adaln"));
+
+        /* expand_adaln */
+        enum { FULL_ROWS = 4, REDUCED = 2 };
+        uint32_t parents[FULL_ROWS] = {0, 0, 1, 1};
+        uint32_t parent_bi[REDUCED] = {0, 0xffffffffu};
+        uint16_t expected_full[FULL_ROWS * WIDTH];
+        uint16_t expected_full_out[FULL_ROWS * WIDTH];
+        for (uint32_t row = 0; row < FULL_ROWS; row++) {
+            uint32_t parent = parents[row];
+            uint32_t baseline_row = parent_bi[parent];
+            float squared[WIDTH];
+            for (uint32_t column = 0; column < WIDTH; column++) {
+                uint16_t restored = expected_res[parent * WIDTH + column];
+                if (!(row < 0 || baseline_row == 0xffffffffu)) {
+                    float update =
+                        bf16_value(expected_res[parent * WIDTH + column]) -
+                        bf16_value(expected_res[baseline_row * WIDTH +
+                                                column]);
+                    restored = bf16_bits(
+                        bf16_value(input[row * WIDTH + column]) +
+                        0.5f * update);
+                }
+                expected_full[row * WIDTH + column] = restored;
+                float value = bf16_value(restored);
+                squared[column] = fmaf(value, value, 0.0f);
+            }
+            float inverse = 1.0f / sqrtf(tree_sum256(squared, WIDTH) /
+                                         (float)WIDTH + epsilon);
+            uint32_t base = row_map[row] * SLOTS * WIDTH;
+            for (uint32_t column = 0; column < WIDTH; column++) {
+                float normalized =
+                    bf16_value(expected_full[row * WIDTH + column]) *
+                    inverse * bf16_value(nw[column]);
+                float shift = bf16_value(mod[base + column]);
+                float scale = bf16_value(mod[base + WIDTH + column]);
+                expected_full_out[row * WIDTH + column] =
+                    bf16_bits(normalized * (1.0f + scale) + shift);
+            }
+        }
+        h3_gpu_tensor *pr2 = h3_gpu_tensor_from_u32(gpu, parents, FULL_ROWS);
+        h3_gpu_tensor *bi2 = h3_gpu_tensor_from_u32(gpu, parent_bi, REDUCED);
+        h3_gpu_tensor *full = h3_gpu_tensor_new_bf16(gpu, FULL_ROWS * WIDTH);
+        h3_gpu_tensor *full_out = h3_gpu_tensor_new_bf16(gpu,
+                                                         FULL_ROWS * WIDTH);
+        CHECK(pr2 && bi2 && full && full_out);
+        if (!failed) {
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_token_expand_adaln_bf16(
+                      gpu, full, full_out, in, 0, res, base, 0, bi2, pr2,
+                      w, m, map, FULL_ROWS, REDUCED, BASELINE_ROWS, WIDTH, 0,
+                      0.5f, SLOTS, 0, 1, epsilon) == 0);
+            CHECK(h3_gpu_submit(gpu) == 0);
+            uint16_t got2[FULL_ROWS * WIDTH];
+            CHECK(h3_gpu_tensor_read_bf16(full, got2,
+                                          FULL_ROWS * WIDTH) == 0);
+            CHECK(memcmp(got2, expected_full, sizeof(got2)) == 0);
+            CHECK(h3_gpu_tensor_read_bf16(full_out, got2,
+                                          FULL_ROWS * WIDTH) == 0);
+            CHECK(check_bf16_ulp(got2, expected_full_out, FULL_ROWS * WIDTH,
+                                 2, "expand_adaln"));
+        }
+        h3_gpu_tensor_free(pr2);
+        h3_gpu_tensor_free(bi2);
+        h3_gpu_tensor_free(full);
+        h3_gpu_tensor_free(full_out);
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(pr);
+    h3_gpu_tensor_free(bi);
+    h3_gpu_tensor_free(w);
+    h3_gpu_tensor_free(m);
+    h3_gpu_tensor_free(map);
+    h3_gpu_tensor_free(res);
+    h3_gpu_tensor_free(out);
+    h3_gpu_tensor_free(orig);
+    h3_gpu_tensor_free(base);
+}
+
 static void test_continue_chain(h3_gpu *gpu) {
     /* Two command buffers chained without a wait must preserve order:
      * add, then silu of the add result, all inside one begin/submit. */
@@ -1540,6 +1794,8 @@ int main(int argc, char **argv) {
     test_patch_linear_bf16(gpu);
     test_patch_linear_offset_bf16(gpu);
     test_patch_linear_map_bf16(gpu);
+    test_token_pool_expand(gpu);
+    test_token_pool_adaln(gpu);
     test_continue_chain(gpu);
     h3_gpu_free(gpu);
     if (failed) {

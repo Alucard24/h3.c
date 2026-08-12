@@ -49,6 +49,24 @@ struct H3Args {
     uint scale_slot;
     uint gate_slot;
     uint grouped;
+    /* Conv3d / VAE-pad / group-norm parameters (Video VAE family). */
+    uint conv_batch;
+    uint conv_depth;
+    uint conv_height;
+    uint conv_width;
+    uint conv_in_channels;
+    uint conv_out_channels;
+    uint conv_kernel_depth;
+    uint conv_kernel_height;
+    uint conv_kernel_width;
+    uint conv_stride_depth;
+    uint conv_stride_height;
+    uint conv_stride_width;
+    uint pad_depth_front;
+    uint pad_height_before;
+    uint pad_height_after;
+    uint pad_width_before;
+    uint pad_width_after;
 };
 layout(set = 0, binding = 10) readonly buffer ArgsBuf { H3Args data; } args;
 
@@ -1322,6 +1340,303 @@ void main_scale_add_f32() {
     uint index = row * args.data.width + column;
     s_out.data[index] = fma(s_branch.data[index], s_scale.data[column],
                             s_res.data[index]);
+}
+
+/* ------------------------------------------------------------- swiglu f32 */
+
+layout(set = 0, binding = 0) readonly buffer SwiFIn { float data[]; } swif_in;
+layout(set = 0, binding = 1) writeonly buffer SwiFOut { float data[]; } swif_out;
+
+void main_swiglu_f32() {
+    uint column = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= args.data.rows || column >= args.data.width) return;
+    uint base = row * args.data.width * 2u;
+    float gate = swif_in.data[base + column];
+    float up = swif_in.data[base + args.data.width + column];
+    swif_out.data[row * args.data.width + column] =
+        gate / (1.0f + exp(-gate)) * up;
+}
+
+/* ------------------------------------------------------ video QKV norm/rope */
+
+layout(set = 0, binding = 0) readonly buffer VQKV { float data[]; } vqkv_in;
+layout(set = 0, binding = 1) readonly buffer VCos { float data[]; } vcos;
+layout(set = 0, binding = 2) readonly buffer VSin { float data[]; } vsin;
+layout(set = 0, binding = 3) writeonly buffer VQ { float data[]; } vq_out;
+layout(set = 0, binding = 4) writeonly buffer VK { float data[]; } vk_out;
+layout(set = 0, binding = 5) writeonly buffer VV { float data[]; } vv_out;
+
+void main_video_qkv_rope_f32() {
+    uint dimension = gl_GlobalInvocationID.x;
+    uint head = gl_GlobalInvocationID.y;
+    uint row = gl_GlobalInvocationID.z;
+    uint head_dim = args.data.input_dim;
+    uint heads = args.data.width;
+    uint sequence = args.data.rows;
+    uint rope_half = args.data.output_dim;
+    if (dimension >= head_dim || head >= heads || row >= sequence) return;
+    uint base = (row * heads + head) * head_dim * 3u;
+    float q_sum = 0.0f, k_sum = 0.0f;
+    for (uint d = 0u; d < head_dim; d++) {
+        float q = vqkv_in.data[base + d];
+        float k = vqkv_in.data[base + head_dim + d];
+        q_sum = fma(q, q, q_sum);
+        k_sum = fma(k, k, k_sum);
+    }
+    float qi = inversesqrt(q_sum / float(head_dim) + args.data.epsilon);
+    float ki = inversesqrt(k_sum / float(head_dim) + args.data.epsilon);
+    float q0 = vqkv_in.data[base + dimension] * qi;
+    float k0 = vqkv_in.data[base + head_dim + dimension] * ki;
+    if (dimension < rope_half) {
+        uint pair = dimension + rope_half;
+        float q1 = vqkv_in.data[base + pair] * qi;
+        float k1 = vqkv_in.data[base + head_dim + pair] * ki;
+        float c = vcos.data[row * rope_half + dimension];
+        float s = vsin.data[row * rope_half + dimension];
+        q0 = q0 * c - q1 * s;
+        k0 = k0 * c - k1 * s;
+    } else if (dimension < rope_half * 2u) {
+        uint pair = dimension - rope_half;
+        float q1 = vqkv_in.data[base + pair] * qi;
+        float k1 = vqkv_in.data[base + head_dim + pair] * ki;
+        float c = vcos.data[row * rope_half + pair];
+        float s = vsin.data[row * rope_half + pair];
+        q0 = q0 * c + q1 * s;
+        k0 = k0 * c + k1 * s;
+    }
+    uint output_index = (row * heads + head) * head_dim + dimension;
+    vq_out.data[output_index] = q0;
+    vk_out.data[output_index] = k0;
+    vv_out.data[output_index] = vqkv_in.data[base + head_dim * 2u + dimension];
+}
+
+/* ------------------------------------------------------- VAE encoder pad f32 */
+
+layout(set = 0, binding = 0) readonly buffer VPadIn { float data[]; } vpad_in;
+layout(set = 0, binding = 1) writeonly buffer VPadOut { float data[]; } vpad_out;
+
+void main_vae_encoder_pad_f32() {
+    uint channel = gl_GlobalInvocationID.x;
+    uint out_x = gl_GlobalInvocationID.y;
+    uint plane = gl_GlobalInvocationID.z;
+    uint depth = args.data.conv_depth;
+    uint height = args.data.conv_height;
+    uint width = args.data.conv_width;
+    uint channels = args.data.conv_in_channels;
+    uint depth_front = args.data.pad_depth_front;
+    uint height_before = args.data.pad_height_before;
+    uint height_after = args.data.pad_height_after;
+    uint width_before = args.data.pad_width_before;
+    uint width_after = args.data.pad_width_after;
+    uint out_height = height + height_before + height_after;
+    uint out_width = width + width_before + width_after;
+    uint out_depth = depth + depth_front;
+    if (channel >= channels || out_x >= out_width ||
+        plane >= args.data.conv_batch * out_depth * out_height) return;
+    uint out_y = plane % out_height;
+    uint temporal_plane = plane / out_height;
+    uint out_t = temporal_plane % out_depth;
+    uint batch = temporal_plane / out_depth;
+    uint destination = ((((batch * out_depth + out_t) * out_height + out_y) *
+                         out_width + out_x) * channels + channel);
+    if (out_t < depth_front) {
+        vpad_out.data[destination] = 0.0f;
+        return;
+    }
+    int source_y = int(out_y) - int(height_before);
+    if (source_y < 0) source_y = -source_y;
+    if (source_y >= int(height))
+        source_y = 2 * int(height) - source_y - 2;
+    int source_x = int(out_x) - int(width_before);
+    if (source_x < 0) source_x = -source_x;
+    if (source_x >= int(width))
+        source_x = 2 * int(width) - source_x - 2;
+    uint source_t = out_t - depth_front;
+    uint source = ((((batch * depth + source_t) * height + uint(source_y)) *
+                    width + uint(source_x)) * channels + channel);
+    vpad_out.data[destination] = vpad_in.data[source];
+}
+
+/* ------------------------------------------- VAE encoder group norm + silu */
+
+layout(set = 0, binding = 0) readonly buffer GNIn { float data[]; } gn_in;
+layout(set = 0, binding = 1) readonly buffer GNW { float data[]; } gn_w;
+layout(set = 0, binding = 2) readonly buffer GNB { float data[]; } gn_b;
+layout(set = 0, binding = 3) writeonly buffer GNOut { float data[]; } gn_out;
+
+shared float gn_reductions[256];
+
+void main_vae_encoder_group_norm_silu_f32() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint groups = args.data.conv_out_channels;
+    uint channels = args.data.conv_in_channels;
+    uint height = args.data.conv_height;
+    uint width = args.data.conv_width;
+    uint rows = args.data.conv_batch * args.data.conv_depth * groups;
+    if (row >= rows) return;
+    uint channels_per_group = channels / groups;
+    uint group_index = row % groups;
+    uint temporal_plane = row / groups;
+    uint elements = height * width * channels_per_group;
+    float local = 0.0f;
+    for (uint index = tid; index < elements; index += 256u) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        uint source = (temporal_plane * height * width + spatial) * channels +
+                      channel;
+        local += gn_in.data[source];
+    }
+    gn_reductions[tid] = local;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) gn_reductions[tid] += gn_reductions[tid + stride];
+        barrier();
+    }
+    float mean = gn_reductions[0] / float(elements);
+    local = 0.0f;
+    for (uint index = tid; index < elements; index += 256u) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        uint source = (temporal_plane * height * width + spatial) * channels +
+                      channel;
+        float centered = gn_in.data[source] - mean;
+        local = fma(centered, centered, local);
+    }
+    gn_reductions[tid] = local;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) gn_reductions[tid] += gn_reductions[tid + stride];
+        barrier();
+    }
+    float inverse = inversesqrt(gn_reductions[0] / float(elements) +
+                                args.data.epsilon);
+    for (uint index = tid; index < elements; index += 256u) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        uint destination =
+            (temporal_plane * height * width + spatial) * channels + channel;
+        float value = (gn_in.data[destination] - mean) * inverse *
+                          gn_w.data[channel] +
+                      gn_b.data[channel];
+        gn_out.data[destination] = value / (1.0f + exp(-value));
+    }
+}
+
+/* --------------------------------------------------------------- sdpa f32 */
+
+layout(set = 0, binding = 0) readonly buffer SdpFQ { float data[]; } sdpf_q;
+layout(set = 0, binding = 1) readonly buffer SdpFK { float data[]; } sdpf_k;
+layout(set = 0, binding = 2) readonly buffer SdpFV { float data[]; } sdpf_v;
+layout(set = 0, binding = 3) writeonly buffer SdpFOut { float data[]; } sdpf_out;
+
+void main_sdpa_f32() {
+    uint head = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    uint seq = args.data.rows;
+    uint heads = args.data.width;
+    uint dim = args.data.input_dim;
+    if (row >= seq || head >= heads) return;
+    float scale = args.data.left_scale;
+    uint qbase = (row * heads + head) * dim;
+    float maxv = -3.402823466e+38f;
+    for (uint s = 0u; s < seq; s++) {
+        uint kbase = (s * heads + head) * dim;
+        float dot = 0.0f;
+        for (uint d = 0u; d < dim; d++) {
+            dot = fma(sdpf_q.data[qbase + d], sdpf_k.data[kbase + d], dot);
+        }
+        dot *= scale;
+        maxv = max(maxv, dot);
+    }
+    float sum = 0.0f;
+    for (uint s = 0u; s < seq; s++) {
+        uint kbase = (s * heads + head) * dim;
+        float dot = 0.0f;
+        for (uint d = 0u; d < dim; d++) {
+            dot = fma(sdpf_q.data[qbase + d], sdpf_k.data[kbase + d], dot);
+        }
+        sum += exp(dot * scale - maxv);
+    }
+    for (uint d = 0u; d < dim; d++) {
+        float acc = 0.0f;
+        for (uint s = 0u; s < seq; s++) {
+            uint kbase = (s * heads + head) * dim;
+            float dot = 0.0f;
+            for (uint k = 0u; k < dim; k++) {
+                dot = fma(sdpf_q.data[qbase + k],
+                          sdpf_k.data[kbase + k], dot);
+            }
+            acc = fma(exp(dot * scale - maxv), sdpf_v.data[kbase + d], acc);
+        }
+        uint oindex = args.data.grouped != 0u ?
+            (head * seq + row) * dim + d : qbase + d;
+        sdpf_out.data[oindex] = acc / sum;
+    }
+}
+
+/* --------------------------------------------------------------- conv3d f32 */
+
+layout(set = 0, binding = 0) readonly buffer CvIn { float data[]; } cv_in;
+layout(set = 0, binding = 1) readonly buffer CvW { float data[]; } cv_w;
+layout(set = 0, binding = 2) readonly buffer CvB { float data[]; } cv_b;
+layout(set = 0, binding = 3) writeonly buffer CvOut { float data[]; } cv_out;
+
+void main_conv3d_f32() {
+    uint out_x = gl_GlobalInvocationID.x;
+    uint out_y = gl_GlobalInvocationID.y;
+    uint plane = gl_GlobalInvocationID.z;
+    uint batch = args.data.conv_batch;
+    uint depth = args.data.conv_depth;
+    uint height = args.data.conv_height;
+    uint width = args.data.conv_width;
+    uint in_channels = args.data.conv_in_channels;
+    uint out_channels = args.data.conv_out_channels;
+    uint kd = args.data.conv_kernel_depth;
+    uint kh = args.data.conv_kernel_height;
+    uint kw = args.data.conv_kernel_width;
+    uint sd = args.data.conv_stride_depth;
+    uint sh = args.data.conv_stride_height;
+    uint sw = args.data.conv_stride_width;
+    uint output_depth = (depth - kd) / sd + 1u;
+    uint output_height = (height - kh) / sh + 1u;
+    uint output_width = (width - kw) / sw + 1u;
+    uint spatial = plane % (output_depth * output_height);
+    uint out_t = spatial / output_height;
+    uint out_h = spatial % output_height;
+    uint batch_index = plane / (output_depth * output_height);
+    if (batch_index >= batch || out_t >= output_depth ||
+        out_h >= output_height || out_x >= output_width) return;
+    for (uint oc = 0u; oc < out_channels; oc++) {
+        float sum = args.data.has_bias != 0u ? cv_b.data[oc] : 0.0f;
+        for (uint kt = 0u; kt < kd; kt++) {
+            for (uint khh = 0u; khh < kh; khh++) {
+                for (uint kww = 0u; kww < kw; kww++) {
+                    for (uint ic = 0u; ic < in_channels; ic++) {
+                        uint in_t = out_t * sd + kt;
+                        uint in_h = out_h * sh + khh;
+                        uint in_x = out_x * sw + kww;
+                        uint input_index =
+                            ((((batch_index * depth + in_t) * height + in_h) *
+                              width + in_x) * in_channels + ic);
+                        uint weight_index =
+                            ((((oc * in_channels + ic) * kd + kt) * kh +
+                              khh) * kw + kww);
+                        sum = fma(cv_in.data[input_index],
+                                  cv_w.data[weight_index], sum);
+                    }
+                }
+            }
+        }
+        uint output_index =
+            ((((batch_index * output_depth + out_t) * output_height + out_h) *
+              output_width + out_x) * out_channels + oc);
+        cv_out.data[output_index] = sum;
+    }
 }
 
 /* The runtime compiles one module per kernel with H3_ENTRY selecting the

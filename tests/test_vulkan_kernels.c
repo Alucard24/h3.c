@@ -921,6 +921,399 @@ static void test_mlp_nax_bf16(h3_gpu *gpu) {
     h3_gpu_tensor_free(out);
 }
 
+static void test_swiglu_f32(h3_gpu *gpu) {
+    uint32_t rows = 7, width = 33;
+    size_t count = (size_t)rows * width;
+    float *fused = malloc(count * 2 * sizeof(float));
+    float *expected = malloc(count * sizeof(float));
+    float *got = malloc(count * sizeof(float));
+    for (size_t index = 0; index < count * 2; index++)
+        fused[index] = (float)(sin((double)index * 0.63) * 1.5);
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t column = 0; column < width; column++) {
+            float gate = fused[row * width * 2 + column];
+            float up = fused[row * width * 2 + width + column];
+            expected[row * width + column] =
+                gate / (1.0f + expf(-gate)) * up;
+        }
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_f32(gpu, fused, count * 2);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_f32(gpu, count);
+    CHECK(in && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_swiglu_f32(gpu, out, in, rows, width) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+        CHECK(check_f32(got, expected, count, 1e-6, "swiglu_f32"));
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(out);
+    free(fused); free(expected); free(got);
+}
+
+static void test_video_qkv_rope_f32(h3_gpu *gpu) {
+    enum { SEQ = 4, HEADS = 3, DIM = 8, HALF = 4 };
+    const float epsilon = 1e-5f;
+    float qkv[SEQ * HEADS * 3 * DIM], rcos[SEQ * HALF], rsin[SEQ * HALF];
+    float expected_q[SEQ * HEADS * DIM], expected_k[SEQ * HEADS * DIM];
+    for (size_t index = 0; index < SEQ * HEADS * 3 * DIM; index++)
+        qkv[index] = (float)(sin((double)index * 0.37) * 1.5);
+    for (size_t index = 0; index < SEQ * HALF; index++) {
+        rcos[index] = cosf((float)index * 0.31f);
+        rsin[index] = sinf((float)index * 0.31f);
+    }
+    for (uint32_t row = 0; row < SEQ; row++) {
+        for (uint32_t head = 0; head < HEADS; head++) {
+            uint32_t base = (row * HEADS + head) * DIM * 3;
+            float q_sum = 0.0f, k_sum = 0.0f;
+            for (uint32_t d = 0; d < DIM; d++) {
+                q_sum = fmaf(qkv[base + d], qkv[base + d], q_sum);
+                k_sum = fmaf(qkv[base + DIM + d], qkv[base + DIM + d], k_sum);
+            }
+            float qi = 1.0f / sqrtf(q_sum / (float)DIM + epsilon);
+            float ki = 1.0f / sqrtf(k_sum / (float)DIM + epsilon);
+            for (uint32_t d = 0; d < DIM; d++) {
+                float q0 = qkv[base + d] * qi;
+                float k0 = qkv[base + DIM + d] * ki;
+                if (d < HALF) {
+                    float q1 = qkv[base + d + HALF] * qi;
+                    float k1 = qkv[base + DIM + d + HALF] * ki;
+                    float c = rcos[row * HALF + d];
+                    float s = rsin[row * HALF + d];
+                    q0 = q0 * c - q1 * s;
+                    k0 = k0 * c - k1 * s;
+                } else if (d < HALF * 2) {
+                    uint32_t pair = d - HALF;
+                    float q1 = qkv[base + pair] * qi;
+                    float k1 = qkv[base + DIM + pair] * ki;
+                    float c = rcos[row * HALF + pair];
+                    float s = rsin[row * HALF + pair];
+                    q0 = q0 * c + q1 * s;
+                    k0 = k0 * c + k1 * s;
+                }
+                uint32_t index = (row * HEADS + head) * DIM + d;
+                expected_q[index] = q0;
+                expected_k[index] = k0;
+            }
+        }
+    }
+    h3_gpu_tensor *t = h3_gpu_tensor_from_f32(gpu, qkv, SEQ * HEADS * 3 * DIM);
+    h3_gpu_tensor *c = h3_gpu_tensor_from_f32(gpu, rcos, SEQ * HALF);
+    h3_gpu_tensor *s = h3_gpu_tensor_from_f32(gpu, rsin, SEQ * HALF);
+    h3_gpu_tensor *oq = h3_gpu_tensor_new_f32(gpu, SEQ * HEADS * DIM);
+    h3_gpu_tensor *ok = h3_gpu_tensor_new_f32(gpu, SEQ * HEADS * DIM);
+    h3_gpu_tensor *ov = h3_gpu_tensor_new_f32(gpu, SEQ * HEADS * DIM);
+    CHECK(t && c && s && oq && ok && ov);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_video_qkv_rope_f32(gpu, oq, ok, ov, t, c, s, SEQ, HEADS,
+                                        DIM, HALF, epsilon) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        float got[SEQ * HEADS * DIM];
+        CHECK(h3_gpu_tensor_read_f32(oq, got, SEQ * HEADS * DIM) == 0);
+        CHECK(check_f32(got, expected_q, SEQ * HEADS * DIM, 1e-4,
+                        "video_qkv_q"));
+        CHECK(h3_gpu_tensor_read_f32(ok, got, SEQ * HEADS * DIM) == 0);
+        CHECK(check_f32(got, expected_k, SEQ * HEADS * DIM, 1e-4,
+                        "video_qkv_k"));
+    }
+    h3_gpu_tensor_free(t);
+    h3_gpu_tensor_free(c);
+    h3_gpu_tensor_free(s);
+    h3_gpu_tensor_free(oq);
+    h3_gpu_tensor_free(ok);
+    h3_gpu_tensor_free(ov);
+}
+
+static void test_vae_encoder_pad_f32(h3_gpu *gpu) {
+    enum { BATCH = 2, DEPTH = 3, HEIGHT = 4, WIDTH = 5, CH = 2 };
+    enum { DF = 1, HB = 1, HA = 2, WB = 2, WA = 1 };
+    size_t input_count = (size_t)BATCH * DEPTH * HEIGHT * WIDTH * CH;
+    size_t out_depth = DEPTH + DF;
+    size_t out_height = HEIGHT + HB + HA;
+    size_t out_width = WIDTH + WB + WA;
+    size_t output_count = (size_t)BATCH * out_depth * out_height * out_width * CH;
+    float *input = malloc(input_count * sizeof(float));
+    float *expected = malloc(output_count * sizeof(float));
+    float *got = malloc(output_count * sizeof(float));
+    for (size_t index = 0; index < input_count; index++)
+        input[index] = (float)(sin((double)index * 0.27) * 2.0);
+    for (uint32_t batch = 0; batch < BATCH; batch++) {
+        for (uint32_t t = 0; t < out_depth; t++) {
+            for (uint32_t y = 0; y < out_height; y++) {
+                for (uint32_t x = 0; x < out_width; x++) {
+                    for (uint32_t channel = 0; channel < CH; channel++) {
+                        size_t destination =
+                            (((((size_t)batch * out_depth + t) * out_height +
+                               y) * out_width + x) * CH + channel);
+                        float value = 0.0f;
+                        if (t >= DF) {
+                            int source_y = (int)y - (int)HB;
+                            if (source_y < 0) source_y = -source_y;
+                            if (source_y >= (int)HEIGHT)
+                                source_y = 2 * (int)HEIGHT - source_y - 2;
+                            int source_x = (int)x - (int)WB;
+                            if (source_x < 0) source_x = -source_x;
+                            if (source_x >= (int)WIDTH)
+                                source_x = 2 * (int)WIDTH - source_x - 2;
+                            uint32_t source_t = t - DF;
+                            size_t source =
+                                (((((size_t)batch * DEPTH + source_t) *
+                                   HEIGHT + (uint32_t)source_y) * WIDTH +
+                                  (uint32_t)source_x) * CH + channel);
+                            value = input[source];
+                        }
+                        expected[destination] = value;
+                    }
+                }
+            }
+        }
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_f32(gpu, input, input_count);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_f32(gpu, output_count);
+    CHECK(in && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_vae_encoder_pad_f32(gpu, out, in, BATCH, DEPTH, HEIGHT,
+                                         WIDTH, CH, DF, HB, HA, WB, WA) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_tensor_read_f32(out, got, output_count) == 0);
+        CHECK(memcmp(got, expected, output_count * sizeof(float)) == 0);
+        if (memcmp(got, expected, output_count * sizeof(float)) != 0) {
+            for (size_t index = 0; index < output_count; index++) {
+                if (got[index] != expected[index]) {
+                    fprintf(stderr, "  vae pad[%zu]: got %.9g expected %.9g\n",
+                            index, got[index], expected[index]);
+                    break;
+                }
+            }
+        }
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(out);
+    free(input); free(expected); free(got);
+}
+
+static void test_vae_group_norm_silu_f32(h3_gpu *gpu) {
+    enum { BATCH = 2, DEPTH = 2, HEIGHT = 3, WIDTH = 4, CH = 4, GROUPS = 2 };
+    const float epsilon = 1e-5f;
+    size_t count = (size_t)BATCH * DEPTH * HEIGHT * WIDTH * CH;
+    size_t rows = (size_t)BATCH * DEPTH * GROUPS;
+    size_t channels_per_group = CH / GROUPS;
+    size_t elements = (size_t)HEIGHT * WIDTH * channels_per_group;
+    float *input = malloc(count * sizeof(float));
+    float *weight = malloc(CH * sizeof(float));
+    float *bias = malloc(CH * sizeof(float));
+    float *expected = malloc(count * sizeof(float));
+    float *got = malloc(count * sizeof(float));
+    for (size_t index = 0; index < count; index++)
+        input[index] = (float)(sin((double)index * 0.53) * 2.0);
+    for (size_t index = 0; index < CH; index++) {
+        weight[index] = (float)cos((double)index * 0.19) * 0.5f + 1.0f;
+        bias[index] = (float)sin((double)index * 0.11) * 0.25f;
+    }
+    for (uint32_t row = 0; row < rows; row++) {
+        uint32_t group_index = row % GROUPS;
+        uint32_t temporal_plane = row / GROUPS;
+        float *values = malloc(elements * sizeof(float));
+        for (uint32_t index = 0; index < elements; index++) {
+            uint32_t spatial = index / channels_per_group;
+            uint32_t channel = group_index * channels_per_group +
+                               index % channels_per_group;
+            size_t source = ((size_t)temporal_plane * HEIGHT * WIDTH +
+                             spatial) * CH + channel;
+            values[index] = input[source];
+        }
+        float mean = tree_sum256(values, (uint32_t)elements) / (float)elements;
+        float *squared = malloc(elements * sizeof(float));
+        for (uint32_t index = 0; index < elements; index++) {
+            float centered = values[index] - mean;
+            squared[index] = fmaf(centered, centered, 0.0f);
+        }
+        float inverse = 1.0f / sqrtf(tree_sum256(squared, (uint32_t)elements) /
+                                     (float)elements + epsilon);
+        for (uint32_t index = 0; index < elements; index++) {
+            uint32_t spatial = index / channels_per_group;
+            uint32_t channel = group_index * channels_per_group +
+                               index % channels_per_group;
+            size_t destination =
+                ((size_t)temporal_plane * HEIGHT * WIDTH + spatial) * CH +
+                channel;
+            float value = (values[index] - mean) * inverse * weight[channel] +
+                          bias[channel];
+            expected[destination] = value / (1.0f + expf(-value));
+        }
+        free(values);
+        free(squared);
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_f32(gpu, input, count);
+    h3_gpu_tensor *w = h3_gpu_tensor_from_f32(gpu, weight, CH);
+    h3_gpu_tensor *b = h3_gpu_tensor_from_f32(gpu, bias, CH);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_f32(gpu, count);
+    CHECK(in && w && b && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_vae_encoder_group_norm_silu_f32(
+                  gpu, out, in, w, b, BATCH, DEPTH, HEIGHT, WIDTH, CH,
+                  GROUPS, epsilon) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+        CHECK(check_f32(got, expected, count, 1e-4, "vae_gn_silu"));
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(w);
+    h3_gpu_tensor_free(b);
+    h3_gpu_tensor_free(out);
+    free(input); free(weight); free(bias); free(expected); free(got);
+}
+
+static void test_sdpa_f32(h3_gpu *gpu) {
+    enum { SEQ = 9, HEADS = 3, DIM = 8 };
+    const float scale = 1.0f / sqrtf((float)DIM);
+    size_t count = (size_t)SEQ * HEADS * DIM;
+    float *query = malloc(count * sizeof(float));
+    float *key = malloc(count * sizeof(float));
+    float *value = malloc(count * sizeof(float));
+    float *expected = malloc(count * sizeof(float));
+    float *got = malloc(count * sizeof(float));
+    for (size_t index = 0; index < count; index++) {
+        query[index] = (float)(sin((double)index * 0.41) * 1.2);
+        key[index] = (float)(cos((double)index * 0.29) * 1.1);
+        value[index] = (float)(sin((double)index * 0.17) * 0.9);
+    }
+    for (uint32_t head = 0; head < HEADS; head++) {
+        for (uint32_t row = 0; row < SEQ; row++) {
+            uint32_t qbase = (row * HEADS + head) * DIM;
+            float maxv = -3.402823466e+38f;
+            float dots[SEQ];
+            for (uint32_t s = 0; s < SEQ; s++) {
+                uint32_t kbase = (s * HEADS + head) * DIM;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < DIM; d++)
+                    dot = fmaf(query[qbase + d], key[kbase + d], dot);
+                dots[s] = dot * scale;
+                if (dots[s] > maxv) maxv = dots[s];
+            }
+            float sum = 0.0f;
+            for (uint32_t s = 0; s < SEQ; s++)
+                sum += expf(dots[s] - maxv);
+            for (uint32_t d = 0; d < DIM; d++) {
+                float acc = 0.0f;
+                for (uint32_t s = 0; s < SEQ; s++) {
+                    uint32_t kbase = (s * HEADS + head) * DIM;
+                    float dot = 0.0f;
+                    for (uint32_t k = 0; k < DIM; k++)
+                        dot = fmaf(query[qbase + k], key[kbase + k], dot);
+                    acc = fmaf(expf(dots[s] - maxv), value[kbase + d], acc);
+                }
+                expected[qbase + d] = acc / sum;
+            }
+        }
+    }
+    h3_gpu_tensor *q = h3_gpu_tensor_from_f32(gpu, query, count);
+    h3_gpu_tensor *k = h3_gpu_tensor_from_f32(gpu, key, count);
+    h3_gpu_tensor *v = h3_gpu_tensor_from_f32(gpu, value, count);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_f32(gpu, count);
+    CHECK(q && k && v && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_sdpa_f32(gpu, out, q, k, v, SEQ, HEADS, DIM, scale) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+        CHECK(check_f32(got, expected, count, 1e-5, "sdpa_f32"));
+    }
+    h3_gpu_tensor_free(q);
+    h3_gpu_tensor_free(k);
+    h3_gpu_tensor_free(v);
+    h3_gpu_tensor_free(out);
+    free(query); free(key); free(value); free(expected); free(got);
+}
+
+static void test_conv3d_f32(h3_gpu *gpu) {
+    enum { BATCH = 2, DEPTH = 4, HEIGHT = 5, WIDTH = 6, IC = 3, OC = 4 };
+    enum { KD = 2, KH = 3, KW = 2, SD = 1, SH = 2, SW = 1 };
+    size_t input_count = (size_t)BATCH * DEPTH * HEIGHT * WIDTH * IC;
+    size_t weight_count = (size_t)OC * IC * KD * KH * KW;
+    size_t output_depth = (DEPTH - KD) / SD + 1;
+    size_t output_height = (HEIGHT - KH) / SH + 1;
+    size_t output_width = (WIDTH - KW) / SW + 1;
+    size_t output_count = (size_t)BATCH * output_depth * output_height *
+                          output_width * OC;
+    float *input = malloc(input_count * sizeof(float));
+    float *weight = malloc(weight_count * sizeof(float));
+    float *bias = malloc(OC * sizeof(float));
+    float *expected = malloc(output_count * sizeof(float));
+    float *got = malloc(output_count * sizeof(float));
+    for (size_t index = 0; index < input_count; index++)
+        input[index] = (float)(sin((double)index * 0.31) * 1.5);
+    for (size_t index = 0; index < weight_count; index++)
+        weight[index] = (float)(cos((double)index * 0.47) * 0.4);
+    for (size_t index = 0; index < OC; index++)
+        bias[index] = (float)(sin((double)index * 0.23) * 0.2);
+    for (uint32_t batch = 0; batch < BATCH; batch++) {
+        for (uint32_t t = 0; t < output_depth; t++) {
+            for (uint32_t y = 0; y < output_height; y++) {
+                for (uint32_t x = 0; x < output_width; x++) {
+                    for (uint32_t oc = 0; oc < OC; oc++) {
+                        float sum = bias[oc];
+                        for (uint32_t kt = 0; kt < KD; kt++) {
+                            for (uint32_t khh = 0; khh < KH; khh++) {
+                                for (uint32_t kww = 0; kww < KW; kww++) {
+                                    for (uint32_t ic = 0; ic < IC; ic++) {
+                                        size_t input_index =
+                                            ((((size_t)batch * DEPTH +
+                                               t * SD + kt) * HEIGHT +
+                                              y * SH + khh) * WIDTH +
+                                             x * SW + kww) * IC + ic;
+                                        size_t weight_index =
+                                            ((((size_t)oc * IC + ic) * KD +
+                                              kt) * KH + khh) * KW + kww;
+                                        sum = fmaf(input[input_index],
+                                                   weight[weight_index], sum);
+                                    }
+                                }
+                            }
+                        }
+                        size_t output_index =
+                            ((((size_t)batch * output_depth + t) *
+                              output_height + y) * output_width + x) * OC +
+                            oc;
+                        expected[output_index] = sum;
+                    }
+                }
+            }
+        }
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_f32(gpu, input, input_count);
+    h3_gpu_tensor *w = h3_gpu_tensor_from_f32(gpu, weight, weight_count);
+    h3_gpu_tensor *b = h3_gpu_tensor_from_f32(gpu, bias, OC);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_f32(gpu, output_count);
+    CHECK(in && w && b && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_conv3d_f32(gpu, out, in, w, b, BATCH, DEPTH, HEIGHT,
+                                WIDTH, IC, OC, KD, KH, KW, SD, SH, SW) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_tensor_read_f32(out, got, output_count) == 0);
+        CHECK(memcmp(got, expected, output_count * sizeof(float)) == 0);
+        if (memcmp(got, expected, output_count * sizeof(float)) != 0) {
+            for (size_t index = 0; index < output_count; index++) {
+                if (got[index] != expected[index]) {
+                    fprintf(stderr, "  conv3d[%zu]: got %.9g expected %.9g\n",
+                            index, got[index], expected[index]);
+                    break;
+                }
+            }
+        }
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(w);
+    h3_gpu_tensor_free(b);
+    h3_gpu_tensor_free(out);
+    free(input); free(weight); free(bias); free(expected); free(got);
+}
+
 static void test_adaln_bf16(h3_gpu *gpu) {
     enum { ROWS = 4, WIDTH = 128, SLOTS = 3 };
     const float epsilon = 1e-5f;
@@ -2396,6 +2789,12 @@ int main(int argc, char **argv) {
     test_mlp_bf16(gpu);
     test_mlp_nax_bf16(gpu);
     test_grouped_qkv_linear_rope_bf16(gpu);
+    test_swiglu_f32(gpu);
+    test_video_qkv_rope_f32(gpu);
+    test_vae_encoder_pad_f32(gpu);
+    test_vae_group_norm_silu_f32(gpu);
+    test_sdpa_f32(gpu);
+    test_conv3d_f32(gpu);
     test_adaln_bf16(gpu);
     test_adaln_offset(gpu);
     test_gate_bf16(gpu);

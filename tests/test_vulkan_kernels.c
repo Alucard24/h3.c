@@ -126,14 +126,14 @@ static void test_cast_and_unary(h3_gpu *gpu) {
     CHECK(in && out_b && out_f && in_b);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_cast_f32_to_bf16(gpu, out_b, in, N) == 0);
-        CHECK(h3_gpu_cast_bf16_to_f32(gpu, out_f, in_b, N) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_cast_f32_to_bf16(gpu, out_b, in, N) == 1);
+        CHECK(h3_gpu_cast_bf16_to_f32(gpu, out_f, in_b, N) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got_b[N];
-        CHECK(h3_gpu_tensor_read_bf16(out_b, got_b, N) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out_b, got_b, N) == 1);
         CHECK(memcmp(got_b, expected_bf16, sizeof(got_b)) == 0);
         float got_f[N];
-        CHECK(h3_gpu_tensor_read_f32(out_f, got_f, N) == 0);
+        CHECK(h3_gpu_tensor_read_f32(out_f, got_f, N) == 1);
         CHECK(check_f32(got_f, expected_f32, N, 2, "cast_bf16"));
     }
     h3_gpu_tensor_free(in);
@@ -155,10 +155,10 @@ static void test_silu_bf16(h3_gpu *gpu) {
     CHECK(in && out);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_silu_bf16(gpu, out, in, N) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_silu_bf16(gpu, out, in, N) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[N];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, N) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, N) == 1);
         CHECK(memcmp(got, expected, sizeof(got)) == 0);
     }
     h3_gpu_tensor_free(in);
@@ -186,16 +186,16 @@ static void test_add_sub_silu_mul(h3_gpu *gpu) {
     CHECK(a_t && b_t && add && sub && mul);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_add_bf16(gpu, add, a_t, b_t, N) == 0);
-        CHECK(h3_gpu_sub_bf16(gpu, sub, a_t, b_t, N) == 0);
-        CHECK(h3_gpu_silu_mul_bf16(gpu, mul, a_t, b_t, N) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_add_bf16(gpu, add, a_t, b_t, N) == 1);
+        CHECK(h3_gpu_sub_bf16(gpu, sub, a_t, b_t, N) == 1);
+        CHECK(h3_gpu_silu_mul_bf16(gpu, mul, a_t, b_t, N) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[N];
-        CHECK(h3_gpu_tensor_read_bf16(add, got, N) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(add, got, N) == 1);
         CHECK(memcmp(got, expected_add, sizeof(got)) == 0);
-        CHECK(h3_gpu_tensor_read_bf16(sub, got, N) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(sub, got, N) == 1);
         CHECK(memcmp(got, expected_sub, sizeof(got)) == 0);
-        CHECK(h3_gpu_tensor_read_bf16(mul, got, N) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(mul, got, N) == 1);
         CHECK(memcmp(got, expected_mul, sizeof(got)) == 0);
     }
     h3_gpu_tensor_free(a_t);
@@ -228,16 +228,16 @@ static void test_scaled_clip_geglu(h3_gpu *gpu) {
     CHECK(a && b && scaled && clipped && geglu);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_add_scaled_f32(gpu, scaled, a, b, 0.75f, -0.25f, N) == 0);
-        CHECK(h3_gpu_clip_f32(gpu, clipped, a, N, -0.5f, 0.5f) == 0);
-        CHECK(h3_gpu_geglu_f32(gpu, geglu, a, b, N) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_add_scaled_f32(gpu, scaled, a, b, 0.75f, -0.25f, N) == 1);
+        CHECK(h3_gpu_clip_f32(gpu, clipped, a, N, -0.5f, 0.5f) == 1);
+        CHECK(h3_gpu_geglu_f32(gpu, geglu, a, b, N) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         float got[N];
-        CHECK(h3_gpu_tensor_read_f32(scaled, got, N) == 0);
+        CHECK(h3_gpu_tensor_read_f32(scaled, got, N) == 1);
         CHECK(check_f32(got, expected_scaled, N, 1e-7, "add_scaled"));
-        CHECK(h3_gpu_tensor_read_f32(clipped, got, N) == 0);
+        CHECK(h3_gpu_tensor_read_f32(clipped, got, N) == 1);
         CHECK(check_f32(got, expected_clip, N, 1e-7, "clip"));
-        CHECK(h3_gpu_tensor_read_f32(geglu, got, N) == 0);
+        CHECK(h3_gpu_tensor_read_f32(geglu, got, N) == 1);
         CHECK(check_f32(got, expected_geglu, N, 1e-6, "geglu"));
     }
     h3_gpu_tensor_free(a);
@@ -269,10 +269,10 @@ static void test_euler(h3_gpu *gpu) {
     CHECK(s && l && p);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_euler_bf16(gpu, s, OFFSET, l, p, N, 0.05f, 0.3f) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_euler_bf16(gpu, s, OFFSET, l, p, N, 0.05f, 0.3f) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         float got[N + OFFSET];
-        CHECK(h3_gpu_tensor_read_f32(s, got, N + OFFSET) == 0);
+        CHECK(h3_gpu_tensor_read_f32(s, got, N + OFFSET) == 1);
         CHECK(check_f32(got, expected, N + OFFSET, 1e-7, "euler"));
     }
     h3_gpu_tensor_free(s);
@@ -302,10 +302,10 @@ static void test_embedding(h3_gpu *gpu) {
     CHECK(w && t && out);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_embedding_bf16(gpu, out, w, t, TOKENS, VOCAB, WIDTH) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_embedding_bf16(gpu, out, w, t, TOKENS, VOCAB, WIDTH) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[TOKENS * WIDTH];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, TOKENS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, TOKENS * WIDTH) == 1);
         CHECK(memcmp(got, expected, sizeof(got)) == 0);
     }
     h3_gpu_tensor_free(w);
@@ -399,24 +399,24 @@ static void test_norms(h3_gpu *gpu) {
           layer_b);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_rms_norm_f32(gpu, rms, in, w, ROWS, WIDTH, epsilon) == 0);
+        CHECK(h3_gpu_rms_norm_f32(gpu, rms, in, w, ROWS, WIDTH, epsilon) == 1);
         CHECK(h3_gpu_layer_norm_f32(gpu, layer, in, w, b, ROWS, WIDTH,
-                                    epsilon) == 0);
+                                    epsilon) == 1);
         CHECK(h3_gpu_rms_norm_bf16(gpu, rms_b, in_b, w_b, ROWS, WIDTH,
-                                   epsilon) == 0);
+                                   epsilon) == 1);
         CHECK(h3_gpu_layer_norm_bf16(gpu, layer_b, in_b, w_b, b_b, ROWS,
-                                     WIDTH, epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                     WIDTH, epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         float got[ROWS * WIDTH];
         uint16_t got_b[ROWS * WIDTH];
-        CHECK(h3_gpu_tensor_read_f32(rms, got, ROWS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_f32(rms, got, ROWS * WIDTH) == 1);
         CHECK(check_f32(got, expected_rms, ROWS * WIDTH, 1e-4, "rms_f32"));
-        CHECK(h3_gpu_tensor_read_f32(layer, got, ROWS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_f32(layer, got, ROWS * WIDTH) == 1);
         CHECK(check_f32(got, expected_layer, ROWS * WIDTH, 1e-4,
                         "layer_f32"));
-        CHECK(h3_gpu_tensor_read_bf16(rms_b, got_b, ROWS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(rms_b, got_b, ROWS * WIDTH) == 1);
         CHECK(check_bf16_ulp(got_b, expected_rms_b, ROWS * WIDTH, 2, "rms_bf16"));
-        CHECK(h3_gpu_tensor_read_bf16(layer_b, got_b, ROWS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(layer_b, got_b, ROWS * WIDTH) == 1);
         CHECK(check_bf16_ulp(got_b, expected_layer_b, ROWS * WIDTH, 2, "layer_bf16"));
     }
     h3_gpu_tensor_free(in);
@@ -485,10 +485,10 @@ static void test_linear_bf16(h3_gpu *gpu) {
             h3_gpu_begin(gpu);
             CHECK(h3_gpu_linear_bf16(gpu, out, in, w,
                                      has_bias ? b : NULL, rows, input_dim,
-                                     output_dim) == 0);
-            CHECK(h3_gpu_submit(gpu) == 0);
+                                     output_dim) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
             CHECK(h3_gpu_tensor_read_bf16(out, got,
-                                          (size_t)rows * output_dim) == 0);
+                                          (size_t)rows * output_dim) == 1);
             int same = memcmp(got, expected,
                               (size_t)rows * output_dim * 2) == 0;
             if (!same) {
@@ -555,10 +555,10 @@ static void test_linear_f32(h3_gpu *gpu) {
         if (!failed) {
             h3_gpu_begin(gpu);
             CHECK(h3_gpu_linear_f32(gpu, out, in, w, has_bias ? b : NULL,
-                                    rows, input_dim, output_dim) == 0);
-            CHECK(h3_gpu_submit(gpu) == 0);
+                                    rows, input_dim, output_dim) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
             CHECK(h3_gpu_tensor_read_f32(out, got,
-                                         (size_t)rows * output_dim) == 0);
+                                         (size_t)rows * output_dim) == 1);
             CHECK(memcmp(got, expected,
                          (size_t)rows * output_dim * sizeof(float)) == 0);
             if (memcmp(got, expected,
@@ -612,9 +612,9 @@ static void test_scale_add_f32(h3_gpu *gpu) {
     CHECK(res && br && sc && out);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_scale_add_f32(gpu, out, res, br, sc, rows, width) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+        CHECK(h3_gpu_scale_add_f32(gpu, out, res, br, sc, rows, width) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
         CHECK(memcmp(got, expected, count * sizeof(float)) == 0);
         if (memcmp(got, expected, count * sizeof(float)) != 0) {
             for (size_t index = 0; index < count; index++) {
@@ -655,9 +655,9 @@ static void test_swiglu_bf16(h3_gpu *gpu) {
     CHECK(in && out);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_swiglu_bf16(gpu, out, in, rows, width) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_bf16(out, got, count) == 0);
+        CHECK(h3_gpu_swiglu_bf16(gpu, out, in, rows, width) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, count) == 1);
         CHECK(memcmp(got, expected, count * 2) == 0);
         if (memcmp(got, expected, count * 2) != 0) {
             for (size_t index = 0; index < count; index++) {
@@ -689,14 +689,14 @@ static void test_copy(h3_gpu *gpu) {
     CHECK(src16 && dst16 && src32 && dst32);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_copy_bf16(gpu, dst16, 16, src16, 8, count - 24) == 0);
-        CHECK(h3_gpu_copy_f32(gpu, dst32, 16, src32, 8, count - 24) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_copy_bf16(gpu, dst16, 16, src16, 8, count - 24) == 1);
+        CHECK(h3_gpu_copy_f32(gpu, dst32, 16, src32, 8, count - 24) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t *got16 = malloc((count + 32) * 2);
         float *got32 = malloc((count + 32) * sizeof(float));
-        CHECK(h3_gpu_tensor_read_bf16(dst16, got16, count + 32) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(dst16, got16, count + 32) == 1);
         CHECK(h3_gpu_tensor_read_f32_range(dst32, 16, got32,
-                                           count - 24) == 0);
+                                           count - 24) == 1);
         CHECK(memcmp(got16 + 16, bf16_values + 8, (count - 24) * 2) == 0);
         CHECK(memcmp(got32, f32_values + 8, (count - 24) * sizeof(float)) == 0);
         free(got16);
@@ -742,10 +742,10 @@ static void test_mlp_bf16(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_mlp_bf16(gpu, out, in, w1, w2, ROWS, INPUT_DIM, HIDDEN,
-                              OUTPUT_DIM) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                              OUTPUT_DIM) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[ROWS * OUTPUT_DIM];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUTPUT_DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUTPUT_DIM) == 1);
         int same = memcmp(got, expected, sizeof(got)) == 0;
         if (!same) {
             for (size_t index = 0; index < ROWS * OUTPUT_DIM; index++) {
@@ -846,12 +846,12 @@ static void test_grouped_qkv_linear_rope_bf16(h3_gpu *gpu) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_grouped_qkv_linear_rope_bf16(
                   gpu, oq, ok, ov, qkv_t, in, w, q, k, c, s, ROWS,
-                  INPUT_DIM, HEADS, DIM, HALF, epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                  INPUT_DIM, HEADS, DIM, HALF, epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[ROWS * HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(oq, got, ROWS * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(oq, got, ROWS * HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected_q, ROWS * HEADS * DIM, 2, "gqkv_q"));
-        CHECK(h3_gpu_tensor_read_bf16(ok, got, ROWS * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(ok, got, ROWS * HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected_k, ROWS * HEADS * DIM, 2, "gqkv_k"));
     }
     h3_gpu_tensor_free(in);
@@ -899,10 +899,10 @@ static void test_mlp_nax_bf16(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_mlp_nax_bf16(gpu, out, act_t, in, w1, w2, ROWS,
-                                  INPUT_DIM, HIDDEN, OUTPUT_DIM) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                  INPUT_DIM, HIDDEN, OUTPUT_DIM) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[ROWS * OUTPUT_DIM];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUTPUT_DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUTPUT_DIM) == 1);
         CHECK(memcmp(got, expected, sizeof(got)) == 0);
         if (memcmp(got, expected, sizeof(got)) != 0) {
             for (size_t index = 0; index < ROWS * OUTPUT_DIM; index++) {
@@ -942,9 +942,9 @@ static void test_swiglu_f32(h3_gpu *gpu) {
     CHECK(in && out);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_swiglu_f32(gpu, out, in, rows, width) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+        CHECK(h3_gpu_swiglu_f32(gpu, out, in, rows, width) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
         CHECK(check_f32(got, expected, count, 1e-6, "swiglu_f32"));
     }
     h3_gpu_tensor_free(in);
@@ -1008,13 +1008,13 @@ static void test_video_qkv_rope_f32(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_video_qkv_rope_f32(gpu, oq, ok, ov, t, c, s, SEQ, HEADS,
-                                        DIM, HALF, epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                        DIM, HALF, epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         float got[SEQ * HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_f32(oq, got, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_f32(oq, got, SEQ * HEADS * DIM) == 1);
         CHECK(check_f32(got, expected_q, SEQ * HEADS * DIM, 1e-4,
                         "video_qkv_q"));
-        CHECK(h3_gpu_tensor_read_f32(ok, got, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_f32(ok, got, SEQ * HEADS * DIM) == 1);
         CHECK(check_f32(got, expected_k, SEQ * HEADS * DIM, 1e-4,
                         "video_qkv_k"));
     }
@@ -1076,9 +1076,9 @@ static void test_vae_encoder_pad_f32(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_vae_encoder_pad_f32(gpu, out, in, BATCH, DEPTH, HEIGHT,
-                                         WIDTH, CH, DF, HB, HA, WB, WA) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, output_count) == 0);
+                                         WIDTH, CH, DF, HB, HA, WB, WA) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, output_count) == 1);
         CHECK(memcmp(got, expected, output_count * sizeof(float)) == 0);
         if (memcmp(got, expected, output_count * sizeof(float)) != 0) {
             for (size_t index = 0; index < output_count; index++) {
@@ -1156,9 +1156,9 @@ static void test_vae_group_norm_silu_f32(h3_gpu *gpu) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_vae_encoder_group_norm_silu_f32(
                   gpu, out, in, w, b, BATCH, DEPTH, HEIGHT, WIDTH, CH,
-                  GROUPS, epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+                  GROUPS, epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
         CHECK(check_f32(got, expected, count, 1e-4, "vae_gn_silu"));
     }
     h3_gpu_tensor_free(in);
@@ -1218,9 +1218,9 @@ static void test_sdpa_f32(h3_gpu *gpu) {
     CHECK(q && k && v && out);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_sdpa_f32(gpu, out, q, k, v, SEQ, HEADS, DIM, scale) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+        CHECK(h3_gpu_sdpa_f32(gpu, out, q, k, v, SEQ, HEADS, DIM, scale) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
         CHECK(check_f32(got, expected, count, 1e-5, "sdpa_f32"));
     }
     h3_gpu_tensor_free(q);
@@ -1293,9 +1293,9 @@ static void test_conv3d_f32(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_conv3d_f32(gpu, out, in, w, b, BATCH, DEPTH, HEIGHT,
-                                WIDTH, IC, OC, KD, KH, KW, SD, SH, SW) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, output_count) == 0);
+                                WIDTH, IC, OC, KD, KH, KW, SD, SH, SW) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, output_count) == 1);
         CHECK(memcmp(got, expected, output_count * sizeof(float)) == 0);
         if (memcmp(got, expected, output_count * sizeof(float)) != 0) {
             for (size_t index = 0; index < output_count; index++) {
@@ -1341,9 +1341,9 @@ static void test_weight_norm_f32(h3_gpu *gpu) {
     CHECK(v && m && out);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_weight_norm_f32(gpu, out, v, m, OUTER, INNER) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+        CHECK(h3_gpu_weight_norm_f32(gpu, out, v, m, OUTER, INNER) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
         CHECK(check_f32(got, expected, count, 1e-4, "weight_norm"));
     }
     h3_gpu_tensor_free(v);
@@ -1375,9 +1375,9 @@ static void test_snake1d_f32(h3_gpu *gpu) {
     CHECK(in && a && out);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_snake1d_f32(gpu, out, in, a, BATCH, LENGTH, CH) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+        CHECK(h3_gpu_snake1d_f32(gpu, out, in, a, BATCH, LENGTH, CH) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
         CHECK(check_f32(got, expected, count, 1e-6, "snake1d"));
     }
     h3_gpu_tensor_free(in);
@@ -1452,9 +1452,9 @@ static void test_alias_free_snake_f32(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_alias_free_snake_f32(gpu, out, in, al, be, u, d, BATCH,
-                                          LENGTH, CH) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+                                          LENGTH, CH) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
         CHECK(check_f32(got, expected, count, 1e-4, "alias_free_snake"));
     }
     h3_gpu_tensor_free(in);
@@ -1507,11 +1507,11 @@ static void test_audio_qkv_split_f32(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_audio_qkv_split_f32(gpu, q, k, v, t, qbt, kbt, vbt,
-                                         BATCH, LENGTH, HEADS, DIM) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(q, gq, count) == 0);
-        CHECK(h3_gpu_tensor_read_f32(k, gk, count) == 0);
-        CHECK(h3_gpu_tensor_read_f32(v, gv, count) == 0);
+                                         BATCH, LENGTH, HEADS, DIM) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(q, gq, count) == 1);
+        CHECK(h3_gpu_tensor_read_f32(k, gk, count) == 1);
+        CHECK(h3_gpu_tensor_read_f32(v, gv, count) == 1);
         CHECK(memcmp(gq, eq, count * sizeof(float)) == 0);
         CHECK(memcmp(gk, ek, count * sizeof(float)) == 0);
         CHECK(memcmp(gv, ev, count * sizeof(float)) == 0);
@@ -1554,9 +1554,9 @@ static void test_audio_attention_pool_f32(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_audio_attention_pool_f32(gpu, out, in, BATCH, LENGTH,
-                                              HEADS, DIM, OUT_DIM) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, out_count) == 0);
+                                              HEADS, DIM, OUT_DIM) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, out_count) == 1);
         CHECK(memcmp(got, expected, out_count * sizeof(float)) == 0);
     }
     h3_gpu_tensor_free(in);
@@ -1611,9 +1611,9 @@ static void test_conv1d_f32(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_conv1d_f32(gpu, out, in, w, b, BATCH, LENGTH, IC, OC,
-                                KERNEL, PADDING, DILATION) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, output_count) == 0);
+                                KERNEL, PADDING, DILATION) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, output_count) == 1);
         CHECK(memcmp(got, expected, output_count * sizeof(float)) == 0);
         if (memcmp(got, expected, output_count * sizeof(float)) != 0) {
             for (size_t index = 0; index < output_count; index++) {
@@ -1682,9 +1682,9 @@ static void test_conv_transpose1d_f32(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_conv_transpose1d_f32(gpu, out, in, w, b, BATCH, LENGTH,
-                                          IC, OC, KERNEL, STRIDE, PADDING) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, output_count) == 0);
+                                          IC, OC, KERNEL, STRIDE, PADDING) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, output_count) == 1);
         CHECK(memcmp(got, expected, output_count * sizeof(float)) == 0);
         if (memcmp(got, expected, output_count * sizeof(float)) != 0) {
             for (size_t index = 0; index < output_count; index++) {
@@ -1758,9 +1758,9 @@ static void test_sdpa_causal_f32(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_sdpa_causal_f32(gpu, out, q, k, v, BATCH, SEQ, HEADS,
-                                     DIM, scale) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+                                     DIM, scale) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
         CHECK(check_f32(got, expected, count, 1e-5, "sdpa_causal"));
     }
     h3_gpu_tensor_free(q);
@@ -1813,13 +1813,13 @@ static void test_vision_qkv_rope_bf16(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_vision_qkv_rope_bf16(gpu, oq, ok, ov, t, c, s, SEQ,
-                                          HEADS, DIM, HALF) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                          HEADS, DIM, HALF) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[SEQ * HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(oq, got, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(oq, got, SEQ * HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected_q, SEQ * HEADS * DIM, 2,
                              "vision_q"));
-        CHECK(h3_gpu_tensor_read_bf16(ok, got, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(ok, got, SEQ * HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected_k, SEQ * HEADS * DIM, 2,
                              "vision_k"));
     }
@@ -1873,11 +1873,11 @@ static void test_quantize_int8(h3_gpu *gpu) {
     CHECK(in && out && sc);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_quantize_weight_int8(gpu, out, sc, in, ROWS, COLS) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_quantize_weight_int8(gpu, out, sc, in, ROWS, COLS) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         CHECK(h3_gpu_tensor_read_bf16(out, (uint16_t *)got,
-                                      ROWS * COLS) == 0);
-        CHECK(h3_gpu_tensor_read_f32(sc, got_scales, ROWS) == 0);
+                                      ROWS * COLS) == 1);
+        CHECK(h3_gpu_tensor_read_f32(sc, got_scales, ROWS) == 1);
         CHECK(memcmp(got, expected, ROWS * COLS) == 0);
         CHECK(memcmp(got_scales, expected_scales, ROWS * sizeof(float)) == 0);
         if (memcmp(got, expected, ROWS * COLS) != 0) {
@@ -1935,12 +1935,12 @@ static void test_linear_int8(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_quantize_weight_int8(gpu, wq, ws, w, OUTPUT_DIM,
-                                          INPUT_DIM) == 0);
+                                          INPUT_DIM) == 1);
         CHECK(h3_gpu_linear_int8_bf16(gpu, out, qi, is, in, wq, ws, ROWS,
-                                      INPUT_DIM, OUTPUT_DIM, 0) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                      INPUT_DIM, OUTPUT_DIM, 0) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[ROWS * OUTPUT_DIM];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUTPUT_DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUTPUT_DIM) == 1);
         CHECK(memcmp(got, expected, sizeof(got)) == 0);
         if (memcmp(got, expected, sizeof(got)) != 0) {
             for (size_t index = 0; index < ROWS * OUTPUT_DIM; index++) {
@@ -2032,15 +2032,15 @@ static void test_mlp_int8(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_quantize_weight_int8(gpu, w1q, w1s, w1, HIDDEN * 2,
-                                          INPUT_DIM) == 0);
+                                          INPUT_DIM) == 1);
         CHECK(h3_gpu_quantize_weight_int8(gpu, w2q, w2s, w2, OUTPUT_DIM,
-                                          HIDDEN) == 0);
+                                          HIDDEN) == 1);
         CHECK(h3_gpu_mlp_int8_bf16(gpu, out, act, qa, qs, in, w1q, w1s, w2q,
                                    w2s, w1, w2, ROWS, INPUT_DIM, HIDDEN,
-                                   OUTPUT_DIM, 0, 0, 1, 0) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                   OUTPUT_DIM, 0, 0, 1, 0) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[ROWS * OUTPUT_DIM];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUTPUT_DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUTPUT_DIM) == 1);
         CHECK(memcmp(got, expected, sizeof(got)) == 0);
         if (memcmp(got, expected, sizeof(got)) != 0) {
             for (size_t index = 0; index < ROWS * OUTPUT_DIM; index++) {
@@ -2144,13 +2144,13 @@ static void test_gate_adaln_quantize_int8(h3_gpu *gpu) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_gate_adaln_quantize_int8(
                   gpu, gated_t, qout, qsc, res, br, w, gm, nm, rm, ROWS,
-                  ROWS, WIDTH, SLOTS, GATE, SHIFT, SCALE, epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                  ROWS, WIDTH, SLOTS, GATE, SHIFT, SCALE, epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         int8_t got[ROWS * WIDTH];
         float got_scales[ROWS];
         CHECK(h3_gpu_tensor_read_bf16(qout, (uint16_t *)got,
-                                      ROWS * WIDTH) == 0);
-        CHECK(h3_gpu_tensor_read_f32(qsc, got_scales, ROWS) == 0);
+                                      ROWS * WIDTH) == 1);
+        CHECK(h3_gpu_tensor_read_f32(qsc, got_scales, ROWS) == 1);
         int same = memcmp(got, expected, ROWS * WIDTH) == 0;
         if (same) {
             /* The GPU divides the shared-memory max by 127 with one ULP of
@@ -2241,10 +2241,10 @@ static void test_adaln_bf16(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_adaln_bf16(gpu, out, in, w, m, map, ROWS, WIDTH, SLOTS,
-                                1, 2, epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                1, 2, epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[ROWS * WIDTH];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 1);
         CHECK(check_bf16_ulp(got, expected, ROWS * WIDTH, 2, "adaln"));
     }
     h3_gpu_tensor_free(in);
@@ -2297,10 +2297,10 @@ static void test_adaln_offset(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_adaln_bf16_offset(gpu, out, in, 2 * WIDTH, w, m, map,
-                                       2, WIDTH, SLOTS, 0, 1, epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                       2, WIDTH, SLOTS, 0, 1, epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[2 * WIDTH];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, 2 * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, 2 * WIDTH) == 1);
         CHECK(check_bf16_ulp(got, expected, 2 * WIDTH, 2, "adaln_offset"));
     }
     h3_gpu_tensor_free(in);
@@ -2340,10 +2340,10 @@ static void test_gate_bf16(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_gate_bf16(gpu, out, r, b, m, map, ROWS, WIDTH, SLOTS,
-                               1) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                               1) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[ROWS * WIDTH];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 1);
         CHECK(memcmp(got, expected, sizeof(got)) == 0);
     }
     h3_gpu_tensor_free(r);
@@ -2412,10 +2412,10 @@ static void test_gate_adaln_bf16(h3_gpu *gpu) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_gate_adaln_bf16(gpu, gated, out, r, b, n, g, m, map,
                                      ROWS, WIDTH, SLOTS, 1, 0, 1,
-                                     epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                     epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[ROWS * WIDTH];
-        CHECK(h3_gpu_tensor_read_bf16(gated, got, ROWS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(gated, got, ROWS * WIDTH) == 1);
         for (uint32_t row = 0; row < ROWS; row++) {
             size_t mbase = (size_t)row_map[row] * SLOTS * WIDTH;
             for (size_t column = 0; column < WIDTH; column++) {
@@ -2427,7 +2427,7 @@ static void test_gate_adaln_bf16(h3_gpu *gpu) {
             }
         }
         CHECK(memcmp(got, gated_expected, sizeof(got)) == 0);
-        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 1);
         CHECK(check_bf16_ulp(got, expected, ROWS * WIDTH, 2, "gate_adaln"));
     }
     h3_gpu_tensor_free(r);
@@ -2494,10 +2494,10 @@ static void test_adaln_linear_bf16(h3_gpu *gpu) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_adaln_linear_bf16(gpu, out, inv, in, 0, n, m, map, w, b,
                                        ROWS, WIDTH, OUT, SLOTS, 0, 1,
-                                       epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                       epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[ROWS * OUT];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUT) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUT) == 1);
         CHECK(check_bf16_ulp(got, expected, ROWS * OUT, 2, "adaln_linear"));
     }
     h3_gpu_tensor_free(in);
@@ -2541,10 +2541,10 @@ static void test_head_rms_norm_bf16(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_head_rms_norm_bf16(gpu, t, w, SEQ, HEADS, DIM,
-                                        epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                        epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[SEQ * HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(t, got, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(t, got, SEQ * HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected, SEQ * HEADS * DIM, 2, "head_rms"));
     }
     h3_gpu_tensor_free(t);
@@ -2622,18 +2622,18 @@ static void test_grouped_qkv_rope_bf16(h3_gpu *gpu) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_grouped_qkv_rope_bf16(gpu, oq, ok, ov, t, q, k, c, s,
                                            SEQ, HEADS, DIM, HALF,
-                                           epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                           epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[SEQ * HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(oq, got, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(oq, got, SEQ * HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected_q, SEQ * HEADS * DIM, 2,
                              "qkv_q"));
-        CHECK(h3_gpu_tensor_read_bf16(ok, got, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(ok, got, SEQ * HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected_k, SEQ * HEADS * DIM, 2,
                              "qkv_k"));
         /* value is copied verbatim from the grouped layout */
         uint16_t gotv[SEQ * HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(ov, gotv, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(ov, gotv, SEQ * HEADS * DIM) == 1);
         int same = 1;
         for (uint32_t row = 0; row < SEQ && same; row++)
             for (uint32_t head = 0; head < HEADS && same; head++)
@@ -2721,13 +2721,13 @@ static void test_qkv_rope_plain_bf16(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_qkv_rope_bf16(gpu, oq, ok, ov, t, q, k, c, s, SEQ, HEADS,
-                                   DIM, HALF, epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                   DIM, HALF, epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[SEQ * HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(oq, got, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(oq, got, SEQ * HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected_q, SEQ * HEADS * DIM, 2,
                              "qkv_plain_q"));
-        CHECK(h3_gpu_tensor_read_bf16(ok, got, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(ok, got, SEQ * HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected_k, SEQ * HEADS * DIM, 2,
                              "qkv_plain_k"));
     }
@@ -2788,20 +2788,20 @@ static void test_sdpa_bf16(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
-                               scale) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                               scale) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[SEQ * HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, SEQ * HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected, SEQ * HEADS * DIM, 4, "sdpa"));
         /* head-major output variant: same values, transposed layout */
         h3_gpu_tensor *out2 = h3_gpu_tensor_new_bf16(gpu, SEQ * HEADS * DIM);
         CHECK(out2);
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_sdpa_bf16_head_major_output(gpu, out2, tq, tk, tv, SEQ,
-                                                 HEADS, DIM, scale) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                                 HEADS, DIM, scale) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got2[SEQ * HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(out2, got2, SEQ * HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out2, got2, SEQ * HEADS * DIM) == 1);
         int same = 1;
         for (uint32_t row = 0; row < SEQ && same; row++)
             for (uint32_t head = 0; head < HEADS && same; head++)
@@ -2877,10 +2877,10 @@ static void test_patch_linear_bf16(h3_gpu *gpu) {
             h3_gpu_begin(gpu);
             CHECK(h3_gpu_patch_linear_bf16(gpu, out, in, w,
                                            has_bias ? b : NULL, rows,
-                                           input_dim, OUT) == 0);
-            CHECK(h3_gpu_submit(gpu) == 0);
+                                           input_dim, OUT) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
             CHECK(h3_gpu_tensor_read_bf16(out, got,
-                                          (size_t)rows * OUT) == 0);
+                                          (size_t)rows * OUT) == 1);
             int same = memcmp(got, expected, (size_t)rows * OUT * 2) == 0;
             if (!same) {
                 for (size_t index = 0; index < (size_t)rows * OUT; index++) {
@@ -2925,9 +2925,9 @@ static void test_patch_linear_offset_bf16(h3_gpu *gpu) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_patch_linear_bf16_offset(gpu, out, OUT_OFFSET * OUT, in,
                                               IN_OFFSET * IN, w, NULL, ROWS,
-                                              IN, OUT) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_bf16(out, got, out_total) == 0);
+                                              IN, OUT) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, out_total) == 1);
         int same = memcmp(got + (size_t)OUT_OFFSET * OUT, expected,
                           (size_t)ROWS * OUT * 2) == 0;
         if (!same) {
@@ -2976,9 +2976,9 @@ static void test_patch_linear_map_bf16(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_patch_linear_bf16_map(gpu, out, in, w, NULL, map,
-                                           OUT_ROWS, ROWS, IN, OUT) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
-        CHECK(h3_gpu_tensor_read_bf16(out, got, (size_t)OUT_ROWS * OUT) == 0);
+                                           OUT_ROWS, ROWS, IN, OUT) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, (size_t)OUT_ROWS * OUT) == 1);
         int same = memcmp(got, expected, (size_t)OUT_ROWS * OUT * 2) == 0;
         if (!same) {
             for (size_t index = 0; index < (size_t)OUT_ROWS * OUT; index++) {
@@ -3049,11 +3049,11 @@ static void test_sdpa_flash_bf16(h3_gpu *gpu) {
         if (!failed) {
             h3_gpu_begin(gpu);
             CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
-                                   scale) == 0);
-            CHECK(h3_gpu_submit(gpu) == 0);
+                                   scale) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
             uint16_t *got = malloc(count * 2);
             CHECK(got);
-            CHECK(h3_gpu_tensor_read_bf16(out, got, count) == 0);
+            CHECK(h3_gpu_tensor_read_bf16(out, got, count) == 1);
             /* The flash kernel reduces dots with a tree instead of the
              * linear FMA order, so allow a few more ulps. */
             CHECK(check_bf16_ulp_abs(got, expected, count, 8, 2e-7f,
@@ -3092,8 +3092,8 @@ static void test_sdpa_flash_bench(h3_gpu *gpu) {
              * the flash path is the one used at this size). */
             h3_gpu_begin(gpu);
             CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
-                                   1.0f / sqrtf((float)DIM)) == 0);
-            CHECK(h3_gpu_submit(gpu) == 0);
+                                   1.0f / sqrtf((float)DIM)) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
             h3_gpu_get_stats(gpu, &stats);
             printf("SDPA seq=%d heads=%d: flash kernel %.1f ms (GPU wait)\n",
                    SEQ, HEADS, stats.command_wait_seconds * 1e3);
@@ -3149,17 +3149,17 @@ static void test_token_pool_expand(h3_gpu *gpu) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_token_pool_bf16(gpu, out, in, 0, orig, 0, base, 0, bi,
                                      pr, INPUT_ROWS, ROWS, BASELINE_ROWS,
-                                     WIDTH) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                     WIDTH) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[ROWS * WIDTH], got_orig[INPUT_ROWS * WIDTH],
                  got_base[BASELINE_ROWS * WIDTH];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 1);
         CHECK(memcmp(got, expected_out, sizeof(got)) == 0);
         CHECK(h3_gpu_tensor_read_bf16(orig, got_orig,
-                                      INPUT_ROWS * WIDTH) == 0);
+                                      INPUT_ROWS * WIDTH) == 1);
         CHECK(memcmp(got_orig, expected_orig, sizeof(got_orig)) == 0);
         CHECK(h3_gpu_tensor_read_bf16(base, got_base,
-                                      BASELINE_ROWS * WIDTH) == 0);
+                                      BASELINE_ROWS * WIDTH) == 1);
         CHECK(memcmp(got_base, expected_base, sizeof(got_base)) == 0);
 
         /* expand: parents map every full row to its pooled row; reduced
@@ -3195,11 +3195,11 @@ static void test_token_pool_expand(h3_gpu *gpu) {
             CHECK(h3_gpu_token_expand_delta_bf16(gpu, full, orig, 0, out,
                                                  base, 0, bi2, pr2, FULL_ROWS,
                                                  REDUCED, BASELINE_ROWS, WIDTH,
-                                                 0, 0.5f) == 0);
-            CHECK(h3_gpu_submit(gpu) == 0);
+                                                 0, 0.5f) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
             uint16_t got_full[FULL_ROWS * WIDTH];
             CHECK(h3_gpu_tensor_read_bf16(full, got_full,
-                                          FULL_ROWS * WIDTH) == 0);
+                                          FULL_ROWS * WIDTH) == 1);
             CHECK(memcmp(got_full, expected_full, sizeof(got_full)) == 0);
         }
         h3_gpu_tensor_free(pr2);
@@ -3274,12 +3274,12 @@ static void test_token_pool_adaln(h3_gpu *gpu) {
         CHECK(h3_gpu_token_pool_adaln_bf16(gpu, res, out, in, 0, orig, 0,
                                            base, 0, bi, pr, w, m, map,
                                            INPUT_ROWS, ROWS, BASELINE_ROWS,
-                                           WIDTH, SLOTS, 0, 1, epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                           WIDTH, SLOTS, 0, 1, epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[ROWS * WIDTH];
-        CHECK(h3_gpu_tensor_read_bf16(res, got, ROWS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(res, got, ROWS * WIDTH) == 1);
         CHECK(memcmp(got, expected_res, sizeof(got)) == 0);
-        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 1);
         CHECK(check_bf16_ulp(got, expected_out, ROWS * WIDTH, 2,
                              "pool_adaln"));
 
@@ -3332,14 +3332,14 @@ static void test_token_pool_adaln(h3_gpu *gpu) {
             CHECK(h3_gpu_token_expand_adaln_bf16(
                       gpu, full, full_out, in, 0, res, base, 0, bi2, pr2,
                       w, m, map, FULL_ROWS, REDUCED, BASELINE_ROWS, WIDTH, 0,
-                      0.5f, SLOTS, 0, 1, epsilon) == 0);
-            CHECK(h3_gpu_submit(gpu) == 0);
+                      0.5f, SLOTS, 0, 1, epsilon) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
             uint16_t got2[FULL_ROWS * WIDTH];
             CHECK(h3_gpu_tensor_read_bf16(full, got2,
-                                          FULL_ROWS * WIDTH) == 0);
+                                          FULL_ROWS * WIDTH) == 1);
             CHECK(memcmp(got2, expected_full, sizeof(got2)) == 0);
             CHECK(h3_gpu_tensor_read_bf16(full_out, got2,
-                                          FULL_ROWS * WIDTH) == 0);
+                                          FULL_ROWS * WIDTH) == 1);
             CHECK(check_bf16_ulp(got2, expected_full_out, FULL_ROWS * WIDTH,
                                  2, "expand_adaln"));
         }
@@ -3382,14 +3382,14 @@ static void test_device_local_load(h3_gpu *gpu) {
         CHECK(w && in && out);
         if (!failed) {
             h3_gpu_begin(gpu);
-            CHECK(h3_gpu_add_bf16(gpu, out, w, in, N) == 0);
-            CHECK(h3_gpu_submit(gpu) == 0);
+            CHECK(h3_gpu_add_bf16(gpu, out, w, in, N) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
             uint16_t got[N];
-            CHECK(h3_gpu_tensor_read_bf16(out, got, N) == 0);
+            CHECK(h3_gpu_tensor_read_bf16(out, got, N) == 1);
             CHECK(memcmp(got, expected, sizeof(got)) == 0);
             /* device-local readback */
             uint16_t wgot[N];
-            CHECK(h3_gpu_tensor_read_bf16(w, wgot, N) == 0);
+            CHECK(h3_gpu_tensor_read_bf16(w, wgot, N) == 1);
             CHECK(memcmp(wgot, data, sizeof(wgot)) == 0);
         }
         h3_gpu_tensor_free(w);
@@ -3470,14 +3470,14 @@ static void test_text_qk_rope_bf16(h3_gpu *gpu) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_text_qk_rope_bf16(gpu, oq, ok, tq, tk, wq, wk, c, s,
                                        SEQ, Q_HEADS, KV_HEADS, DIM,
-                                       epsilon) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                       epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[SEQ * Q_HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(oq, got, SEQ * Q_HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(oq, got, SEQ * Q_HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected_q, SEQ * Q_HEADS * DIM, 2,
                              "text_qk_q"));
         uint16_t gotk[SEQ * KV_HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(ok, gotk, SEQ * KV_HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(ok, gotk, SEQ * KV_HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(gotk, expected_k, SEQ * KV_HEADS * DIM, 2,
                              "text_qk_k"));
     }
@@ -3533,14 +3533,14 @@ static void test_rope_text_bf16(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_rope_text_bf16(gpu, tq, tk, c, s, SEQ, Q_HEADS, KV_HEADS,
-                                    DIM) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                    DIM) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[SEQ * Q_HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(tq, got, SEQ * Q_HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(tq, got, SEQ * Q_HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(got, expected_q, SEQ * Q_HEADS * DIM, 2,
                              "rope_text_q"));
         uint16_t gotk[SEQ * KV_HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(tk, gotk, SEQ * KV_HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(tk, gotk, SEQ * KV_HEADS * DIM) == 1);
         CHECK(check_bf16_ulp(gotk, expected_k, SEQ * KV_HEADS * DIM, 2,
                              "rope_text_k"));
     }
@@ -3604,10 +3604,10 @@ static void test_gqa_causal_bf16(h3_gpu *gpu) {
     if (!failed) {
         h3_gpu_begin(gpu);
         CHECK(h3_gpu_gqa_causal_bf16(gpu, out, tq, tk, tv, SEQ, Q_HEADS,
-                                     KV_HEADS, DIM, scale) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+                                     KV_HEADS, DIM, scale) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[SEQ * Q_HEADS * DIM];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, SEQ * Q_HEADS * DIM) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, SEQ * Q_HEADS * DIM) == 1);
         CHECK(check_bf16_ulp_abs(got, expected, SEQ * Q_HEADS * DIM, 8,
                                  2e-7f, "gqa_causal"));
     }
@@ -3637,12 +3637,12 @@ static void test_continue_chain(h3_gpu *gpu) {
     CHECK(a && b && sum && out);
     if (!failed) {
         h3_gpu_begin(gpu);
-        CHECK(h3_gpu_add_bf16(gpu, sum, a, b, N) == 0);
-        CHECK(h3_gpu_continue(gpu) == 0);
-        CHECK(h3_gpu_silu_bf16(gpu, out, sum, N) == 0);
-        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_add_bf16(gpu, sum, a, b, N) == 1);
+        CHECK(h3_gpu_continue(gpu) == 1);
+        CHECK(h3_gpu_silu_bf16(gpu, out, sum, N) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
         uint16_t got[N];
-        CHECK(h3_gpu_tensor_read_bf16(out, got, N) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, N) == 1);
         CHECK(memcmp(got, expected, sizeof(got)) == 0);
     }
     h3_gpu_tensor_free(a);

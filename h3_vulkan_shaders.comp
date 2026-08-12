@@ -934,6 +934,58 @@ void main_sdpa_flash_bf16() {
     fl_out.data[oindex] = uint16_t(h3_f32_to_bf16(fl_acc[d] / fl_sum));
 }
 
+/* F32 sibling of the flash kernel: one workgroup per (head, row) with an
+ * online-softmax sweep over the sequence; used for long sequences where
+ * the one-thread-per-output naive kernel would trip the GPU watchdog. */
+layout(set = 0, binding = 0) readonly buffer SdpFFQ { float data[]; } flf_q;
+layout(set = 0, binding = 1) readonly buffer SdpFFK { float data[]; } flf_k;
+layout(set = 0, binding = 2) readonly buffer SdpFFV { float data[]; } flf_v;
+layout(set = 0, binding = 3) writeonly buffer SdpFFOut { float data[]; } flf_out;
+
+void main_sdpa_flash_f32() {
+    uint head = gl_WorkGroupID.x;
+    uint row = gl_WorkGroupID.y;
+    uint d = gl_LocalInvocationID.x;
+    uint seq = args.data.rows;
+    uint heads = args.data.width;
+    uint dim = args.data.input_dim;
+    if (row >= seq || head >= heads || d >= dim) return;
+    float scale = args.data.left_scale;
+    uint qbase = (row * heads + head) * dim;
+    fl_q_shared[d] = flf_q.data[qbase + d];
+    fl_acc[d] = 0.0f;
+    if (d == 0u) {
+        fl_max = -3.402823466e+38f;
+        fl_sum = 0.0f;
+    }
+    barrier();
+    for (uint s = 0u; s < seq; s++) {
+        uint kbase = (s * heads + head) * dim;
+        fl_dots[d] = fma(fl_q_shared[d], flf_k.data[kbase + d], 0.0f);
+        barrier();
+        for (uint stride = 64u; stride > 0u; stride >>= 1) {
+            if (d < stride) fl_dots[d] += fl_dots[d + stride];
+            barrier();
+        }
+        float dot = fl_dots[0] * scale;
+        if (d == 0u) {
+            float new_max = max(fl_max, dot);
+            fl_old_max = fl_max;
+            fl_max = new_max;
+            fl_sum = fl_sum * exp(fl_old_max - new_max) +
+                     exp(dot - new_max);
+        }
+        barrier();
+        float p = exp(fl_old_max - fl_max);
+        float w = exp(fl_dots[0] * scale - fl_max);
+        fl_acc[d] = fl_acc[d] * p + w * flf_v.data[kbase + d];
+        barrier();
+    }
+    uint oindex = args.data.grouped != 0u ?
+        (head * seq + row) * dim + d : qbase + d;
+    flf_out.data[oindex] = fl_acc[d] / fl_sum;
+}
+
 
 
 
@@ -1985,42 +2037,82 @@ layout(set = 0, binding = 2) readonly buffer L8IS { float data[]; } l8_is;
 layout(set = 0, binding = 3) readonly buffer L8WS { float data[]; } l8_ws;
 layout(set = 0, binding = 4) writeonly buffer L8Out { uint16_t data[]; } l8_out;
 
+/* 16x16 tiled int8 matmul: integer accumulation is exact and order
+ * independent, so the dequantized result is bit-identical to the naive
+ * kernel while the weights are staged through shared memory. */
+shared int lin8_in_tile[16][16];
+shared int lin8_w_tile[16][16];
+
 void main_linear_int8_bf16() {
-    uint column = gl_GlobalInvocationID.x;
-    uint row = gl_GlobalInvocationID.y;
-    if (row >= args.data.rows || column >= args.data.output_dim) return;
+    uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
     int acc = 0;
-    for (uint k = 0u; k < args.data.input_dim; k++) {
-        acc += int(l8_in.data[row * args.data.input_dim + k]) *
-               int(l8_w.data[column * args.data.input_dim + k]);
+    uint tile_count = (args.data.input_dim + 15u) / 16u;
+    for (uint tile = 0u; tile < tile_count; tile++) {
+        uint input_k = tile * 16u + gl_LocalInvocationID.x;
+        lin8_in_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (row < args.data.rows && input_k < args.data.input_dim) ?
+            int(l8_in.data[row * args.data.input_dim + input_k]) : 0;
+        uint weight_k = tile * 16u + gl_LocalInvocationID.y;
+        lin8_w_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (column < args.data.output_dim && weight_k < args.data.input_dim) ?
+            int(l8_w.data[column * args.data.input_dim + weight_k]) : 0;
+        barrier();
+        for (uint k = 0u; k < 16u; k++) {
+            acc += lin8_in_tile[gl_LocalInvocationID.y][k] *
+                   lin8_w_tile[k][gl_LocalInvocationID.x];
+        }
+        barrier();
     }
-    float dequant = float(acc) * l8_is.data[row] * l8_ws.data[column];
-    l8_out.data[row * args.data.output_dim + column] =
-        uint16_t(h3_f32_to_bf16(dequant));
+    if (row < args.data.rows && column < args.data.output_dim) {
+        float dequant = float(acc) * l8_is.data[row] * l8_ws.data[column];
+        l8_out.data[row * args.data.output_dim + column] =
+            uint16_t(h3_f32_to_bf16(dequant));
+    }
 }
 
 /* Fused fc1 (gate|up halves) -> SwiGLU in int8 with per-column weight
- * scales; one BF16 rounding after the dequantized product. */
+ * scales; one BF16 rounding after the dequantized product.  Tiled like the
+ * linear kernel; the exact integer sums keep the bit-exact semantics. */
+shared int fc1_in_tile[16][16];
+shared int fc1_g_tile[16][16];
+shared int fc1_u_tile[16][16];
 
 void main_fc1_swiglu_int8_bf16() {
-    uint column = gl_GlobalInvocationID.x;
-    uint row = gl_GlobalInvocationID.y;
+    uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
     uint hidden = args.data.output_dim;
-    if (row >= args.data.rows || column >= hidden) return;
-    uint base = row * args.data.input_dim;
     int acc_gate = 0;
     int acc_up = 0;
-    for (uint k = 0u; k < args.data.input_dim; k++) {
-        int value = int(l8_in.data[base + k]);
-        acc_gate += value * int(l8_w.data[column * args.data.input_dim + k]);
-        acc_up += value *
-                  int(l8_w.data[(hidden + column) * args.data.input_dim + k]);
+    uint tile_count = (args.data.input_dim + 15u) / 16u;
+    for (uint tile = 0u; tile < tile_count; tile++) {
+        uint input_k = tile * 16u + gl_LocalInvocationID.x;
+        fc1_in_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (row < args.data.rows && input_k < args.data.input_dim) ?
+            int(l8_in.data[row * args.data.input_dim + input_k]) : 0;
+        uint weight_k = tile * 16u + gl_LocalInvocationID.y;
+        int gate_w = (column < hidden && weight_k < args.data.input_dim) ?
+            int(l8_w.data[column * args.data.input_dim + weight_k]) : 0;
+        int up_w = (column < hidden && weight_k < args.data.input_dim) ?
+            int(l8_w.data[(hidden + column) * args.data.input_dim +
+                          weight_k]) : 0;
+        fc1_g_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = gate_w;
+        fc1_u_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = up_w;
+        barrier();
+        for (uint k = 0u; k < 16u; k++) {
+            int value = fc1_in_tile[gl_LocalInvocationID.y][k];
+            acc_gate += value * fc1_g_tile[k][gl_LocalInvocationID.x];
+            acc_up += value * fc1_u_tile[k][gl_LocalInvocationID.x];
+        }
+        barrier();
     }
-    float input_scale = l8_is.data[row];
-    float gate = float(acc_gate) * input_scale * l8_ws.data[column];
-    float up = float(acc_up) * input_scale * l8_ws.data[hidden + column];
-    l8_out.data[row * hidden + column] = uint16_t(h3_f32_to_bf16(
-        gate / (1.0f + exp(-gate)) * up));
+    if (row < args.data.rows && column < hidden) {
+        float input_scale = l8_is.data[row];
+        float gate = float(acc_gate) * input_scale * l8_ws.data[column];
+        float up = float(acc_up) * input_scale * l8_ws.data[hidden + column];
+        l8_out.data[row * hidden + column] = uint16_t(h3_f32_to_bf16(
+            gate / (1.0f + exp(-gate)) * up));
+    }
 }
 
 /* Fused gate + AdaLN + per-row quantization (scalar semantics): gated

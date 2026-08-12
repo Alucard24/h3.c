@@ -473,33 +473,33 @@ int main(int argc, char **argv) {
     h3_gpu_begin(gpu);
     CHECK(h3_gpu_linear_bf16(gpu, t_modulation, t_time_silu, t_adaln_w,
                              t_adaln_b, 1, TIME_DIM,
-                             (uint32_t)mod_count) == 0);
+                             (uint32_t)mod_count) == 1);
     CHECK(h3_gpu_adaln_bf16(gpu, t_mod_attention, t_hidden, t_norm1,
                             t_modulation, t_row_map, SEQUENCE, HIDDEN, SLOTS,
-                            0, 1, 1e-5f) == 0);
+                            0, 1, 1e-5f) == 1);
     CHECK(h3_gpu_linear_bf16(gpu, t_qkv, t_mod_attention, t_qkv_w, NULL,
-                             SEQUENCE, HIDDEN, INNER * 3) == 0);
+                             SEQUENCE, HIDDEN, INNER * 3) == 1);
     CHECK(h3_gpu_grouped_qkv_rope_bf16(gpu, t_query, t_key, t_value, t_qkv,
                                        t_q_norm, t_k_norm, t_rope_cos,
                                        t_rope_sin, SEQUENCE, HEADS, HEAD_DIM,
-                                       ROPE_HALF, 1e-5f) == 0);
+                                       ROPE_HALF, 1e-5f) == 1);
     CHECK(h3_gpu_sdpa_bf16(gpu, t_heads, t_query, t_key, t_value, SEQUENCE,
                            HEADS, HEAD_DIM,
-                           1.0f / sqrtf((float)HEAD_DIM)) == 0);
+                           1.0f / sqrtf((float)HEAD_DIM)) == 1);
     CHECK(h3_gpu_linear_bf16(gpu, t_attention_output, t_heads, t_out_w, NULL,
-                             SEQUENCE, INNER, HIDDEN) == 0);
+                             SEQUENCE, INNER, HIDDEN) == 1);
     CHECK(h3_gpu_gate_bf16(gpu, t_hidden, t_hidden, t_attention_output,
                            t_modulation, t_row_map, SEQUENCE, HIDDEN, SLOTS,
-                           2) == 0);
+                           2) == 1);
     CHECK(h3_gpu_adaln_bf16(gpu, t_mod_mlp, t_hidden, t_norm2, t_modulation,
                             t_row_map, SEQUENCE, HIDDEN, SLOTS, 3, 4,
-                            1e-5f) == 0);
+                            1e-5f) == 1);
     CHECK(h3_gpu_mlp_bf16(gpu, t_mlp_output, t_mod_mlp, t_fc1_w, t_fc2_w,
-                          SEQUENCE, HIDDEN, FFN, HIDDEN) == 0);
+                          SEQUENCE, HIDDEN, FFN, HIDDEN) == 1);
     CHECK(h3_gpu_gate_bf16(gpu, t_hidden, t_hidden, t_mlp_output,
                            t_modulation, t_row_map, SEQUENCE, HIDDEN, SLOTS,
-                           5) == 0);
-    CHECK(h3_gpu_submit(gpu) == 0);
+                           5) == 1);
+    CHECK(h3_gpu_submit(gpu) == 1);
     if (failed) {
         fprintf(stderr, "GPU pipeline error: %s\n", h3_gpu_error(gpu));
     } else {
@@ -508,9 +508,9 @@ int main(int argc, char **argv) {
         CHECK(got_hidden && got_mod_att);
         if (!failed) {
             CHECK(h3_gpu_tensor_read_bf16(t_hidden, got_hidden,
-                                          seq_hidden) == 0);
+                                          seq_hidden) == 1);
             CHECK(h3_gpu_tensor_read_bf16(t_mod_attention, got_mod_att,
-                                          seq_hidden) == 0);
+                                          seq_hidden) == 1);
             double l2, relmax;
             report("hidden", got_hidden, ref_hidden, seq_hidden, &l2,
                    &relmax);

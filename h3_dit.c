@@ -1652,16 +1652,19 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->use_slower_dynamic_fc1_k = use_slower_dynamic_fc1_k;
     dit->keep_bf16_attention_out = dit->int8_attention_out &&
         (getenv("H3_INT8_KEEP_BF16_ATTENTION_OUT") ||
-         getenv("H3_BENCH_INT8_ATTENTION_OUT_AB"));
+         getenv("H3_BENCH_INT8_ATTENTION_OUT_AB") ||
+         getenv("H3_DISABLE_INT8_ATTENTION_OUT"));
     dit->keep_bf16_qkv = dit->int8_qkv &&
         (getenv("H3_INT8_KEEP_BF16_QKV") ||
-         getenv("H3_BENCH_INT8_QKV_AB"));
+         getenv("H3_BENCH_INT8_QKV_AB") ||
+         getenv("H3_DISABLE_INT8_QKV"));
     dit->use_slower_grouped_quantizer = use_slower_grouped_quantizer;
     dit->use_int8_row_fc2 = dit->int8_mlp && use_int8_row_fc2;
     dit->keep_bf16_mlp = dit->int8_mlp &&
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||
-         getenv("H3_INT8_MLP_STAGE"));
+         getenv("H3_INT8_MLP_STAGE") ||
+         getenv("H3_DISABLE_INT8_MLP"));
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;

@@ -179,7 +179,7 @@ smoke:
 	rm -f /tmp/h3-smoke.mp4
 	./h3 -d MiniMax-H3 -p "A red fox walking through snow" \
 		-o /tmp/h3-smoke.mp4 --width 256 --height 256 --frames 8 \
-		--steps 5 --reuse 3 --layers 5
+		--steps 5 --reuse 3 --layers 35
 	@if command -v ffprobe >/dev/null 2>&1; then \
 		ffprobe -v error -show_entries format=duration /tmp/h3-smoke.mp4; \
 	else \

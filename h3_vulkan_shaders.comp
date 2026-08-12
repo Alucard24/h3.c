@@ -12,6 +12,7 @@
 #version 460
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
 #define H3_BF16_TO_F32(value) uintBitsToFloat(uint(value) << 16)
 
@@ -1928,6 +1929,179 @@ void main_vision_qkv_rope_bf16() {
     vis_q.data[output_index] = uint16_t(h3_f32_to_bf16(qr));
     vis_k.data[output_index] = uint16_t(h3_f32_to_bf16(kr));
     vis_v.data[output_index] = vis_in.data[v_base + dimension];
+}
+
+/* ------------------------------------------------------------ int8 mode */
+
+/* Per-row BF16 -> int8 quantization, matching the Metal scalar kernel:
+ * scale = max(|row|) * clip / 127, q = clamp(rint(x / scale), -127, 127).
+ * Out-of-range rows are zeroed with scale 1.0. */
+
+layout(set = 0, binding = 0) readonly buffer QIn { uint16_t data[]; } q_in;
+layout(set = 0, binding = 1) writeonly buffer QOut { int8_t data[]; } q_out;
+layout(set = 0, binding = 2) writeonly buffer QScales { float data[]; } q_scales;
+
+shared float q_reductions[256];
+
+void main_quantize_rows_bf16_i8() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * args.data.width;
+    if (row >= args.data.rows) {
+        for (uint column = tid; column < args.data.width; column += 256u) {
+            q_out.data[base + column] = int8_t(0);
+        }
+        if (tid == 0u) q_scales.data[row] = 1.0f;
+        return;
+    }
+    float local_max = 0.0f;
+    for (uint column = tid; column < args.data.width; column += 256u) {
+        local_max = max(local_max, abs(H3_BF16_TO_F32(q_in.data[base + column])));
+    }
+    q_reductions[tid] = local_max;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) q_reductions[tid] = max(q_reductions[tid],
+                                                  q_reductions[tid + stride]);
+        barrier();
+    }
+    float max_abs = q_reductions[0];
+    float clipped_max = max_abs * args.data.left_scale;
+    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    if (tid == 0u) q_scales.data[row] = scale;
+    for (uint column = tid; column < args.data.width; column += 256u) {
+        int quantized = int(roundEven(H3_BF16_TO_F32(q_in.data[base + column]) *
+                                 inverse));
+        q_out.data[base + column] = int8_t(clamp(quantized, -127, 127));
+    }
+}
+
+/* int8 matmul: acc = sum(q_in * w) in int32, out = bf16(acc * in_s * w_s). */
+
+layout(set = 0, binding = 0) readonly buffer L8In { int8_t data[]; } l8_in;
+layout(set = 0, binding = 1) readonly buffer L8W { int8_t data[]; } l8_w;
+layout(set = 0, binding = 2) readonly buffer L8IS { float data[]; } l8_is;
+layout(set = 0, binding = 3) readonly buffer L8WS { float data[]; } l8_ws;
+layout(set = 0, binding = 4) writeonly buffer L8Out { uint16_t data[]; } l8_out;
+
+void main_linear_int8_bf16() {
+    uint column = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= args.data.rows || column >= args.data.output_dim) return;
+    int acc = 0;
+    for (uint k = 0u; k < args.data.input_dim; k++) {
+        acc += int(l8_in.data[row * args.data.input_dim + k]) *
+               int(l8_w.data[column * args.data.input_dim + k]);
+    }
+    float dequant = float(acc) * l8_is.data[row] * l8_ws.data[column];
+    l8_out.data[row * args.data.output_dim + column] =
+        uint16_t(h3_f32_to_bf16(dequant));
+}
+
+/* Fused fc1 (gate|up halves) -> SwiGLU in int8 with per-column weight
+ * scales; one BF16 rounding after the dequantized product. */
+
+void main_fc1_swiglu_int8_bf16() {
+    uint column = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    uint hidden = args.data.output_dim;
+    if (row >= args.data.rows || column >= hidden) return;
+    uint base = row * args.data.input_dim;
+    int acc_gate = 0;
+    int acc_up = 0;
+    for (uint k = 0u; k < args.data.input_dim; k++) {
+        int value = int(l8_in.data[base + k]);
+        acc_gate += value * int(l8_w.data[column * args.data.input_dim + k]);
+        acc_up += value *
+                  int(l8_w.data[(hidden + column) * args.data.input_dim + k]);
+    }
+    float input_scale = l8_is.data[row];
+    float gate = float(acc_gate) * input_scale * l8_ws.data[column];
+    float up = float(acc_up) * input_scale * l8_ws.data[hidden + column];
+    l8_out.data[row * hidden + column] = uint16_t(h3_f32_to_bf16(
+        gate / (1.0f + exp(-gate)) * up));
+}
+
+/* Fused gate + AdaLN + per-row quantization (scalar semantics): gated
+ * residual, RMS norm with modulated weight, shift/scale, then quantize. */
+
+layout(set = 0, binding = 0) readonly buffer IARes { uint16_t data[]; } ia_res;
+layout(set = 0, binding = 1) readonly buffer IABranch { uint16_t data[]; } ia_branch;
+layout(set = 0, binding = 2) readonly buffer IAGMod { uint16_t data[]; } ia_gmod;
+layout(set = 0, binding = 3) readonly buffer IAMap { uint data[]; } ia_map;
+layout(set = 0, binding = 4) readonly buffer IAW { uint16_t data[]; } ia_w;
+layout(set = 0, binding = 5) readonly buffer IANMod { uint16_t data[]; } ia_nmod;
+layout(set = 0, binding = 6) writeonly buffer IAGated { uint16_t data[]; } ia_gated;
+layout(set = 0, binding = 7) writeonly buffer IAOut { int8_t data[]; } ia_out;
+layout(set = 0, binding = 8) writeonly buffer IAScales { float data[]; } ia_scales;
+
+shared float ia_reductions[256];
+shared uint16_t ia_values[5376];
+
+void main_gate_adaln_quantize_int8() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint width = args.data.width;
+    if (row >= args.data.rows) {
+        uint qbase = row * width;
+        for (uint column = tid; column < width; column += 256u)
+            ia_out.data[qbase + column] = int8_t(0);
+        if (tid == 0u) ia_scales.data[row] = 1.0f;
+        return;
+    }
+    uint base = ia_map.data[row] * args.data.slots * width;
+    uint row_base = row * width;
+    float local_sum = 0.0f;
+    for (uint column = tid; column < width; column += 256u) {
+        uint index = row_base + column;
+        float gate = H3_BF16_TO_F32(
+            ia_gmod.data[base + args.data.gate_slot * width + column]);
+        uint16_t gated = uint16_t(h3_f32_to_bf16(
+            fma(H3_BF16_TO_F32(ia_branch.data[index]), gate,
+                H3_BF16_TO_F32(ia_res.data[index]))));
+        ia_gated.data[index] = gated;
+        ia_values[column] = gated;
+        float value = H3_BF16_TO_F32(gated);
+        local_sum = fma(value, value, local_sum);
+    }
+    ia_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) ia_reductions[tid] += ia_reductions[tid + stride];
+        barrier();
+    }
+    float inverse = inversesqrt(ia_reductions[0] / float(width) +
+                                args.data.epsilon);
+    float local_max = 0.0f;
+    for (uint column = tid; column < width; column += 256u) {
+        float normalized = H3_BF16_TO_F32(ia_values[column]) * inverse *
+            H3_BF16_TO_F32(ia_w.data[column]);
+        float shift = H3_BF16_TO_F32(
+            ia_nmod.data[base + args.data.shift_slot * width + column]);
+        float scale = H3_BF16_TO_F32(
+            ia_nmod.data[base + args.data.scale_slot * width + column]);
+        uint16_t value = uint16_t(h3_f32_to_bf16(
+            fma(normalized, 1.0f + scale, shift)));
+        ia_values[column] = value;
+        local_max = max(local_max, abs(H3_BF16_TO_F32(value)));
+    }
+    ia_reductions[tid] = local_max;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) ia_reductions[tid] = max(ia_reductions[tid],
+                                                   ia_reductions[tid + stride]);
+        barrier();
+    }
+    float max_abs = ia_reductions[0];
+    float output_scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+    float quantize_scale = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+    if (tid == 0u) ia_scales.data[row] = output_scale;
+    for (uint column = tid; column < width; column += 256u) {
+        int value = int(roundEven(H3_BF16_TO_F32(ia_values[column]) *
+                             quantize_scale));
+        ia_out.data[row_base + column] = int8_t(clamp(value, -127, 127));
+    }
 }
 
 /* The runtime compiles one module per kernel with H3_ENTRY selecting the

@@ -135,6 +135,10 @@ typedef enum {
     H3_VK_KERNEL_CONV_TRANSPOSE1D_F32,
     H3_VK_KERNEL_SDPA_CAUSAL_F32,
     H3_VK_KERNEL_VISION_QKV_ROPE_BF16,
+    H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8,
+    H3_VK_KERNEL_LINEAR_INT8_BF16,
+    H3_VK_KERNEL_FC1_SWIGLU_INT8_BF16,
+    H3_VK_KERNEL_GATE_ADALN_QUANTIZE_INT8,
     H3_VK_KERNEL_COUNT
 } h3_vk_kernel;
 
@@ -164,7 +168,9 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_alias_free_snake_f32", "main_audio_qkv_split_f32",
     "main_audio_attention_pool_f32", "main_conv1d_stride_f32",
     "main_conv_transpose1d_f32", "main_sdpa_causal_f32",
-    "main_vision_qkv_rope_bf16"
+    "main_vision_qkv_rope_bf16",
+    "main_quantize_rows_bf16_i8", "main_linear_int8_bf16",
+    "main_fc1_swiglu_int8_bf16", "main_gate_adaln_quantize_int8"
 };
 
 /* Storage-buffer bindings consumed by each kernel (0..n-1 plus binding 7
@@ -173,14 +179,14 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
     2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2,
-    5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2, 6, 2, 4, 4, 4, 3, 3, 6, 7, 2, 4, 4, 4, 6
+    5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2, 6, 2, 4, 4, 4, 3, 3, 6, 7, 2, 4, 4, 4, 6, 3, 5, 5, 9
 };
 
 /* Workgroup layout per kernel: 0 = 256 threads, 1 = 16x16 tiles,
  * 2 = 128 threads (SDPA flash). */
 static const int h3_vk_kernel_layout[H3_VK_KERNEL_COUNT] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-    0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1
+    0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0
 };
 
 struct h3_gpu {
@@ -3055,15 +3061,30 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     if (own_scratch) h3_gpu_tensor_free(scratch);
     return ok;
 }
-
 int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,
                                 uint32_t columns) {
-(void)gpu; (void)output; (void)scales; (void)input; (void)rows; (void)columns;
-    return h3_vk_not_ported(gpu, "h3_gpu_quantize_weight_int8");
-}
 
+    if (!h3_vk_check_tensors(gpu, 3, output, scales, input)) return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    if ((size_t)rows * columns > h3_gpu_tensor_elements(input) ||
+        (size_t)rows * columns > h3_gpu_tensor_elements(output) ||
+        rows > h3_gpu_tensor_elements(scales)) {
+        h3_vk_set_error(gpu, "int8 quantize tensor size mismatch");
+        return -1;
+    }
+    gpu->args->rows = rows;
+    gpu->args->width = columns;
+    gpu->args->left_scale = 1.0f;
+    const h3_gpu_tensor *tensors[3] = { input, output, scales };
+    VkDescriptorSet set = h3_vk_prepare(gpu,
+                                        H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8,
+                                        tensors, 3);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, set,
+                          rows, 1, 1);
+}
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,
@@ -3073,10 +3094,47 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
                             int use_slower_uncached_int8_scales) {
-(void)gpu; (void)output; (void)quantized_input; (void)input_scales; (void)input; (void)weight; (void)weight_scales; (void)rows; (void)input_dim; (void)output_dim; (void)use_slower_uncached_int8_scales;
-    return h3_vk_not_ported(gpu, "h3_gpu_linear_int8_bf16");
-}
 
+    if (!h3_vk_check_tensors(gpu, 4, output, quantized_input, input_scales,
+                             input) ||
+        !h3_vk_check_tensors(gpu, 3, output, weight, weight_scales))
+        return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    (void)use_slower_uncached_int8_scales;
+    if ((size_t)rows * input_dim > h3_gpu_tensor_elements(input) ||
+        (size_t)rows * input_dim > h3_gpu_tensor_elements(quantized_input) ||
+        rows > h3_gpu_tensor_elements(input_scales) ||
+        (size_t)output_dim * input_dim > h3_gpu_tensor_elements(weight) ||
+        output_dim > h3_gpu_tensor_elements(weight_scales) ||
+        (size_t)rows * output_dim > h3_gpu_tensor_elements(output)) {
+        h3_vk_set_error(gpu, "int8 linear tensor size mismatch");
+        return -1;
+    }
+    gpu->args->rows = rows;
+    gpu->args->width = input_dim;
+    gpu->args->left_scale = 1.0f;
+    {
+        const h3_gpu_tensor *q[3] = { input, quantized_input, input_scales };
+        VkDescriptorSet set = h3_vk_prepare(
+            gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, q, 3);
+        if (set == VK_NULL_HANDLE) return -1;
+        if (h3_vk_dispatch(gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, set,
+                           rows, 1, 1) != 0)
+            return -1;
+    }
+    gpu->args->rows = rows;
+    gpu->args->input_dim = input_dim;
+    gpu->args->output_dim = output_dim;
+    {
+        const h3_gpu_tensor *l[5] = { quantized_input, weight, input_scales,
+                                      weight_scales, output };
+        VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16,
+                                            l, 5);
+        if (set == VK_NULL_HANDLE) return -1;
+        return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
+                              (output_dim + 15) / 16, (rows + 15) / 16, 1);
+    }
+}
 int h3_gpu_linear_int8_head_major_bf16(
                             h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
@@ -3086,10 +3144,49 @@ int h3_gpu_linear_int8_head_major_bf16(
                             const h3_gpu_tensor *weight_scales,
                             uint32_t rows, uint32_t heads,
                             uint32_t head_dim, uint32_t output_dim) {
-(void)gpu; (void)output; (void)quantized_input; (void)input_scales; (void)input; (void)weight; (void)weight_scales; (void)rows; (void)heads; (void)head_dim; (void)output_dim;
-    return h3_vk_not_ported(gpu, "h3_gpu_linear_int8_head_major_bf16");
-}
 
+    if (!h3_vk_check_tensors(gpu, 4, output, quantized_input, input_scales,
+                             input) ||
+        !h3_vk_check_tensors(gpu, 3, output, weight, weight_scales))
+        return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    uint32_t total_rows = rows * heads;
+    if ((size_t)total_rows * head_dim > h3_gpu_tensor_elements(input) ||
+        (size_t)total_rows * head_dim >
+            h3_gpu_tensor_elements(quantized_input) ||
+        total_rows > h3_gpu_tensor_elements(input_scales) ||
+        (size_t)output_dim * head_dim > h3_gpu_tensor_elements(weight) ||
+        output_dim > h3_gpu_tensor_elements(weight_scales) ||
+        (size_t)total_rows * output_dim > h3_gpu_tensor_elements(output)) {
+        h3_vk_set_error(gpu, "head-major int8 linear tensor size mismatch");
+        return -1;
+    }
+    gpu->args->rows = total_rows;
+    gpu->args->width = head_dim;
+    gpu->args->left_scale = 1.0f;
+    {
+        const h3_gpu_tensor *q[3] = { input, quantized_input, input_scales };
+        VkDescriptorSet set = h3_vk_prepare(
+            gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, q, 3);
+        if (set == VK_NULL_HANDLE) return -1;
+        if (h3_vk_dispatch(gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, set,
+                           total_rows, 1, 1) != 0)
+            return -1;
+    }
+    gpu->args->rows = total_rows;
+    gpu->args->input_dim = head_dim;
+    gpu->args->output_dim = output_dim;
+    {
+        const h3_gpu_tensor *l[5] = { quantized_input, weight, input_scales,
+                                      weight_scales, output };
+        VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16,
+                                            l, 5);
+        if (set == VK_NULL_HANDLE) return -1;
+        return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
+                              (output_dim + 15) / 16, (total_rows + 15) / 16,
+                              1);
+    }
+}
 int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          h3_gpu_tensor *activated,
                          h3_gpu_tensor *quantized_activation,
@@ -3107,8 +3204,91 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          int use_slower_dynamic_fc1_k,
                          int use_int8_row_fc2,
                          int input_is_quantized) {
-(void)gpu; (void)output; (void)activated; (void)quantized_activation; (void)activation_scales; (void)input; (void)fc1_weight; (void)fc1_scales; (void)fc2_weight; (void)fc2_scales; (void)fc1_bf16; (void)fc2_bf16; (void)rows; (void)input_dim; (void)hidden_dim; (void)output_dim; (void)use_slower_grouped_quantizer; (void)use_slower_dynamic_fc1_k; (void)use_int8_row_fc2; (void)input_is_quantized;
-    return h3_vk_not_ported(gpu, "h3_gpu_mlp_int8_bf16");
+
+    if (!h3_vk_check_tensors(gpu, 5, output, activated, quantized_activation,
+                             activation_scales, input) ||
+        !h3_vk_check_tensors(gpu, 4, output, fc1_weight, fc1_scales,
+                             fc2_weight) ||
+        !h3_vk_check_tensors(gpu, 2, output, fc2_scales))
+        return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    (void)fc1_bf16;
+    (void)fc2_bf16;
+    (void)use_slower_grouped_quantizer;
+    (void)use_slower_dynamic_fc1_k;
+    (void)use_int8_row_fc2;
+    size_t fc1_count = (size_t)hidden_dim * 2 * input_dim;
+    size_t fc2_count = (size_t)output_dim * hidden_dim;
+    if ((size_t)rows * input_dim > h3_gpu_tensor_elements(input) ||
+        fc1_count > h3_gpu_tensor_elements(fc1_weight) ||
+        hidden_dim * 2 > h3_gpu_tensor_elements(fc1_scales) ||
+        fc2_count > h3_gpu_tensor_elements(fc2_weight) ||
+        output_dim > h3_gpu_tensor_elements(fc2_scales) ||
+        (size_t)rows * input_dim >
+            h3_gpu_tensor_elements(quantized_activation) ||
+        rows > h3_gpu_tensor_elements(activation_scales) ||
+        (size_t)rows * hidden_dim > h3_gpu_tensor_elements(activated) ||
+        (size_t)rows * output_dim > h3_gpu_tensor_elements(output)) {
+        h3_vk_set_error(gpu, "int8 MLP tensor size mismatch");
+        return -1;
+    }
+    /* FC1 input: reuse the caller's quantized buffer when prequantized. */
+    const h3_gpu_tensor *fc1_input = quantized_activation;
+    if (!input_is_quantized) {
+        gpu->args->rows = rows;
+        gpu->args->width = input_dim;
+        gpu->args->left_scale = 1.0f;
+        const h3_gpu_tensor *q[3] = { input, quantized_activation,
+                                      activation_scales };
+        VkDescriptorSet set = h3_vk_prepare(
+            gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, q, 3);
+        if (set == VK_NULL_HANDLE) return -1;
+        if (h3_vk_dispatch(gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, set,
+                           rows, 1, 1) != 0)
+            return -1;
+    }
+    /* Fused FC1 + SwiGLU (gate | up halves). */
+    gpu->args->rows = rows;
+    gpu->args->input_dim = input_dim;
+    gpu->args->output_dim = hidden_dim;
+    {
+        const h3_gpu_tensor *f[5] = { fc1_input, fc1_weight,
+                                      activation_scales, fc1_scales,
+                                      activated };
+        VkDescriptorSet set = h3_vk_prepare(
+            gpu, H3_VK_KERNEL_FC1_SWIGLU_INT8_BF16, f, 5);
+        if (set == VK_NULL_HANDLE) return -1;
+        if (h3_vk_dispatch(gpu, H3_VK_KERNEL_FC1_SWIGLU_INT8_BF16, set,
+                           (hidden_dim + 15) / 16, (rows + 15) / 16, 1) != 0)
+            return -1;
+    }
+    /* Quantize the SwiGLU activation for FC2. */
+    gpu->args->rows = rows;
+    gpu->args->width = hidden_dim;
+    gpu->args->left_scale = 1.0f;
+    {
+        const h3_gpu_tensor *q[3] = { activated, quantized_activation,
+                                      activation_scales };
+        VkDescriptorSet set = h3_vk_prepare(
+            gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, q, 3);
+        if (set == VK_NULL_HANDLE) return -1;
+        if (h3_vk_dispatch(gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, set,
+                           rows, 1, 1) != 0)
+            return -1;
+    }
+    /* FC2 projection. */
+    gpu->args->rows = rows;
+    gpu->args->input_dim = hidden_dim;
+    gpu->args->output_dim = output_dim;
+    {
+        const h3_gpu_tensor *l[5] = { quantized_activation, fc2_weight,
+                                      activation_scales, fc2_scales, output };
+        VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16,
+                                            l, 5);
+        if (set == VK_NULL_HANDLE) return -1;
+        return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
+                              (output_dim + 15) / 16, (rows + 15) / 16, 1);
+    }
 }
 
 int h3_gpu_vision_qkv_rope_bf16(
@@ -3149,7 +3329,6 @@ int h3_gpu_vision_qkv_rope_bf16(
                           (head_dim + 15) / 16, (heads + 15) / 16,
                           sequence);
 }
-
 int h3_gpu_gate_adaln_quantize_int8(
                      h3_gpu *gpu, h3_gpu_tensor *gated_residual,
                      h3_gpu_tensor *quantized_output,
@@ -3163,8 +3342,42 @@ int h3_gpu_gate_adaln_quantize_int8(
                      uint32_t padded_rows, uint32_t width, uint32_t slots,
                      uint32_t gate_slot, uint32_t shift_slot,
                      uint32_t scale_slot, float epsilon) {
-(void)gpu; (void)gated_residual; (void)quantized_output; (void)quantized_scales; (void)residual; (void)branch; (void)norm_weight; (void)gate_modulation; (void)norm_modulation; (void)row_map; (void)rows; (void)padded_rows; (void)width; (void)slots; (void)gate_slot; (void)shift_slot; (void)scale_slot; (void)epsilon;
-    return h3_vk_not_ported(gpu, "h3_gpu_gate_adaln_quantize_int8");
+
+    if (!h3_vk_check_tensors(gpu, 9, gated_residual, quantized_output,
+                             quantized_scales, residual, branch, norm_weight,
+                             gate_modulation, norm_modulation, row_map))
+        return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    (void)padded_rows;
+    size_t elements = (size_t)rows * width;
+    if (!rows || !width || width > 5376 || gate_slot >= slots ||
+        shift_slot >= slots || scale_slot >= slots ||
+        elements > h3_gpu_tensor_elements(residual) ||
+        elements > h3_gpu_tensor_elements(branch) ||
+        width > h3_gpu_tensor_elements(norm_weight) ||
+        rows > h3_gpu_tensor_elements(row_map) ||
+        elements > h3_gpu_tensor_elements(gated_residual) ||
+        elements > h3_gpu_tensor_elements(quantized_output) ||
+        rows > h3_gpu_tensor_elements(quantized_scales)) {
+        h3_vk_set_error(gpu, "gate-AdaLN-quantize tensor size mismatch");
+        return -1;
+    }
+    gpu->args->rows = rows;
+    gpu->args->width = width;
+    gpu->args->slots = slots;
+    gpu->args->gate_slot = gate_slot;
+    gpu->args->shift_slot = shift_slot;
+    gpu->args->scale_slot = scale_slot;
+    gpu->args->epsilon = epsilon;
+    const h3_gpu_tensor *tensors[9] = { residual, branch, gate_modulation,
+                                        row_map, norm_weight, norm_modulation,
+                                        gated_residual, quantized_output,
+                                        quantized_scales };
+    VkDescriptorSet set = h3_vk_prepare(
+        gpu, H3_VK_KERNEL_GATE_ADALN_QUANTIZE_INT8, tensors, 9);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_GATE_ADALN_QUANTIZE_INT8, set,
+                          rows, 1, 1);
 }
 
 int h3_gpu_grouped_qkv_linear_rope_bf16(
@@ -3192,7 +3405,6 @@ int h3_gpu_grouped_qkv_linear_rope_bf16(
                                         k_norm, rope_cos, rope_sin, rows,
                                         heads, head_dim, rope_half, epsilon);
 }
-
 int h3_gpu_grouped_qkv_linear_rope_int8(
                                  h3_gpu *gpu,
                                  h3_gpu_tensor *query,
@@ -3214,8 +3426,72 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int use_slower_unfused_qkv_rope,
                                  int use_slower_scalar_qkv_rms,
                                  int use_slower_uncached_int8_scales) {
-(void)gpu; (void)query; (void)key; (void)value; (void)quantized_input; (void)input_scales; (void)input; (void)weight; (void)weight_scales; (void)q_norm; (void)k_norm; (void)rope_cos; (void)rope_sin; (void)rows; (void)input_dim; (void)heads; (void)head_dim; (void)rope_half; (void)epsilon; (void)input_is_quantized; (void)use_slower_unfused_qkv_rope; (void)use_slower_scalar_qkv_rms; (void)use_slower_uncached_int8_scales;
-    return h3_vk_not_ported(gpu, "h3_gpu_grouped_qkv_linear_rope_int8");
+
+    if (!h3_vk_check_tensors(gpu, 6, query, key, value, quantized_input,
+                             input_scales, input) ||
+        !h3_vk_check_tensors(gpu, 5, query, weight, weight_scales, q_norm,
+                             k_norm) ||
+        !h3_vk_check_tensors(gpu, 3, query, rope_cos, rope_sin))
+        return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    (void)use_slower_unfused_qkv_rope;
+    (void)use_slower_scalar_qkv_rms;
+    (void)use_slower_uncached_int8_scales;
+    uint32_t inner = heads * head_dim;
+    size_t projected = (size_t)rows * inner;
+    if ((size_t)rows * input_dim > h3_gpu_tensor_elements(input) ||
+        (size_t)rows * input_dim > h3_gpu_tensor_elements(quantized_input) ||
+        rows > h3_gpu_tensor_elements(input_scales) ||
+        (size_t)inner * 3 * input_dim > h3_gpu_tensor_elements(weight) ||
+        inner * 3 > h3_gpu_tensor_elements(weight_scales) ||
+        projected > h3_gpu_tensor_elements(query) ||
+        projected > h3_gpu_tensor_elements(key) ||
+        projected > h3_gpu_tensor_elements(value)) {
+        h3_vk_set_error(gpu, "int8 QKV projection tensor size mismatch");
+        return -1;
+    }
+    if (!input_is_quantized) {
+        gpu->args->rows = rows;
+        gpu->args->width = input_dim;
+        gpu->args->left_scale = 1.0f;
+        const h3_gpu_tensor *q[3] = { input, quantized_input, input_scales };
+        VkDescriptorSet set = h3_vk_prepare(
+            gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, q, 3);
+        if (set == VK_NULL_HANDLE) return -1;
+        if (h3_vk_dispatch(gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, set,
+                           rows, 1, 1) != 0)
+            return -1;
+    }
+    /* Projection into a temporary BF16 QKV stream, then the ported grouped
+     * norm/RoPE kernel. */
+    h3_gpu_tensor *qkv = h3_gpu_tensor_new_bf16(gpu, projected * 3);
+    if (!qkv) {
+        h3_vk_set_error(gpu, "int8 QKV scratch allocation failed");
+        return -1;
+    }
+    gpu->args->rows = rows;
+    gpu->args->input_dim = input_dim;
+    gpu->args->output_dim = inner * 3;
+    {
+        const h3_gpu_tensor *l[5] = { quantized_input, weight, input_scales,
+                                      weight_scales, qkv };
+        VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16,
+                                            l, 5);
+        if (set == VK_NULL_HANDLE) {
+            h3_gpu_tensor_free(qkv);
+            return -1;
+        }
+        if (h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
+                           (inner * 3 + 15) / 16, (rows + 15) / 16, 1) != 0) {
+            h3_gpu_tensor_free(qkv);
+            return -1;
+        }
+    }
+    int ok = h3_gpu_grouped_qkv_rope_bf16(
+        gpu, query, key, value, qkv, q_norm, k_norm, rope_cos, rope_sin,
+        rows, heads, head_dim, rope_half, epsilon);
+    h3_gpu_tensor_free(qkv);
+    return ok;
 }
 
 int h3_gpu_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

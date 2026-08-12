@@ -1289,6 +1289,41 @@ void main_gqa_causal_bf16() {
     }
 }
 
+/* ------------------------------------------------------------- linear f32 */
+
+layout(set = 0, binding = 0) readonly buffer LFIn { float data[]; } lf_in;
+layout(set = 0, binding = 1) readonly buffer LFW { float data[]; } lf_w;
+layout(set = 0, binding = 2) readonly buffer LFB { float data[]; } lf_b;
+layout(set = 0, binding = 3) writeonly buffer LFOut { float data[]; } lf_out;
+
+void main_linear_f32() {
+    uint column = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= args.data.rows || column >= args.data.output_dim) return;
+    float sum = args.data.has_bias != 0u ? lf_b.data[column] : 0.0f;
+    for (uint k = 0u; k < args.data.input_dim; k++) {
+        sum = fma(lf_in.data[row * args.data.input_dim + k],
+                  lf_w.data[column * args.data.input_dim + k], sum);
+    }
+    lf_out.data[row * args.data.output_dim + column] = sum;
+}
+
+/* ---------------------------------------------------------- scale-add f32 */
+
+layout(set = 0, binding = 0) readonly buffer SRes { float data[]; } s_res;
+layout(set = 0, binding = 1) readonly buffer SBranch { float data[]; } s_branch;
+layout(set = 0, binding = 2) readonly buffer SScale { float data[]; } s_scale;
+layout(set = 0, binding = 3) writeonly buffer SOut { float data[]; } s_out;
+
+void main_scale_add_f32() {
+    uint column = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= args.data.rows || column >= args.data.width) return;
+    uint index = row * args.data.width + column;
+    s_out.data[index] = fma(s_branch.data[index], s_scale.data[column],
+                            s_res.data[index]);
+}
+
 /* The runtime compiles one module per kernel with H3_ENTRY selecting the
  * kernel function; glslc testing uses -DH3_ENTRY=main_<kernel>. */
 void main() { H3_ENTRY(); }

@@ -513,6 +513,203 @@ static void test_linear_bf16(h3_gpu *gpu) {
     }
 }
 
+static void test_linear_f32(h3_gpu *gpu) {
+    struct { uint32_t rows, input_dim, output_dim; int has_bias; } cases[] = {
+        {20, 32, 48, 1}, {3, 5, 7, 0}, {16, 16, 16, 1}, {17, 33, 31, 1}
+    };
+    for (size_t case_index = 0; case_index < sizeof(cases) / sizeof(cases[0]);
+         case_index++) {
+        uint32_t rows = cases[case_index].rows;
+        uint32_t input_dim = cases[case_index].input_dim;
+        uint32_t output_dim = cases[case_index].output_dim;
+        int has_bias = cases[case_index].has_bias;
+        size_t input_count = (size_t)rows * input_dim;
+        size_t weight_count = (size_t)output_dim * input_dim;
+        float *input = malloc(input_count * sizeof(float));
+        float *weight = malloc(weight_count * sizeof(float));
+        float *bias = malloc(output_dim * sizeof(float));
+        float *expected = malloc((size_t)rows * output_dim * sizeof(float));
+        float *got = malloc((size_t)rows * output_dim * sizeof(float));
+        for (size_t index = 0; index < input_count; index++)
+            input[index] = (float)(sin((double)index * 0.53) * 2.0);
+        for (size_t index = 0; index < weight_count; index++)
+            weight[index] = (float)(cos((double)index * 0.71) * 0.5);
+        for (size_t index = 0; index < output_dim; index++)
+            bias[index] = (float)(sin((double)index * 0.29) * 0.1);
+        for (uint32_t row = 0; row < rows; row++) {
+            for (uint32_t column = 0; column < output_dim; column++) {
+                float sum = has_bias ? bias[column] : 0.0f;
+                for (uint32_t k = 0; k < input_dim; k++) {
+                    sum = fmaf(input[row * input_dim + k],
+                               weight[column * input_dim + k], sum);
+                }
+                expected[row * output_dim + column] = sum;
+            }
+        }
+        h3_gpu_tensor *in = h3_gpu_tensor_from_f32(gpu, input, input_count);
+        h3_gpu_tensor *w = h3_gpu_tensor_from_f32(gpu, weight, weight_count);
+        h3_gpu_tensor *b = h3_gpu_tensor_from_f32(gpu, bias, output_dim);
+        h3_gpu_tensor *out = h3_gpu_tensor_new_f32(gpu,
+                                                   (size_t)rows * output_dim);
+        CHECK(in && w && b && out);
+        if (!failed) {
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_linear_f32(gpu, out, in, w, has_bias ? b : NULL,
+                                    rows, input_dim, output_dim) == 0);
+            CHECK(h3_gpu_submit(gpu) == 0);
+            CHECK(h3_gpu_tensor_read_f32(out, got,
+                                         (size_t)rows * output_dim) == 0);
+            CHECK(memcmp(got, expected,
+                         (size_t)rows * output_dim * sizeof(float)) == 0);
+            if (memcmp(got, expected,
+                       (size_t)rows * output_dim * sizeof(float)) != 0) {
+                for (size_t index = 0;
+                     index < (size_t)rows * output_dim; index++) {
+                    if (got[index] != expected[index]) {
+                        fprintf(stderr,
+                                "  linear f32 %ux%ux%u[%zu]: got %.9g "
+                                "expected %.9g\n",
+                                rows, input_dim, output_dim, index,
+                                got[index], expected[index]);
+                        break;
+                    }
+                }
+            }
+        }
+        h3_gpu_tensor_free(in);
+        h3_gpu_tensor_free(w);
+        h3_gpu_tensor_free(b);
+        h3_gpu_tensor_free(out);
+        free(input); free(weight); free(bias); free(expected); free(got);
+    }
+}
+
+static void test_scale_add_f32(h3_gpu *gpu) {
+    uint32_t rows = 13, width = 37;
+    size_t count = (size_t)rows * width;
+    float *residual = malloc(count * sizeof(float));
+    float *branch = malloc(count * sizeof(float));
+    float *scale = malloc(width * sizeof(float));
+    float *expected = malloc(count * sizeof(float));
+    float *got = malloc(count * sizeof(float));
+    for (size_t index = 0; index < count; index++)
+        residual[index] = (float)(sin((double)index * 0.31) * 3.0);
+    for (size_t index = 0; index < count; index++)
+        branch[index] = (float)(cos((double)index * 0.17) * 2.0);
+    for (size_t index = 0; index < width; index++)
+        scale[index] = (float)(sin((double)index * 0.43) * 0.5);
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t column = 0; column < width; column++) {
+            size_t index = (size_t)row * width + column;
+            expected[index] = fmaf(branch[index], scale[column],
+                                   residual[index]);
+        }
+    }
+    h3_gpu_tensor *res = h3_gpu_tensor_from_f32(gpu, residual, count);
+    h3_gpu_tensor *br = h3_gpu_tensor_from_f32(gpu, branch, count);
+    h3_gpu_tensor *sc = h3_gpu_tensor_from_f32(gpu, scale, width);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_f32(gpu, count);
+    CHECK(res && br && sc && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_scale_add_f32(gpu, out, res, br, sc, rows, width) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 0);
+        CHECK(memcmp(got, expected, count * sizeof(float)) == 0);
+        if (memcmp(got, expected, count * sizeof(float)) != 0) {
+            for (size_t index = 0; index < count; index++) {
+                if (got[index] != expected[index]) {
+                    fprintf(stderr, "  scale-add[%zu]: got %.9g expected %.9g\n",
+                            index, got[index], expected[index]);
+                    break;
+                }
+            }
+        }
+    }
+    h3_gpu_tensor_free(res);
+    h3_gpu_tensor_free(br);
+    h3_gpu_tensor_free(sc);
+    h3_gpu_tensor_free(out);
+    free(residual); free(branch); free(scale); free(expected); free(got);
+}
+
+static void test_swiglu_bf16(h3_gpu *gpu) {
+    uint32_t rows = 9, width = 41;
+    size_t count = (size_t)rows * width;
+    uint16_t *fused = malloc(count * 2 * 2);
+    uint16_t *expected = malloc(count * 2);
+    uint16_t *got = malloc(count * 2);
+    for (size_t index = 0; index < count * 2; index++)
+        fused[index] = bf16_bits((float)(sin((double)index * 0.63) * 1.5));
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t column = 0; column < width; column++) {
+            float gate = bf16_value(fused[row * width * 2 + column]);
+            float up = bf16_value(
+                fused[row * width * 2 + width + column]);
+            expected[row * width + column] =
+                bf16_bits(gate / (1.0f + expf(-gate)) * up);
+        }
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_bf16(gpu, fused, count * 2);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, count);
+    CHECK(in && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_swiglu_bf16(gpu, out, in, rows, width) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, count) == 0);
+        CHECK(memcmp(got, expected, count * 2) == 0);
+        if (memcmp(got, expected, count * 2) != 0) {
+            for (size_t index = 0; index < count; index++) {
+                if (got[index] != expected[index]) {
+                    fprintf(stderr, "  swiglu bf16[%zu]: got %u expected %u\n",
+                            index, got[index], expected[index]);
+                    break;
+                }
+            }
+        }
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(out);
+    free(fused); free(expected); free(got);
+}
+
+static void test_copy(h3_gpu *gpu) {
+    size_t count = 1000;
+    uint16_t *bf16_values = malloc(count * 2);
+    float *f32_values = malloc(count * sizeof(float));
+    for (size_t index = 0; index < count; index++) {
+        bf16_values[index] = bf16_bits((float)(sin((double)index * 0.37)));
+        f32_values[index] = (float)(cos((double)index * 0.11) * 2.0);
+    }
+    h3_gpu_tensor *src16 = h3_gpu_tensor_from_bf16(gpu, bf16_values, count);
+    h3_gpu_tensor *dst16 = h3_gpu_tensor_new_bf16(gpu, count + 32);
+    h3_gpu_tensor *src32 = h3_gpu_tensor_from_f32(gpu, f32_values, count);
+    h3_gpu_tensor *dst32 = h3_gpu_tensor_new_f32(gpu, count + 32);
+    CHECK(src16 && dst16 && src32 && dst32);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_copy_bf16(gpu, dst16, 16, src16, 8, count - 24) == 0);
+        CHECK(h3_gpu_copy_f32(gpu, dst32, 16, src32, 8, count - 24) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        uint16_t *got16 = malloc((count + 32) * 2);
+        float *got32 = malloc((count + 32) * sizeof(float));
+        CHECK(h3_gpu_tensor_read_bf16(dst16, got16, count + 32) == 0);
+        CHECK(h3_gpu_tensor_read_f32_range(dst32, 16, got32,
+                                           count - 24) == 0);
+        CHECK(memcmp(got16 + 16, bf16_values + 8, (count - 24) * 2) == 0);
+        CHECK(memcmp(got32, f32_values + 8, (count - 24) * sizeof(float)) == 0);
+        free(got16);
+        free(got32);
+    }
+    h3_gpu_tensor_free(src16);
+    h3_gpu_tensor_free(dst16);
+    h3_gpu_tensor_free(src32);
+    h3_gpu_tensor_free(dst32);
+    free(bf16_values);
+    free(f32_values);
+}
+
 static void test_mlp_bf16(h3_gpu *gpu) {
     enum { ROWS = 8, INPUT_DIM = 16, HIDDEN = 12, OUTPUT_DIM = 20 };
     size_t fc1_count = (size_t)HIDDEN * 2 * INPUT_DIM;
@@ -2036,6 +2233,10 @@ int main(int argc, char **argv) {
     test_embedding(gpu);
     test_norms(gpu);
     test_linear_bf16(gpu);
+    test_linear_f32(gpu);
+    test_scale_add_f32(gpu);
+    test_swiglu_bf16(gpu);
+    test_copy(gpu);
     test_mlp_bf16(gpu);
     test_adaln_bf16(gpu);
     test_adaln_offset(gpu);

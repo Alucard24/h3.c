@@ -100,6 +100,8 @@ typedef enum {
     H3_VK_KERNEL_TEXT_QK_ROPE_BF16,
     H3_VK_KERNEL_ROPE_TEXT_BF16,
     H3_VK_KERNEL_GQA_CAUSAL_BF16,
+    H3_VK_KERNEL_LINEAR_F32,
+    H3_VK_KERNEL_SCALE_ADD_F32,
     H3_VK_KERNEL_COUNT
 } h3_vk_kernel;
 
@@ -120,7 +122,8 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_token_pool_bf16", "main_token_pool_adaln_bf16",
     "main_token_expand_delta_bf16", "main_token_expand_adaln_bf16",
     "main_text_qk_rope_bf16", "main_rope_text_bf16",
-    "main_gqa_causal_bf16"
+    "main_gqa_causal_bf16",
+    "main_linear_f32", "main_scale_add_f32"
 };
 
 /* Storage-buffer bindings consumed by each kernel (0..n-1 plus binding 7
@@ -129,14 +132,14 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
     2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2,
-    5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4
+    5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4
 };
 
 /* Workgroup layout per kernel: 0 = 256 threads, 1 = 16x16 tiles,
  * 2 = 128 threads (SDPA flash). */
 static const int h3_vk_kernel_layout[H3_VK_KERNEL_COUNT] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-    0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2
+    0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1
 };
 
 struct h3_gpu {
@@ -2335,24 +2338,74 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input, const h3_gpu_tensor *weight,
                       const h3_gpu_tensor *bias, uint32_t rows,
                       uint32_t input_dim, uint32_t output_dim) {
-(void)gpu; (void)output; (void)input; (void)weight; (void)bias; (void)rows; (void)input_dim; (void)output_dim;
-    return h3_vk_not_ported(gpu, "h3_gpu_linear_f32");
+    if (!h3_vk_check_tensors(gpu, 3, output, input, weight)) return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    if ((size_t)rows * input_dim > h3_gpu_tensor_elements(input) ||
+        (size_t)output_dim * input_dim > h3_gpu_tensor_elements(weight) ||
+        (size_t)rows * output_dim > h3_gpu_tensor_elements(output) ||
+        (bias && output_dim > h3_gpu_tensor_elements(bias))) {
+        h3_vk_set_error(gpu, "linear f32 tensor size mismatch");
+        return -1;
+    }
+    gpu->args->rows = rows;
+    gpu->args->input_dim = input_dim;
+    gpu->args->output_dim = output_dim;
+    gpu->args->has_bias = bias ? 1u : 0u;
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    const h3_gpu_tensor *tensors[4] = { input, weight, bias_buffer, output };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_F32, tensors,
+                                        4);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_F32, set,
+                          (output_dim + 15) / 16, (rows + 15) / 16, 1);
+}
+
+static int h3_vk_copy(h3_gpu *gpu, h3_gpu_tensor *destination,
+                      size_t destination_offset,
+                      const h3_gpu_tensor *source, size_t source_offset,
+                      size_t elements, h3_gpu_dtype dtype) {
+    if (!h3_vk_check_tensors(gpu, 2, destination, source)) return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    if (h3_gpu_tensor_dtype(destination) != dtype ||
+        h3_gpu_tensor_dtype(source) != dtype) {
+        h3_vk_set_error(gpu, "copy dtype mismatch");
+        return -1;
+    }
+    size_t dtype_size = h3_vk_dtype_size(dtype);
+    if (source_offset > h3_gpu_tensor_elements(source) ||
+        elements > h3_gpu_tensor_elements(source) - source_offset ||
+        destination_offset > h3_gpu_tensor_elements(destination) ||
+        elements > h3_gpu_tensor_elements(destination) - destination_offset) {
+        h3_vk_set_error(gpu, "invalid blit range");
+        return -1;
+    }
+    if (elements) {
+        VkBufferCopy region = {
+            .srcOffset = (VkDeviceSize)source_offset * dtype_size,
+            .dstOffset = (VkDeviceSize)destination_offset * dtype_size,
+            .size = (VkDeviceSize)elements * dtype_size
+        };
+        vkCmdCopyBuffer(gpu->command, source->buffer, destination->buffer, 1,
+                        &region);
+    }
+    gpu->stats.blit_copies++;
+    return 0;
 }
 
 int h3_gpu_copy_bf16(h3_gpu *gpu, h3_gpu_tensor *destination,
                      size_t destination_offset,
                      const h3_gpu_tensor *source, size_t source_offset,
                      size_t elements) {
-(void)gpu; (void)destination; (void)destination_offset; (void)source; (void)source_offset; (void)elements;
-    return h3_vk_not_ported(gpu, "h3_gpu_copy_bf16");
+    return h3_vk_copy(gpu, destination, destination_offset, source,
+                      source_offset, elements, H3_GPU_BF16);
 }
 
 int h3_gpu_copy_f32(h3_gpu *gpu, h3_gpu_tensor *destination,
                     size_t destination_offset,
                     const h3_gpu_tensor *source, size_t source_offset,
                     size_t elements) {
-(void)gpu; (void)destination; (void)destination_offset; (void)source; (void)source_offset; (void)elements;
-    return h3_vk_not_ported(gpu, "h3_gpu_copy_f32");
+    return h3_vk_copy(gpu, destination, destination_offset, source,
+                      source_offset, elements, H3_GPU_F32);
 }
 
 int h3_gpu_adaln_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -2409,8 +2462,25 @@ int h3_gpu_scale_add_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *branch,
                          const h3_gpu_tensor *scale, uint32_t rows,
                          uint32_t width) {
-(void)gpu; (void)output; (void)residual; (void)branch; (void)scale; (void)rows; (void)width;
-    return h3_vk_not_ported(gpu, "h3_gpu_scale_add_f32");
+    if (!h3_vk_check_tensors(gpu, 4, output, residual, branch, scale))
+        return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    size_t count = (size_t)rows * width;
+    if (count > h3_gpu_tensor_elements(residual) ||
+        count > h3_gpu_tensor_elements(branch) ||
+        width > h3_gpu_tensor_elements(scale) ||
+        count > h3_gpu_tensor_elements(output)) {
+        h3_vk_set_error(gpu, "scale-add tensor size mismatch");
+        return -1;
+    }
+    gpu->args->rows = rows;
+    gpu->args->width = width;
+    const h3_gpu_tensor *tensors[4] = { residual, branch, scale, output };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_SCALE_ADD_F32,
+                                        tensors, 4);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_SCALE_ADD_F32, set,
+                          (width + 15) / 16, (rows + 15) / 16, 1);
 }
 
 int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
@@ -2697,8 +2767,24 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
 int h3_gpu_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *fused, uint32_t rows,
                        uint32_t width) {
-(void)gpu; (void)output; (void)fused; (void)rows; (void)width;
-    return h3_vk_not_ported(gpu, "h3_gpu_swiglu_bf16");
+    if (!h3_vk_check_tensors(gpu, 2, output, fused)) return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    if ((size_t)rows * width * 2 > h3_gpu_tensor_elements(fused) ||
+        (size_t)rows * width > h3_gpu_tensor_elements(output)) {
+        h3_vk_set_error(gpu, "swiglu bf16 tensor size mismatch");
+        return -1;
+    }
+    gpu->args->elements = (size_t)rows * width;
+    gpu->args->rows = rows;
+    gpu->args->width = width;
+    const h3_gpu_tensor *tensors[2] = { fused, output };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_SWIGLU_HALVES_BF16,
+                                        tensors, 2);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_SWIGLU_HALVES_BF16, set,
+                          (uint32_t)(((uint64_t)rows * width +
+                                       H3_VK_THREADS - 1) / H3_VK_THREADS),
+                          1, 1);
 }
 
 

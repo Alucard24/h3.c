@@ -464,6 +464,10 @@ round-to-nearest-even is bit-exact):
 - `linear` bf16 (16x16 threadgroup tiles, bias, bit-exact FMA order)
 - fused `mlp` bf16 (fc1 -> SwiGLU -> fc2; FC1 carries `[gate | up]` halves,
   one BF16 rounding per boundary)
+- DiT modulation: `adaln` bf16 (+ offset views), `gate` bf16, fused
+  `gate_adaln` bf16 (gated row kept in threadgroup memory), fused final
+  `adaln_linear` bf16 (inverse RMS scalars + 16x16 projection), and the
+  Qwen3 `head_rms_norm` bf16
 - `embedding` bf16 (out-of-vocab rows zeroed)
 - `rms_norm`/`layer_norm` f32 and bf16 with the 256-thread tree reduction
 

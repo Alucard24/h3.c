@@ -63,20 +63,18 @@ static int check_f32(const float *got, const float *expected, size_t count,
     }
     return ok;
 }
-
-/* Norm kernels reduce with a threadgroup tree and an approximate
- * inversesqrt; both are within ~1 ulp of the CPU reference but not
- * bit-exact, and BF16 rounds that ulp. Compare BF16 values numerically
- * instead of bitwise. */
-static int check_bf16_rel(const uint16_t *got, const uint16_t *expected,
-                          size_t count, float tolerance, const char *name) {
+/* BF16-aware comparison: within `max_ulp` BF16 units. */
+static int check_bf16_ulp(const uint16_t *got, const uint16_t *expected,
+                          size_t count, uint32_t max_ulp, const char *name) {
     int ok = 1;
     for (size_t index = 0; index < count; index++) {
-        float g = bf16_value(got[index]);
-        float e = bf16_value(expected[index]);
-        if (!close_relative(g, e, tolerance)) {
-            fprintf(stderr, "  %s[%zu]: got %.9g expected %.9g\n", name,
-                    index, g, e);
+        uint16_t g = got[index], e = expected[index];
+        uint32_t diff = (g & 0x8000u) != (e & 0x8000u) ?
+            UINT32_MAX : (uint32_t)abs((int)(g & 0x7fffu) -
+                                       (int)(e & 0x7fffu));
+        if (diff > max_ulp) {
+            fprintf(stderr, "  %s[%zu]: got %u expected %u (%.9g vs %.9g)\n",
+                    name, index, g, e, bf16_value(g), bf16_value(e));
             ok = 0;
             break;
         }
@@ -111,7 +109,7 @@ static void test_cast_and_unary(h3_gpu *gpu) {
         CHECK(memcmp(got_b, expected_bf16, sizeof(got_b)) == 0);
         float got_f[N];
         CHECK(h3_gpu_tensor_read_f32(out_f, got_f, N) == 0);
-        CHECK(check_f32(got_f, expected_f32, N, 1e-7, "cast_bf16"));
+        CHECK(check_f32(got_f, expected_f32, N, 2, "cast_bf16"));
     }
     h3_gpu_tensor_free(in);
     h3_gpu_tensor_free(out_b);
@@ -293,10 +291,10 @@ static void test_embedding(h3_gpu *gpu) {
 /* Norm kernels reduce per row with a 256-thread tree; reproduce that order
  * so the F32 references match to rounding (the GPU inverse sqrt itself stays
  * within an ulp). */
-static float tree_sum256(const float *values) {
+static float tree_sum256(const float *values, uint32_t count) {
     float reductions[256];
-    for (size_t index = 0; index < 256; index++)
-        reductions[index] = values[index];
+    for (uint32_t index = 0; index < 256; index++)
+        reductions[index] = index < count ? values[index] : 0.0f;
     for (uint32_t stride = 128; stride > 0; stride >>= 1) {
         for (uint32_t index = 0; index < stride; index++)
             reductions[index] += reductions[index + stride];
@@ -325,10 +323,10 @@ static void test_norms(h3_gpu *gpu) {
                 (float)(sin((double)(row * WIDTH + column) * 0.31) * 3.0);
             input_b[row * WIDTH + column] = bf16_bits(input[row * WIDTH + column]);
         }
-        float mean = tree_sum256(input + row * WIDTH) / (float)WIDTH;
+        float mean = tree_sum256(input + row * WIDTH, WIDTH) / (float)WIDTH;
         float bf16_row[WIDTH];
         bf16_row_values(input_b + row * WIDTH, bf16_row, WIDTH);
-        float mean_b = tree_sum256(bf16_row) / (float)WIDTH;
+        float mean_b = tree_sum256(bf16_row, WIDTH) / (float)WIDTH;
         for (size_t column = 0; column < WIDTH; column++) {
             float x = input[row * WIDTH + column];
             float xb = bf16_value(input_b[row * WIDTH + column]);
@@ -340,13 +338,13 @@ static void test_norms(h3_gpu *gpu) {
             layer_sq[column] = fmaf(centered, centered, 0.0f);
             layer_sq_b[column] = fmaf(centered_b, centered_b, 0.0f);
         }
-        float inverse = 1.0f / sqrtf(tree_sum256(squared) / (float)WIDTH +
+        float inverse = 1.0f / sqrtf(tree_sum256(squared, WIDTH) / (float)WIDTH +
                                      epsilon);
-        float inverse_b = 1.0f / sqrtf(tree_sum256(squared_b) / (float)WIDTH +
+        float inverse_b = 1.0f / sqrtf(tree_sum256(squared_b, WIDTH) / (float)WIDTH +
                                        epsilon);
-        float inverse_layer = 1.0f / sqrtf(tree_sum256(layer_sq) /
+        float inverse_layer = 1.0f / sqrtf(tree_sum256(layer_sq, WIDTH) /
                                            (float)WIDTH + epsilon);
-        float inverse_layer_b = 1.0f / sqrtf(tree_sum256(layer_sq_b) /
+        float inverse_layer_b = 1.0f / sqrtf(tree_sum256(layer_sq_b, WIDTH) /
                                             (float)WIDTH + epsilon);
         for (size_t column = 0; column < WIDTH; column++) {
             float x = input[row * WIDTH + column];
@@ -392,11 +390,9 @@ static void test_norms(h3_gpu *gpu) {
         CHECK(check_f32(got, expected_layer, ROWS * WIDTH, 1e-4,
                         "layer_f32"));
         CHECK(h3_gpu_tensor_read_bf16(rms_b, got_b, ROWS * WIDTH) == 0);
-        CHECK(check_bf16_rel(got_b, expected_rms_b, ROWS * WIDTH, 1e-3,
-                             "rms_bf16"));
+        CHECK(check_bf16_ulp(got_b, expected_rms_b, ROWS * WIDTH, 2, "rms_bf16"));
         CHECK(h3_gpu_tensor_read_bf16(layer_b, got_b, ROWS * WIDTH) == 0);
-        CHECK(check_bf16_rel(got_b, expected_layer_b, ROWS * WIDTH, 1e-3,
-                             "layer_bf16"));
+        CHECK(check_bf16_ulp(got_b, expected_layer_b, ROWS * WIDTH, 2, "layer_bf16"));
     }
     h3_gpu_tensor_free(in);
     h3_gpu_tensor_free(w);
@@ -547,6 +543,358 @@ static void test_mlp_bf16(h3_gpu *gpu) {
     h3_gpu_tensor_free(out);
 }
 
+static void test_adaln_bf16(h3_gpu *gpu) {
+    enum { ROWS = 4, WIDTH = 128, SLOTS = 3 };
+    const float epsilon = 1e-5f;
+    uint16_t input[ROWS * WIDTH], norm_w[WIDTH];
+    uint16_t mod[ROWS * SLOTS * WIDTH];
+    uint32_t row_map[ROWS] = {2, 0, 1, 2};
+    uint16_t expected[ROWS * WIDTH];
+    for (size_t index = 0; index < ROWS * WIDTH; index++)
+        input[index] = bf16_bits((float)(sin((double)index * 0.41) * 2.5));
+    for (size_t index = 0; index < WIDTH; index++)
+        norm_w[index] = bf16_bits((float)cos((double)index * 0.17) * 0.5f + 1.0f);
+    for (size_t index = 0; index < ROWS * SLOTS * WIDTH; index++)
+        mod[index] = bf16_bits((float)sin((double)index * 0.29) * 0.3f);
+    for (uint32_t row = 0; row < ROWS; row++) {
+        float squared[WIDTH];
+        float base = (float)row * WIDTH;
+        for (size_t column = 0; column < WIDTH; column++) {
+            float value = bf16_value(input[(size_t)row * WIDTH + column]);
+            squared[column] = fmaf(value, value, 0.0f);
+        }
+        float inverse = 1.0f / sqrtf(tree_sum256(squared, WIDTH) / (float)WIDTH +
+                                     epsilon);
+        uint32_t mrow = row_map[row];
+        size_t mbase = (size_t)mrow * SLOTS * WIDTH;
+        for (size_t column = 0; column < WIDTH; column++) {
+            float normalized = bf16_value(input[(size_t)row * WIDTH + column]) *
+                               inverse * bf16_value(norm_w[column]);
+            float shift = bf16_value(mod[mbase + 1 * WIDTH + column]);
+            float scale = bf16_value(mod[mbase + 2 * WIDTH + column]);
+            expected[(size_t)row * WIDTH + column] =
+                bf16_bits(normalized * (1.0f + scale) + shift);
+        }
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_bf16(gpu, input, ROWS * WIDTH);
+    h3_gpu_tensor *w = h3_gpu_tensor_from_bf16(gpu, norm_w, WIDTH);
+    h3_gpu_tensor *m = h3_gpu_tensor_from_bf16(gpu, mod, ROWS * SLOTS * WIDTH);
+    h3_gpu_tensor *map = h3_gpu_tensor_from_u32(gpu, row_map, ROWS);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, ROWS * WIDTH);
+    CHECK(in && w && m && map && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_adaln_bf16(gpu, out, in, w, m, map, ROWS, WIDTH, SLOTS,
+                                1, 2, epsilon) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        uint16_t got[ROWS * WIDTH];
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 0);
+        CHECK(check_bf16_ulp(got, expected, ROWS * WIDTH, 2, "adaln"));
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(w);
+    h3_gpu_tensor_free(m);
+    h3_gpu_tensor_free(map);
+    h3_gpu_tensor_free(out);
+}
+
+static void test_adaln_offset(h3_gpu *gpu) {
+    /* Offset view: run rows 2..3 of a 4-row buffer through AdaLN. */
+    enum { ROWS = 4, WIDTH = 64, SLOTS = 2 };
+    const float epsilon = 1e-5f;
+    uint16_t input[ROWS * WIDTH], norm_w[WIDTH];
+    uint16_t mod[ROWS * SLOTS * WIDTH];
+    uint32_t row_map[2] = {0, 1};
+    uint16_t expected[2 * WIDTH];
+    for (size_t index = 0; index < ROWS * WIDTH; index++)
+        input[index] = bf16_bits((float)(sin((double)index * 0.33) * 2.0));
+    for (size_t index = 0; index < WIDTH; index++)
+        norm_w[index] = bf16_bits(1.0f);
+    for (size_t index = 0; index < ROWS * SLOTS * WIDTH; index++)
+        mod[index] = bf16_bits((float)cos((double)index * 0.21) * 0.2f);
+    for (uint32_t row = 0; row < 2; row++) {
+        float squared[WIDTH];
+        uint32_t src = 2 + row;
+        for (size_t column = 0; column < WIDTH; column++) {
+            float value = bf16_value(input[(size_t)src * WIDTH + column]);
+            squared[column] = fmaf(value, value, 0.0f);
+        }
+        float inverse = 1.0f / sqrtf(tree_sum256(squared, WIDTH) / (float)WIDTH +
+                                     epsilon);
+        size_t mbase = (size_t)row_map[row] * SLOTS * WIDTH;
+        for (size_t column = 0; column < WIDTH; column++) {
+            float normalized = bf16_value(input[(size_t)src * WIDTH + column]) *
+                               inverse * bf16_value(norm_w[column]);
+            float shift = bf16_value(mod[mbase + column]);
+            float scale = bf16_value(mod[mbase + WIDTH + column]);
+            expected[(size_t)row * WIDTH + column] =
+                bf16_bits(normalized * (1.0f + scale) + shift);
+        }
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_bf16(gpu, input, ROWS * WIDTH);
+    h3_gpu_tensor *w = h3_gpu_tensor_from_bf16(gpu, norm_w, WIDTH);
+    h3_gpu_tensor *m = h3_gpu_tensor_from_bf16(gpu, mod,
+                                                ROWS * SLOTS * WIDTH);
+    h3_gpu_tensor *map = h3_gpu_tensor_from_u32(gpu, row_map, 2);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, 2 * WIDTH);
+    CHECK(in && w && m && map && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_adaln_bf16_offset(gpu, out, in, 2 * WIDTH, w, m, map,
+                                       2, WIDTH, SLOTS, 0, 1, epsilon) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        uint16_t got[2 * WIDTH];
+        CHECK(h3_gpu_tensor_read_bf16(out, got, 2 * WIDTH) == 0);
+        CHECK(check_bf16_ulp(got, expected, 2 * WIDTH, 2, "adaln_offset"));
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(w);
+    h3_gpu_tensor_free(m);
+    h3_gpu_tensor_free(map);
+    h3_gpu_tensor_free(out);
+}
+
+static void test_gate_bf16(h3_gpu *gpu) {
+    enum { ROWS = 3, WIDTH = 64, SLOTS = 2 };
+    uint16_t residual[ROWS * WIDTH], branch[ROWS * WIDTH];
+    uint16_t mod[ROWS * SLOTS * WIDTH];
+    uint32_t row_map[ROWS] = {1, 0, 1};
+    uint16_t expected[ROWS * WIDTH];
+    for (size_t index = 0; index < ROWS * WIDTH; index++) {
+        residual[index] = bf16_bits((float)(sin((double)index * 0.19) * 2.0));
+        branch[index] = bf16_bits((float)(cos((double)index * 0.27) * 1.5));
+    }
+    for (size_t index = 0; index < ROWS * SLOTS * WIDTH; index++)
+        mod[index] = bf16_bits((float)sin((double)index * 0.13) * 0.4f);
+    for (uint32_t row = 0; row < ROWS; row++) {
+        size_t mbase = (size_t)row_map[row] * SLOTS * WIDTH;
+        for (size_t column = 0; column < WIDTH; column++) {
+            size_t index = (size_t)row * WIDTH + column;
+            float gate = bf16_value(mod[mbase + WIDTH + column]);
+            expected[index] = bf16_bits(bf16_value(residual[index]) +
+                                        bf16_value(branch[index]) * gate);
+        }
+    }
+    h3_gpu_tensor *r = h3_gpu_tensor_from_bf16(gpu, residual, ROWS * WIDTH);
+    h3_gpu_tensor *b = h3_gpu_tensor_from_bf16(gpu, branch, ROWS * WIDTH);
+    h3_gpu_tensor *m = h3_gpu_tensor_from_bf16(gpu, mod, ROWS * SLOTS * WIDTH);
+    h3_gpu_tensor *map = h3_gpu_tensor_from_u32(gpu, row_map, ROWS);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, ROWS * WIDTH);
+    CHECK(r && b && m && map && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_gate_bf16(gpu, out, r, b, m, map, ROWS, WIDTH, SLOTS,
+                               1) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        uint16_t got[ROWS * WIDTH];
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 0);
+        CHECK(memcmp(got, expected, sizeof(got)) == 0);
+    }
+    h3_gpu_tensor_free(r);
+    h3_gpu_tensor_free(b);
+    h3_gpu_tensor_free(m);
+    h3_gpu_tensor_free(map);
+    h3_gpu_tensor_free(out);
+}
+
+static void test_gate_adaln_bf16(h3_gpu *gpu) {
+    enum { ROWS = 2, WIDTH = 256, SLOTS = 2 };
+    const float epsilon = 1e-5f;
+    uint16_t residual[ROWS * WIDTH], branch[ROWS * WIDTH], nw[WIDTH];
+    uint16_t gmod[ROWS * SLOTS * WIDTH], nmod[ROWS * SLOTS * WIDTH];
+    uint32_t row_map[ROWS] = {0, 1};
+    uint16_t expected[ROWS * WIDTH];
+    uint16_t gated_expected[ROWS * WIDTH];
+    for (size_t index = 0; index < ROWS * WIDTH; index++) {
+        residual[index] = bf16_bits((float)(sin((double)index * 0.23) * 2.0));
+        branch[index] = bf16_bits((float)(cos((double)index * 0.31) * 1.5));
+    }
+    for (size_t index = 0; index < WIDTH; index++)
+        nw[index] = bf16_bits((float)sin((double)index * 0.11) * 0.5f + 1.0f);
+    for (size_t index = 0; index < ROWS * SLOTS * WIDTH; index++) {
+        gmod[index] = bf16_bits((float)cos((double)index * 0.07) * 0.3f);
+        nmod[index] = bf16_bits((float)sin((double)index * 0.17) * 0.2f);
+    }
+    for (uint32_t row = 0; row < ROWS; row++) {
+        float squared[WIDTH];
+        size_t mbase = (size_t)row_map[row] * SLOTS * WIDTH;
+        for (size_t column = 0; column < WIDTH; column++) {
+            size_t index = (size_t)row * WIDTH + column;
+            float gate = bf16_value(gmod[mbase + WIDTH + column]);
+            float gated = bf16_value(residual[index]) +
+                          bf16_value(branch[index]) * gate;
+            uint16_t gated_b = bf16_bits(gated);
+            float value = bf16_value(gated_b);
+            squared[column] = fmaf(value, value, 0.0f);
+        }
+        float inverse = 1.0f / sqrtf(tree_sum256(squared, WIDTH) / (float)WIDTH +
+                                     epsilon);
+        for (size_t column = 0; column < WIDTH; column++) {
+            size_t index = (size_t)row * WIDTH + column;
+            float gate = bf16_value(gmod[mbase + WIDTH + column]);
+            uint16_t gated_b = bf16_bits(bf16_value(residual[index]) +
+                                         bf16_value(branch[index]) * gate);
+            float normalized = bf16_value(gated_b) * inverse *
+                               bf16_value(nw[column]);
+            float shift = bf16_value(nmod[mbase + column]);
+            float scale = bf16_value(nmod[mbase + WIDTH + column]);
+            expected[index] = bf16_bits(normalized * (1.0f + scale) + shift);
+        }
+    }
+    h3_gpu_tensor *r = h3_gpu_tensor_from_bf16(gpu, residual, ROWS * WIDTH);
+    h3_gpu_tensor *b = h3_gpu_tensor_from_bf16(gpu, branch, ROWS * WIDTH);
+    h3_gpu_tensor *n = h3_gpu_tensor_from_bf16(gpu, nw, WIDTH);
+    h3_gpu_tensor *g = h3_gpu_tensor_from_bf16(gpu, gmod,
+                                                ROWS * SLOTS * WIDTH);
+    h3_gpu_tensor *m = h3_gpu_tensor_from_bf16(gpu, nmod,
+                                                ROWS * SLOTS * WIDTH);
+    h3_gpu_tensor *map = h3_gpu_tensor_from_u32(gpu, row_map, ROWS);
+    h3_gpu_tensor *gated = h3_gpu_tensor_new_bf16(gpu, ROWS * WIDTH);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, ROWS * WIDTH);
+    CHECK(r && b && n && g && m && map && gated && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_gate_adaln_bf16(gpu, gated, out, r, b, n, g, m, map,
+                                     ROWS, WIDTH, SLOTS, 1, 0, 1,
+                                     epsilon) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        uint16_t got[ROWS * WIDTH];
+        CHECK(h3_gpu_tensor_read_bf16(gated, got, ROWS * WIDTH) == 0);
+        for (uint32_t row = 0; row < ROWS; row++) {
+            size_t mbase = (size_t)row_map[row] * SLOTS * WIDTH;
+            for (size_t column = 0; column < WIDTH; column++) {
+                size_t index = (size_t)row * WIDTH + column;
+                float gate = bf16_value(gmod[mbase + WIDTH + column]);
+                gated_expected[index] = bf16_bits(
+                    bf16_value(residual[index]) +
+                    bf16_value(branch[index]) * gate);
+            }
+        }
+        CHECK(memcmp(got, gated_expected, sizeof(got)) == 0);
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * WIDTH) == 0);
+        CHECK(check_bf16_ulp(got, expected, ROWS * WIDTH, 2, "gate_adaln"));
+    }
+    h3_gpu_tensor_free(r);
+    h3_gpu_tensor_free(b);
+    h3_gpu_tensor_free(n);
+    h3_gpu_tensor_free(g);
+    h3_gpu_tensor_free(m);
+    h3_gpu_tensor_free(map);
+    h3_gpu_tensor_free(gated);
+    h3_gpu_tensor_free(out);
+}
+
+static void test_adaln_linear_bf16(h3_gpu *gpu) {
+    enum { ROWS = 3, WIDTH = 64, OUT = 32, SLOTS = 2 };
+    const float epsilon = 1e-5f;
+    uint16_t input[ROWS * WIDTH], nw[WIDTH], mod[ROWS * SLOTS * WIDTH],
+             weight[OUT * WIDTH], bias[OUT];
+    uint32_t row_map[ROWS] = {1, 0, 1};
+    uint16_t expected[ROWS * OUT];
+    for (size_t index = 0; index < ROWS * WIDTH; index++)
+        input[index] = bf16_bits((float)(sin((double)index * 0.37) * 2.0));
+    for (size_t index = 0; index < WIDTH; index++)
+        nw[index] = bf16_bits(1.0f);
+    for (size_t index = 0; index < ROWS * SLOTS * WIDTH; index++)
+        mod[index] = bf16_bits((float)cos((double)index * 0.19) * 0.2f);
+    for (size_t index = 0; index < OUT * WIDTH; index++)
+        weight[index] = bf16_bits((float)sin((double)index * 0.43) * 0.4f);
+    for (size_t index = 0; index < OUT; index++)
+        bias[index] = bf16_bits((float)cos((double)index * 0.29) * 0.1f);
+    for (uint32_t row = 0; row < ROWS; row++) {
+        float squared[WIDTH];
+        for (size_t column = 0; column < WIDTH; column++) {
+            float value = bf16_value(input[(size_t)row * WIDTH + column]);
+            squared[column] = fmaf(value, value, 0.0f);
+        }
+        float inverse = 1.0f / sqrtf(tree_sum256(squared, WIDTH) / (float)WIDTH +
+                                     epsilon);
+        size_t mbase = (size_t)row_map[row] * SLOTS * WIDTH;
+        for (size_t column = 0; column < OUT; column++) {
+            float sum = bf16_value(bias[column]);
+            for (size_t k = 0; k < WIDTH; k++) {
+                float value = bf16_value(input[(size_t)row * WIDTH + k]);
+                float shift = bf16_value(mod[mbase + k]);
+                float scale = bf16_value(mod[mbase + WIDTH + k]);
+                float normed = value * inverse * bf16_value(nw[k]);
+                uint16_t normed_b = bf16_bits(normed * (1.0f + scale) + shift);
+                sum = fmaf(bf16_value(normed_b),
+                           bf16_value(weight[(size_t)column * WIDTH + k]),
+                           sum);
+            }
+            expected[(size_t)row * OUT + column] = bf16_bits(sum);
+        }
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_bf16(gpu, input, ROWS * WIDTH);
+    h3_gpu_tensor *n = h3_gpu_tensor_from_bf16(gpu, nw, WIDTH);
+    h3_gpu_tensor *m = h3_gpu_tensor_from_bf16(gpu, mod, ROWS * SLOTS * WIDTH);
+    h3_gpu_tensor *map = h3_gpu_tensor_from_u32(gpu, row_map, ROWS);
+    h3_gpu_tensor *w = h3_gpu_tensor_from_bf16(gpu, weight, OUT * WIDTH);
+    h3_gpu_tensor *b = h3_gpu_tensor_from_bf16(gpu, bias, OUT);
+    h3_gpu_tensor *inv = h3_gpu_tensor_new_f32(gpu, ROWS);
+    h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, ROWS * OUT);
+    CHECK(in && n && m && map && w && b && inv && out);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_adaln_linear_bf16(gpu, out, inv, in, 0, n, m, map, w, b,
+                                       ROWS, WIDTH, OUT, SLOTS, 0, 1,
+                                       epsilon) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        uint16_t got[ROWS * OUT];
+        CHECK(h3_gpu_tensor_read_bf16(out, got, ROWS * OUT) == 0);
+        CHECK(check_bf16_ulp(got, expected, ROWS * OUT, 2, "adaln_linear"));
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(n);
+    h3_gpu_tensor_free(m);
+    h3_gpu_tensor_free(map);
+    h3_gpu_tensor_free(w);
+    h3_gpu_tensor_free(b);
+    h3_gpu_tensor_free(inv);
+    h3_gpu_tensor_free(out);
+}
+
+static void test_head_rms_norm_bf16(h3_gpu *gpu) {
+    enum { SEQ = 4, HEADS = 6, DIM = 32 };
+    const float epsilon = 1e-5f;
+    uint16_t tensor[SEQ * HEADS * DIM], weight[DIM];
+    uint16_t expected[SEQ * HEADS * DIM];
+    for (size_t index = 0; index < SEQ * HEADS * DIM; index++)
+        tensor[index] = bf16_bits((float)(sin((double)index * 0.51) * 1.5));
+    for (size_t index = 0; index < DIM; index++)
+        weight[index] = bf16_bits((float)cos((double)index * 0.13) * 0.5f + 1.0f);
+    for (uint32_t row = 0; row < SEQ; row++) {
+        for (uint32_t head = 0; head < HEADS; head++) {
+            size_t base = ((size_t)row * HEADS + head) * DIM;
+            float sum = 0.0f;
+            for (uint32_t d = 0; d < DIM; d++) {
+                float value = bf16_value(tensor[base + d]);
+                sum = fmaf(value, value, sum);
+            }
+            float inverse = 1.0f / sqrtf(sum / (float)DIM + epsilon);
+            for (uint32_t d = 0; d < DIM; d++) {
+                float value = bf16_value(tensor[base + d]);
+                expected[base + d] =
+                    bf16_bits(value * inverse * bf16_value(weight[d]));
+            }
+        }
+    }
+    h3_gpu_tensor *t = h3_gpu_tensor_from_bf16(gpu, tensor, SEQ * HEADS * DIM);
+    h3_gpu_tensor *w = h3_gpu_tensor_from_bf16(gpu, weight, DIM);
+    CHECK(t && w);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_head_rms_norm_bf16(gpu, t, w, SEQ, HEADS, DIM,
+                                        epsilon) == 0);
+        CHECK(h3_gpu_submit(gpu) == 0);
+        uint16_t got[SEQ * HEADS * DIM];
+        CHECK(h3_gpu_tensor_read_bf16(t, got, SEQ * HEADS * DIM) == 0);
+        CHECK(check_bf16_ulp(got, expected, SEQ * HEADS * DIM, 2, "head_rms"));
+    }
+    h3_gpu_tensor_free(t);
+    h3_gpu_tensor_free(w);
+}
+
 static void test_continue_chain(h3_gpu *gpu) {
     /* Two command buffers chained without a wait must preserve order:
      * add, then silu of the add result, all inside one begin/submit. */
@@ -600,6 +948,12 @@ int main(int argc, char **argv) {
     test_norms(gpu);
     test_linear_bf16(gpu);
     test_mlp_bf16(gpu);
+    test_adaln_bf16(gpu);
+    test_adaln_offset(gpu);
+    test_gate_bf16(gpu);
+    test_gate_adaln_bf16(gpu);
+    test_adaln_linear_bf16(gpu);
+    test_head_rms_norm_bf16(gpu);
     test_continue_chain(gpu);
     h3_gpu_free(gpu);
     if (failed) {

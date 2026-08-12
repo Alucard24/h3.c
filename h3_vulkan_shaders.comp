@@ -44,8 +44,12 @@ struct H3Args {
     uint has_bias;
     uint input_dim;
     uint output_dim;
+    uint slots;
+    uint shift_slot;
+    uint scale_slot;
+    uint gate_slot;
 };
-layout(set = 0, binding = 7) readonly buffer ArgsBuf { H3Args data; } args;
+layout(set = 0, binding = 8) readonly buffer ArgsBuf { H3Args data; } args;
 
 /* ------------------------------------------------------------------ casts */
 
@@ -395,6 +399,229 @@ void main_swiglu_halves_bf16() {
     swi_out.data[gid] = uint16_t(h3_f32_to_bf16(
         gate / (1.0f + exp(-gate)) * up));
 }
+
+
+/* -------------------------------------------------------- AdaLN / gates */
+
+layout(set = 0, binding = 0) readonly buffer AdIn { uint16_t data[]; } ad_in;
+layout(set = 0, binding = 1) readonly buffer AdW { uint16_t data[]; } ad_w;
+layout(set = 0, binding = 2) readonly buffer AdMod { uint16_t data[]; } ad_mod;
+layout(set = 0, binding = 3) readonly buffer AdMap { uint data[]; } ad_map;
+layout(set = 0, binding = 4) writeonly buffer AdOut { uint16_t data[]; } ad_out;
+
+void main_adaln_bf16() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= args.data.rows) return;
+    uint base_row = row * args.data.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.data.width; k += 256u) {
+        float value = H3_BF16_TO_F32(ad_in.data[base_row + k]);
+        local_sum = fma(value, value, local_sum);
+    }
+    norm_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) norm_reductions[tid] += norm_reductions[tid + stride];
+        barrier();
+    }
+    float inverse = inversesqrt(norm_reductions[0] / float(args.data.width) +
+                                args.data.epsilon);
+    uint base = ad_map.data[row] * args.data.slots * args.data.width;
+    for (uint column = tid; column < args.data.width; column += 256u) {
+        float normalized = H3_BF16_TO_F32(ad_in.data[base_row + column]) *
+                           inverse * H3_BF16_TO_F32(ad_w.data[column]);
+        float shift = H3_BF16_TO_F32(
+            ad_mod.data[base + args.data.shift_slot * args.data.width +
+                        column]);
+        float scale = H3_BF16_TO_F32(
+            ad_mod.data[base + args.data.scale_slot * args.data.width +
+                        column]);
+        ad_out.data[base_row + column] = uint16_t(h3_f32_to_bf16(
+            normalized * (1.0f + scale) + shift));
+    }
+}
+
+layout(set = 0, binding = 0) readonly buffer GateRes { uint16_t data[]; } gate_res;
+layout(set = 0, binding = 1) readonly buffer GateBranch { uint16_t data[]; } gate_branch;
+layout(set = 0, binding = 2) readonly buffer GateMod { uint16_t data[]; } gate_mod;
+layout(set = 0, binding = 3) readonly buffer GateMap { uint data[]; } gate_map;
+layout(set = 0, binding = 4) writeonly buffer GateOut { uint16_t data[]; } gate_out;
+
+void main_gate_bf16() {
+    uint column = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= args.data.rows || column >= args.data.width) return;
+    uint base = gate_map.data[row] * args.data.slots * args.data.width;
+    float gate = H3_BF16_TO_F32(
+        gate_mod.data[base + args.data.gate_slot * args.data.width + column]);
+    uint index = row * args.data.width + column;
+    float value = H3_BF16_TO_F32(gate_res.data[index]) +
+                  H3_BF16_TO_F32(gate_branch.data[index]) * gate;
+    gate_out.data[index] = uint16_t(h3_f32_to_bf16(value));
+}
+
+layout(set = 0, binding = 0) readonly buffer GAdRes { uint16_t data[]; } gad_res;
+layout(set = 0, binding = 1) readonly buffer GAdBranch { uint16_t data[]; } gad_branch;
+layout(set = 0, binding = 2) readonly buffer GAdGMod { uint16_t data[]; } gad_gmod;
+layout(set = 0, binding = 3) readonly buffer GAdMap { uint data[]; } gad_map;
+layout(set = 0, binding = 4) readonly buffer GAdW { uint16_t data[]; } gad_w;
+layout(set = 0, binding = 5) readonly buffer GAdNMod { uint16_t data[]; } gad_nmod;
+layout(set = 0, binding = 6) buffer GAdGated { uint16_t data[]; } gad_gated;
+layout(set = 0, binding = 7) writeonly buffer GAdOut { uint16_t data[]; } gad_out;
+
+shared uint16_t gated_values[5376];
+
+void main_gate_adaln_bf16() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= args.data.rows) return;
+    uint base_row = row * args.data.width;
+    uint base = gad_map.data[row] * args.data.slots * args.data.width;
+    float local_sum = 0.0f;
+    for (uint column = tid; column < args.data.width; column += 256u) {
+        uint index = base_row + column;
+        float gate = H3_BF16_TO_F32(
+            gad_gmod.data[base + args.data.gate_slot * args.data.width +
+                          column]);
+        uint16_t gated = uint16_t(h3_f32_to_bf16(
+            H3_BF16_TO_F32(gad_res.data[index]) +
+            H3_BF16_TO_F32(gad_branch.data[index]) * gate));
+        gad_gated.data[index] = gated;
+        gated_values[column] = gated;
+        float value = H3_BF16_TO_F32(gated);
+        local_sum = fma(value, value, local_sum);
+    }
+    norm_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) norm_reductions[tid] += norm_reductions[tid + stride];
+        barrier();
+    }
+    float inverse = inversesqrt(norm_reductions[0] / float(args.data.width) +
+                                args.data.epsilon);
+    for (uint column = tid; column < args.data.width; column += 256u) {
+        float normalized = H3_BF16_TO_F32(gated_values[column]) * inverse *
+                           H3_BF16_TO_F32(gad_w.data[column]);
+        float shift = H3_BF16_TO_F32(
+            gad_nmod.data[base + args.data.shift_slot * args.data.width +
+                          column]);
+        float scale = H3_BF16_TO_F32(
+            gad_nmod.data[base + args.data.scale_slot * args.data.width +
+                          column]);
+        gad_out.data[base_row + column] = uint16_t(h3_f32_to_bf16(
+            normalized * (1.0f + scale) + shift));
+    }
+}
+
+/* Inverse RMS scalars for the fused final projection (rows floats). */
+layout(set = 0, binding = 0) readonly buffer RmsIn { uint16_t data[]; } rms_in;
+layout(set = 0, binding = 1) writeonly buffer RmsInv { float data[]; } rms_inv;
+
+void main_rms_inverse_bf16() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= args.data.rows) return;
+    uint base_row = row * args.data.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.data.width; k += 256u) {
+        float value = H3_BF16_TO_F32(rms_in.data[base_row + k]);
+        local_sum = fma(value, value, local_sum);
+    }
+    norm_reductions[tid] = local_sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) norm_reductions[tid] += norm_reductions[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) {
+        rms_inv.data[row] = inversesqrt(norm_reductions[0] /
+                                        float(args.data.width) +
+                                        args.data.epsilon);
+    }
+}
+
+/* Fused final AdaLN + 16x16 linear (see h3_adaln_linear_bf16 in the Metal
+ * source): the normalized activation is rounded to BF16 before the dot
+ * product, preserving the AdaLN + linear arithmetic boundary. */
+layout(set = 0, binding = 0) readonly buffer ALIn { uint16_t data[]; } al_in;
+layout(set = 0, binding = 1) readonly buffer ALInv { float data[]; } al_inv;
+layout(set = 0, binding = 2) readonly buffer ALNW { uint16_t data[]; } al_nw;
+layout(set = 0, binding = 3) readonly buffer ALMod { uint16_t data[]; } al_mod;
+layout(set = 0, binding = 4) readonly buffer ALMap { uint data[]; } al_map;
+layout(set = 0, binding = 5) readonly buffer ALW { uint16_t data[]; } al_w;
+layout(set = 0, binding = 6) readonly buffer ALB { uint16_t data[]; } al_b;
+layout(set = 0, binding = 7) writeonly buffer ALOut { uint16_t data[]; } al_out;
+
+void main_adaln_linear_bf16() {
+    uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    float sum = (args.data.has_bias != 0u && column < args.data.output_dim) ?
+        H3_BF16_TO_F32(al_b.data[column]) : 0.0f;
+    uint base = row < args.data.rows ?
+        al_map.data[row] * args.data.slots * args.data.width : 0u;
+    uint tile_count = (args.data.width + 15u) / 16u;
+    for (uint tile = 0u; tile < tile_count; tile++) {
+        uint input_k = tile * 16u + gl_LocalInvocationID.x;
+        uint16_t normalized = uint16_t(0);
+        if (row < args.data.rows && input_k < args.data.width) {
+            float value = H3_BF16_TO_F32(
+                al_in.data[row * args.data.width + input_k]);
+            float shift = H3_BF16_TO_F32(
+                al_mod.data[base + args.data.shift_slot * args.data.width +
+                            input_k]);
+            float scale = H3_BF16_TO_F32(
+                al_mod.data[base + args.data.scale_slot * args.data.width +
+                            input_k]);
+            float normed = value * al_inv.data[row] *
+                           H3_BF16_TO_F32(al_nw.data[input_k]);
+            normalized = uint16_t(h3_f32_to_bf16(normed * (1.0f + scale) +
+                                                 shift));
+        }
+        lin_input_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            H3_BF16_TO_F32(normalized);
+        uint weight_k = tile * 16u + gl_LocalInvocationID.y;
+        lin_weight_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (column < args.data.output_dim && weight_k < args.data.width) ?
+            H3_BF16_TO_F32(al_w.data[column * args.data.width + weight_k]) :
+            0.0f;
+        barrier();
+        for (uint k = 0u; k < 16u; k++) {
+            sum = fma(lin_input_tile[gl_LocalInvocationID.y][k],
+                      lin_weight_tile[k][gl_LocalInvocationID.x], sum);
+        }
+        barrier();
+    }
+    if (row < args.data.rows && column < args.data.output_dim) {
+        al_out.data[row * args.data.output_dim + column] =
+            uint16_t(h3_f32_to_bf16(sum));
+    }
+}
+
+/* Per-head RMS norm in place (Qwen3 style). */
+layout(set = 0, binding = 0) buffer HNIn { uint16_t data[]; } hn_in;
+layout(set = 0, binding = 1) readonly buffer HNW { uint16_t data[]; } hn_w;
+
+void main_head_rms_norm_bf16() {
+    uint row = gl_GlobalInvocationID.x;
+    uint head = gl_GlobalInvocationID.y;
+    if (row >= args.data.rows || head >= args.data.width) return;
+    uint base = (row * args.data.width + head) * args.data.input_dim;
+    float sum = 0.0f;
+    for (uint d = 0u; d < args.data.input_dim; d++) {
+        float value = H3_BF16_TO_F32(hn_in.data[base + d]);
+        sum = fma(value, value, sum);
+    }
+    float inverse = inversesqrt(sum / float(args.data.input_dim) +
+                                args.data.epsilon);
+    for (uint d = 0u; d < args.data.input_dim; d++) {
+        float value = H3_BF16_TO_F32(hn_in.data[base + d]);
+        hn_in.data[base + d] = uint16_t(h3_f32_to_bf16(
+            value * inverse * H3_BF16_TO_F32(hn_w.data[d])));
+    }
+}
+
+
 
 /* The runtime compiles one module per kernel with H3_ENTRY selecting the
  * kernel function; glslc testing uses -DH3_ENTRY=main_<kernel>. */

@@ -63,6 +63,29 @@ static int check_f32(const float *got, const float *expected, size_t count,
     }
     return ok;
 }
+/* BF16-aware comparison: within `max_ulp` BF16 units, or within an
+ * absolute bound (for denormal-scale outputs where a few ulps are
+ * meaningless). */
+static int check_bf16_ulp_abs(const uint16_t *got, const uint16_t *expected,
+                              size_t count, uint32_t max_ulp,
+                              float max_absolute, const char *name) {
+    int ok = 1;
+    for (size_t index = 0; index < count; index++) {
+        uint16_t g = got[index], e = expected[index];
+        uint32_t diff = (g & 0x8000u) != (e & 0x8000u) ?
+            UINT32_MAX : (uint32_t)abs((int)(g & 0x7fffu) -
+                                       (int)(e & 0x7fffu));
+        float gv = bf16_value(g), ev = bf16_value(e);
+        if (diff > max_ulp && fabsf(gv - ev) > max_absolute) {
+            fprintf(stderr, "  %s[%zu]: got %u expected %u (%.9g vs %.9g)\n",
+                    name, index, g, e, gv, ev);
+            ok = 0;
+            break;
+        }
+    }
+    return ok;
+}
+
 /* BF16-aware comparison: within `max_ulp` BF16 units. */
 static int check_bf16_ulp(const uint16_t *got, const uint16_t *expected,
                           size_t count, uint32_t max_ulp, const char *name) {
@@ -1151,8 +1174,16 @@ static void test_sdpa_bf16(h3_gpu *gpu) {
             for (uint32_t head = 0; head < HEADS && same; head++)
                 for (uint32_t d = 0; d < DIM; d++)
                     if (got2[(head * SEQ + row) * DIM + d] !=
-                        got[(row * HEADS + head) * DIM + d])
+                        got[(row * HEADS + head) * DIM + d]) {
+                        fprintf(stderr,
+                                "  sdpa head-major mismatch row=%u head=%u "
+                                "d=%u: %u vs %u\n",
+                                row, head, d,
+                                got2[(head * SEQ + row) * DIM + d],
+                                got[(row * HEADS + head) * DIM + d]);
                         same = 0;
+                        break;
+                    }
         CHECK(same);
         h3_gpu_tensor_free(out2);
     }
@@ -1334,6 +1365,114 @@ static void test_patch_linear_map_bf16(h3_gpu *gpu) {
     free(input); free(weight); free(expected); free(got);
 }
 
+static void test_sdpa_flash_bf16(h3_gpu *gpu) {
+    /* Long sequence exercises the 128-thread flash kernel (selected
+     * automatically for sequence >= 128). */
+    enum { SEQ = 256, HEADS = 4, DIM = 128 };
+    size_t count = (size_t)SEQ * HEADS * DIM;
+    uint16_t *q = malloc(count * 2), *k = malloc(count * 2),
+             *v = malloc(count * 2), *expected = malloc(count * 2);
+    float scale = 1.0f / sqrtf((float)DIM);
+    CHECK(q && k && v && expected);
+    if (!failed) {
+        for (size_t index = 0; index < count; index++) {
+            q[index] = bf16_bits((float)(sin((double)index * 0.31) * 0.8));
+            k[index] = bf16_bits((float)(cos((double)index * 0.43) * 0.8));
+            v[index] = bf16_bits((float)(sin((double)index * 0.57) * 0.6));
+        }
+        for (uint32_t row = 0; row < SEQ; row++) {
+            for (uint32_t head = 0; head < HEADS; head++) {
+                uint32_t qbase = (row * HEADS + head) * DIM;
+                float scores[SEQ];
+                float maxv = -3.402823466e+38f;
+                for (uint32_t s = 0; s < SEQ; s++) {
+                    uint32_t kbase = (s * HEADS + head) * DIM;
+                    float dot = 0.0f;
+                    for (uint32_t d = 0; d < DIM; d++)
+                        dot = fmaf(bf16_value(q[qbase + d]),
+                                   bf16_value(k[kbase + d]), dot);
+                    scores[s] = dot * scale;
+                    if (scores[s] > maxv) maxv = scores[s];
+                }
+                float sum = 0.0f;
+                for (uint32_t s = 0; s < SEQ; s++)
+                    sum += expf(scores[s] - maxv);
+                for (uint32_t d = 0; d < DIM; d++) {
+                    float acc = 0.0f;
+                    for (uint32_t s = 0; s < SEQ; s++) {
+                        uint32_t kbase = (s * HEADS + head) * DIM;
+                        acc = fmaf(expf(scores[s] - maxv),
+                                   bf16_value(v[kbase + d]), acc);
+                    }
+                    expected[qbase + d] = bf16_bits(acc / sum);
+                }
+            }
+        }
+        h3_gpu_tensor *tq = h3_gpu_tensor_from_bf16(gpu, q, count);
+        h3_gpu_tensor *tk = h3_gpu_tensor_from_bf16(gpu, k, count);
+        h3_gpu_tensor *tv = h3_gpu_tensor_from_bf16(gpu, v, count);
+        h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, count);
+        CHECK(tq && tk && tv && out);
+        if (!failed) {
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
+                                   scale) == 0);
+            CHECK(h3_gpu_submit(gpu) == 0);
+            uint16_t *got = malloc(count * 2);
+            CHECK(got);
+            CHECK(h3_gpu_tensor_read_bf16(out, got, count) == 0);
+            /* The flash kernel reduces dots with a tree instead of the
+             * linear FMA order, so allow a few more ulps. */
+            CHECK(check_bf16_ulp_abs(got, expected, count, 8, 2e-7f,
+                                      "sdpa_flash"));
+            free(got);
+            h3_gpu_tensor_free(tq);
+            h3_gpu_tensor_free(tk);
+            h3_gpu_tensor_free(tv);
+            h3_gpu_tensor_free(out);
+        }
+    }
+    free(q); free(k); free(v); free(expected);
+}
+
+static void test_sdpa_flash_bench(h3_gpu *gpu) {
+    /* Informational timing: naive vs flash on a production-like sequence. */
+    enum { SEQ = 2048, HEADS = 8, DIM = 128 };
+    size_t count = (size_t)SEQ * HEADS * DIM;
+    uint16_t *q = malloc(count * 2), *k = malloc(count * 2),
+             *v = malloc(count * 2);
+    CHECK(q && k && v);
+    if (!failed) {
+        for (size_t index = 0; index < count; index++) {
+            q[index] = bf16_bits((float)(sin((double)index * 0.11) * 0.5));
+            k[index] = bf16_bits((float)(cos((double)index * 0.17) * 0.5));
+            v[index] = bf16_bits((float)(sin((double)index * 0.23) * 0.5));
+        }
+        h3_gpu_tensor *tq = h3_gpu_tensor_from_bf16(gpu, q, count);
+        h3_gpu_tensor *tk = h3_gpu_tensor_from_bf16(gpu, k, count);
+        h3_gpu_tensor *tv = h3_gpu_tensor_from_bf16(gpu, v, count);
+        h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, count);
+        CHECK(tq && tk && tv && out);
+        if (!failed) {
+            h3_gpu_stats stats;
+            /* Naive (force by temporary threshold override is not exposed;
+             * the flash path is the one used at this size). */
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
+                                   1.0f / sqrtf((float)DIM)) == 0);
+            CHECK(h3_gpu_submit(gpu) == 0);
+            h3_gpu_get_stats(gpu, &stats);
+            printf("SDPA seq=%d heads=%d: flash kernel %.1f ms (GPU wait)\n",
+                   SEQ, HEADS, stats.command_wait_seconds * 1e3);
+        }
+        h3_gpu_tensor_free(tq);
+        h3_gpu_tensor_free(tk);
+        h3_gpu_tensor_free(tv);
+        h3_gpu_tensor_free(out);
+    }
+    free(q); free(k); free(v);
+}
+
 static void test_continue_chain(h3_gpu *gpu) {
     /* Two command buffers chained without a wait must preserve order:
      * add, then silu of the add result, all inside one begin/submit. */
@@ -1396,6 +1535,8 @@ int main(int argc, char **argv) {
     test_grouped_qkv_rope_bf16(gpu);
     test_qkv_rope_plain_bf16(gpu);
     test_sdpa_bf16(gpu);
+    test_sdpa_flash_bf16(gpu);
+    test_sdpa_flash_bench(gpu);
     test_patch_linear_bf16(gpu);
     test_patch_linear_offset_bf16(gpu);
     test_patch_linear_map_bf16(gpu);

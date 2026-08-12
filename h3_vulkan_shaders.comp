@@ -59,6 +59,8 @@ layout(set = 0, binding = 1) writeonly buffer OutBF16 { uint16_t data[]; } out_b
 
 #if defined(H3_LS16)
 layout(local_size_x = 16, local_size_y = 16) in;
+#elif defined(H3_LS128)
+layout(local_size_x = 128) in;
 #else
 layout(local_size_x = 256) in;
 #endif
@@ -844,6 +846,71 @@ void main_patch_linear_bf16_map() {
                     args.data.output_dim + column] =
             uint16_t(h3_f32_to_bf16(sum));
     }
+}
+
+
+
+/* Flash-style SDPA: one 128-thread workgroup per (row, head), each thread
+ * owning one head dimension. Online softmax (running max and sum) with F32
+ * accumulation; per-source dot products use the same tree reduction order
+ * as the norm kernels. Selected automatically for sequences of at least
+ * 128 rows, where the one-thread-per-output naive kernel would serialize. */
+layout(set = 0, binding = 0) readonly buffer FlQ { uint16_t data[]; } fl_q;
+layout(set = 0, binding = 1) readonly buffer FlK { uint16_t data[]; } fl_k;
+layout(set = 0, binding = 2) readonly buffer FlV { uint16_t data[]; } fl_v;
+layout(set = 0, binding = 3) writeonly buffer FlOut { uint16_t data[]; } fl_out;
+
+shared float fl_q_shared[128];
+shared float fl_dots[128];
+shared float fl_acc[128];
+shared float fl_max;
+shared float fl_old_max;
+shared float fl_sum;
+
+void main_sdpa_flash_bf16() {
+    uint head = gl_WorkGroupID.x;
+    uint row = gl_WorkGroupID.y;
+    uint d = gl_LocalInvocationID.x;
+    uint seq = args.data.rows;
+    uint heads = args.data.width;
+    uint dim = args.data.input_dim;
+    if (row >= seq || head >= heads || d >= dim) return;
+    float scale = args.data.left_scale;
+    uint qbase = (row * heads + head) * dim;
+    fl_q_shared[d] = H3_BF16_TO_F32(fl_q.data[qbase + d]);
+    fl_acc[d] = 0.0f;
+    if (d == 0u) {
+        fl_max = -3.402823466e+38f;
+        fl_sum = 0.0f;
+    }
+    barrier();
+    for (uint s = 0u; s < seq; s++) {
+        uint kbase = (s * heads + head) * dim;
+        fl_dots[d] = fma(fl_q_shared[d],
+                         H3_BF16_TO_F32(fl_k.data[kbase + d]), 0.0f);
+        barrier();
+        for (uint stride = 64u; stride > 0u; stride >>= 1) {
+            if (d < stride) fl_dots[d] += fl_dots[d + stride];
+            barrier();
+        }
+        float dot = fl_dots[0] * scale;
+        if (d == 0u) {
+            float new_max = max(fl_max, dot);
+            fl_old_max = fl_max;
+            fl_max = new_max;
+            fl_sum = fl_sum * exp(fl_old_max - new_max) +
+                     exp(dot - new_max);
+        }
+        barrier();
+        float p = exp(fl_old_max - fl_max);
+        float w = exp(fl_dots[0] * scale - fl_max);
+        fl_acc[d] = fl_acc[d] * p +
+                    w * H3_BF16_TO_F32(fl_v.data[kbase + d]);
+        barrier();
+    }
+    uint oindex = args.data.grouped != 0u ?
+        (head * seq + row) * dim + d : qbase + d;
+    fl_out.data[oindex] = uint16_t(h3_f32_to_bf16(fl_acc[d] / fl_sum));
 }
 
 /* The runtime compiles one module per kernel with H3_ENTRY selecting the

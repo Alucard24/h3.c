@@ -473,8 +473,11 @@ round-to-nearest-even is bit-exact):
   Qwen3 `head_rms_norm` bf16
 - attention: `grouped_qkv_rope` bf16 (checkpoint `[head, q/k/v, dim]` rows
   and the plain `[q/k/v, head, dim]` variant, Q/K RMS + RoPE to
-  `[row, head, dim]`) and portable naive `sdpa` bf16 with maximum
-  subtraction, F32 accumulation, and a head-major output variant
+  `[row, head, dim]`) and `sdpa` bf16 with maximum subtraction and F32
+  accumulation: the one-thread-per-output naive kernel below 128 rows
+  (bit-exact reference order), a 128-thread flash kernel with online
+  softmax and tree-reduced dots at and above 128 rows, and a head-major
+  output variant for layout-aware projections
 - `embedding` bf16 (out-of-vocab rows zeroed)
 - `rms_norm`/`layer_norm` f32 and bf16 with the 256-thread tree reduction
 

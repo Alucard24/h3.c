@@ -90,6 +90,7 @@ typedef enum {
     H3_VK_KERNEL_HEAD_RMS_NORM_BF16,
     H3_VK_KERNEL_GROUPED_QKV_ROPE_BF16,
     H3_VK_KERNEL_SDPA_BF16,
+    H3_VK_KERNEL_SDPA_FLASH_BF16,
     H3_VK_KERNEL_PATCH_LINEAR_BF16,
     H3_VK_KERNEL_PATCH_LINEAR_BF16_MAP,
     H3_VK_KERNEL_COUNT
@@ -107,6 +108,7 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_rms_inverse_bf16", "main_adaln_linear_bf16",
     "main_head_rms_norm_bf16",
     "main_grouped_qkv_rope_bf16", "main_sdpa_bf16",
+    "main_sdpa_flash_bf16",
     "main_patch_linear_bf16", "main_patch_linear_bf16_map"
 };
 
@@ -116,13 +118,14 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
     2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2,
-    5, 5, 8, 2, 8, 2, 8, 4, 4, 5
+    5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5
 };
 
-/* Kernels with a 16x16 threadgroup need H3_LS16 at compile time. */
-static const int h3_vk_kernel_ls16[H3_VK_KERNEL_COUNT] = {
+/* Workgroup layout per kernel: 0 = 256 threads, 1 = 16x16 tiles,
+ * 2 = 128 threads (SDPA flash). */
+static const int h3_vk_kernel_layout[H3_VK_KERNEL_COUNT] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-    0, 1, 0, 0, 1, 1, 0, 0, 1, 1
+    0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1
 };
 
 struct h3_gpu {
@@ -369,7 +372,7 @@ static int h3_vk_create_device(h3_gpu *gpu, char *error, size_t error_size) {
 
 static VkShaderModule h3_vk_compile(h3_gpu *gpu, const char *source,
                                     size_t source_size,
-                                    const char *entry_point, int ls16) {
+                                    const char *entry_point, int layout) {
     shaderc_compilation_result_t result = NULL;
     if (gpu->shaderc) {
         shaderc_compile_options_t options =
@@ -382,9 +385,12 @@ static VkShaderModule h3_vk_compile(h3_gpu *gpu, const char *source,
         shaderc_compile_options_add_macro_definition(
             options, "H3_ENTRY", strlen("H3_ENTRY"), entry_point,
             strlen(entry_point));
-        if (ls16)
+        if (layout == 1)
             shaderc_compile_options_add_macro_definition(
                 options, "H3_LS16", strlen("H3_LS16"), "1", 1);
+        else if (layout == 2)
+            shaderc_compile_options_add_macro_definition(
+                options, "H3_LS128", strlen("H3_LS128"), "1", 1);
         result = shaderc_compile_into_spv(
             gpu->shaderc, source, source_size,
             shaderc_compute_shader, "h3_vulkan_shaders.comp",
@@ -448,7 +454,7 @@ static int h3_vk_create_pipelines(h3_gpu *gpu, const char *source,
     for (int kernel = 0; kernel < H3_VK_KERNEL_COUNT; kernel++) {
         VkShaderModule module = h3_vk_compile(gpu, source, source_size,
                                               h3_vk_kernel_names[kernel],
-                                              h3_vk_kernel_ls16[kernel]);
+                                              h3_vk_kernel_layout[kernel]);
         if (module == VK_NULL_HANDLE) {
             if (error && error_size)
                 snprintf(error, error_size, "%s", gpu->error);
@@ -1748,12 +1754,16 @@ static int h3_vk_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
     gpu->args->input_dim = head_dim;
     gpu->args->left_scale = scale;
     gpu->args->grouped = head_major_output ? 1u : 0u;
+    /* Long sequences use the 128-thread flash kernel; short ones keep the
+     * one-thread-per-output naive kernel, whose bit-exact reference order
+     * is what the parity tests compare against. */
+    int flash = sequence >= 128 && head_dim <= 128;
+    h3_vk_kernel kernel = flash ? H3_VK_KERNEL_SDPA_FLASH_BF16
+                                : H3_VK_KERNEL_SDPA_BF16;
     const h3_gpu_tensor *tensors[4] = { query, key, value, output };
-    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_SDPA_BF16, tensors,
-                                        4);
+    VkDescriptorSet set = h3_vk_prepare(gpu, kernel, tensors, 4);
     if (set == VK_NULL_HANDLE) return -1;
-    return h3_vk_dispatch(gpu, H3_VK_KERNEL_SDPA_BF16, set, heads, sequence,
-                          1);
+    return h3_vk_dispatch(gpu, kernel, set, heads, sequence, 1);
 }
 
 int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,

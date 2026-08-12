@@ -1639,6 +1639,297 @@ void main_conv3d_f32() {
     }
 }
 
+/* --------------------------------------------------------- audio family */
+
+/* weight_norm: out[row, :] = vector[row, :] * magnitude[row] / ||vector|| */
+
+layout(set = 0, binding = 0) readonly buffer WNVec { float data[]; } wn_vec;
+layout(set = 0, binding = 1) readonly buffer WNMag { float data[]; } wn_mag;
+layout(set = 0, binding = 2) writeonly buffer WNOut { float data[]; } wn_out;
+
+void main_weight_norm_f32() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= args.data.rows) return;
+    uint base = row * args.data.width;
+    float square_sum = 0.0f;
+    for (uint index = 0u; index < args.data.width; index++) {
+        float value = wn_vec.data[base + index];
+        square_sum = fma(value, value, square_sum);
+    }
+    float scale = wn_mag.data[row] * inversesqrt(square_sum);
+    for (uint index = 0u; index < args.data.width; index++) {
+        wn_out.data[base + index] = wn_vec.data[base + index] * scale;
+    }
+}
+
+/* snake1d: x + sin(a*x)^2 / (a + 1e-9) */
+
+layout(set = 0, binding = 0) readonly buffer SnIn { float data[]; } sn_in;
+layout(set = 0, binding = 1) readonly buffer SnA { float data[]; } sn_a;
+layout(set = 0, binding = 2) writeonly buffer SnOut { float data[]; } sn_out;
+
+void main_snake1d_f32() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.elements) return;
+    float a = sn_a.data[gid % args.data.conv_in_channels];
+    float x = sn_in.data[gid];
+    float wave = sin(a * x);
+    sn_out.data[gid] = x + wave * wave / (a + 1e-9f);
+}
+
+/* Fused BigVGAN 2x upsample -> SnakeBeta -> 2x low-pass downsample at the
+ * original rate; filters are the fixed 12-tap windowed-sinc kernels. */
+
+layout(set = 0, binding = 0) readonly buffer AFIn { float data[]; } af_in;
+layout(set = 0, binding = 1) readonly buffer AFAlpha { float data[]; } af_alpha;
+layout(set = 0, binding = 2) readonly buffer AFBeta { float data[]; } af_beta;
+layout(set = 0, binding = 3) readonly buffer AFUp { float data[]; } af_up;
+layout(set = 0, binding = 4) readonly buffer AFDown { float data[]; } af_down;
+layout(set = 0, binding = 5) writeonly buffer AFOut { float data[]; } af_out;
+
+void main_alias_free_snake_f32() {
+    uint channel = gl_GlobalInvocationID.x;
+    uint time = gl_GlobalInvocationID.y;
+    uint batch = gl_GlobalInvocationID.z;
+    uint channels = args.data.conv_in_channels;
+    uint length = args.data.conv_depth;
+    if (channel >= channels || time >= length || batch >= args.data.conv_batch)
+        return;
+    float alpha = exp(af_alpha.data[channel]);
+    float beta = exp(af_beta.data[channel]);
+    float result = 0.0f;
+    for (int down_k = 0; down_k < 12; down_k++) {
+        int up_time = int(time * 2u) + down_k - 5;
+        up_time = clamp(up_time, 0, int(length * 2u) - 1);
+        int raw_time = up_time + 15;
+        float upsampled = 0.0f;
+        for (int up_k = 0; up_k < 12; up_k++) {
+            int numerator = raw_time - up_k;
+            if (numerator < 0 || (numerator & 1) != 0) continue;
+            int padded_time = numerator / 2;
+            int source_time = clamp(padded_time - 5, 0, int(length) - 1);
+            uint source = (batch * length + uint(source_time)) * channels +
+                          channel;
+            upsampled = fma(af_in.data[source],
+                            2.0f * af_up.data[uint(up_k)], upsampled);
+        }
+        float sine = sin(alpha * upsampled);
+        float activated = upsampled + sine * sine / (beta + 1e-9f);
+        result = fma(activated, af_down.data[uint(down_k)], result);
+    }
+    uint destination = (batch * length + time) * channels + channel;
+    af_out.data[destination] = result;
+}
+
+/* audio QKV split with per-head biases */
+
+layout(set = 0, binding = 0) readonly buffer AQSQKV { float data[]; } aqs_qkv;
+layout(set = 0, binding = 1) readonly buffer AQSQ { float data[]; } aqs_qb;
+layout(set = 0, binding = 2) readonly buffer AQSK { float data[]; } aqs_kb;
+layout(set = 0, binding = 3) readonly buffer AQSV { float data[]; } aqs_vb;
+layout(set = 0, binding = 4) writeonly buffer AQSQOut { float data[]; } aqs_q;
+layout(set = 0, binding = 5) writeonly buffer AQSKOut { float data[]; } aqs_k;
+layout(set = 0, binding = 6) writeonly buffer AQSVOut { float data[]; } aqs_v;
+
+void main_audio_qkv_split_f32() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.elements) return;
+    uint width = args.data.conv_width * args.data.conv_height;
+    uint column = gid % width;
+    uint row = gid / width;
+    uint base = row * width * 3u;
+    aqs_q.data[gid] = aqs_qkv.data[base + column] + aqs_qb.data[column];
+    aqs_k.data[gid] = aqs_qkv.data[base + width + column] + aqs_kb.data[column];
+    aqs_v.data[gid] = aqs_qkv.data[base + width * 2u + column] +
+                      aqs_vb.data[column];
+}
+
+/* audio attention pooling over heads and head_dim groups */
+
+layout(set = 0, binding = 0) readonly buffer APIn { float data[]; } ap_in;
+layout(set = 0, binding = 1) writeonly buffer APOut { float data[]; } ap_out;
+
+void main_audio_attention_pool_f32() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= args.data.elements) return;
+    uint column = gid % args.data.conv_in_channels;
+    uint row = gid / args.data.conv_in_channels;
+    uint pool = args.data.conv_height / args.data.conv_in_channels;
+    float sum = 0.0f;
+    for (uint head = 0u; head < args.data.conv_width; head++) {
+        uint base = (row * args.data.conv_width + head) *
+                        args.data.conv_height +
+                    column * pool;
+        for (uint item = 0u; item < pool; item++)
+            sum += ap_in.data[base + item];
+    }
+    ap_out.data[gid] = sum / float(args.data.conv_width * pool);
+}
+
+/* conv1d (OIK weights, stride/padding/dilation) and conv-transpose1d (IOK) */
+
+layout(set = 0, binding = 0) readonly buffer C1In { float data[]; } c1_in;
+layout(set = 0, binding = 1) readonly buffer C1W { float data[]; } c1_w;
+layout(set = 0, binding = 2) readonly buffer C1B { float data[]; } c1_b;
+layout(set = 0, binding = 3) writeonly buffer C1Out { float data[]; } c1_out;
+
+void main_conv1d_stride_f32() {
+    uint oc = gl_GlobalInvocationID.x;
+    uint time = gl_GlobalInvocationID.y;
+    uint batch = gl_GlobalInvocationID.z;
+    uint length = args.data.conv_depth;
+    uint in_channels = args.data.conv_in_channels;
+    uint out_channels = args.data.conv_out_channels;
+    uint kernel = args.data.conv_kernel_width;
+    uint stride = args.data.conv_stride_width;
+    uint padding = args.data.conv_stride_height;
+    uint dilation = args.data.conv_stride_depth;
+    uint effective = dilation * (kernel - 1u) + 1u;
+    uint output_length = (length + 2u * padding - effective) / stride + 1u;
+    if (oc >= out_channels || time >= output_length ||
+        batch >= args.data.conv_batch)
+        return;
+    float sum = args.data.has_bias != 0u ? c1_b.data[oc] : 0.0f;
+    for (uint ic = 0u; ic < in_channels; ic++) {
+        for (uint k = 0u; k < kernel; k++) {
+            int source = int(time * stride) + int(k * dilation) -
+                         int(padding);
+            if (source < 0 || source >= int(length)) continue;
+            uint input_index =
+                (batch * length + uint(source)) * in_channels + ic;
+            uint weight_index = (oc * in_channels + ic) * kernel + k;
+            sum = fma(c1_in.data[input_index], c1_w.data[weight_index], sum);
+        }
+    }
+    uint output_index =
+        (batch * output_length + time) * out_channels + oc;
+    c1_out.data[output_index] = sum;
+}
+
+void main_conv_transpose1d_f32() {
+    uint oc = gl_GlobalInvocationID.x;
+    uint time = gl_GlobalInvocationID.y;
+    uint batch = gl_GlobalInvocationID.z;
+    uint length = args.data.conv_depth;
+    uint in_channels = args.data.conv_in_channels;
+    uint out_channels = args.data.conv_out_channels;
+    uint kernel = args.data.conv_kernel_width;
+    uint stride = args.data.conv_stride_width;
+    uint padding = args.data.conv_stride_height;
+    uint output_length = (length - 1u) * stride + kernel - 2u * padding;
+    if (oc >= out_channels || time >= output_length ||
+        batch >= args.data.conv_batch)
+        return;
+    float sum = args.data.has_bias != 0u ? c1_b.data[oc] : 0.0f;
+    for (uint ic = 0u; ic < in_channels; ic++) {
+        for (uint k = 0u; k < kernel; k++) {
+            int numerator = int(time) + int(padding) - int(k);
+            if (numerator < 0 || numerator % int(stride) != 0) continue;
+            uint source = uint(numerator) / stride;
+            if (source >= length) continue;
+            uint input_index = (batch * length + source) * in_channels + ic;
+            /* IOK weight layout: [in_ch][out_ch][kernel] */
+            uint weight_index = (ic * out_channels + oc) * kernel + k;
+            sum = fma(c1_in.data[input_index], c1_w.data[weight_index], sum);
+        }
+    }
+    uint output_index =
+        (batch * output_length + time) * out_channels + oc;
+    c1_out.data[output_index] = sum;
+}
+
+/* causal SDPA (f32, batch dimension) */
+
+layout(set = 0, binding = 0) readonly buffer SdpCQ { float data[]; } sdpc_q;
+layout(set = 0, binding = 1) readonly buffer SdpCK { float data[]; } sdpc_k;
+layout(set = 0, binding = 2) readonly buffer SdpCV { float data[]; } sdpc_v;
+layout(set = 0, binding = 3) writeonly buffer SdpCOut { float data[]; } sdpc_out;
+
+void main_sdpa_causal_f32() {
+    uint head = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    uint batch = gl_GlobalInvocationID.z;
+    uint seq = args.data.rows;
+    uint heads = args.data.width;
+    uint dim = args.data.input_dim;
+    uint batches = args.data.conv_batch;
+    if (row >= seq || head >= heads || batch >= batches) return;
+    float scale = args.data.left_scale;
+    uint qbase = ((batch * seq + row) * heads + head) * dim;
+    float maxv = -3.402823466e+38f;
+    for (uint s = 0u; s <= row; s++) {
+        uint kbase = ((batch * seq + s) * heads + head) * dim;
+        float dot = 0.0f;
+        for (uint d = 0u; d < dim; d++) {
+            dot = fma(sdpc_q.data[qbase + d], sdpc_k.data[kbase + d], dot);
+        }
+        dot *= scale;
+        maxv = max(maxv, dot);
+    }
+    float sum = 0.0f;
+    for (uint s = 0u; s <= row; s++) {
+        uint kbase = ((batch * seq + s) * heads + head) * dim;
+        float dot = 0.0f;
+        for (uint d = 0u; d < dim; d++) {
+            dot = fma(sdpc_q.data[qbase + d], sdpc_k.data[kbase + d], dot);
+        }
+        sum += exp(dot * scale - maxv);
+    }
+    for (uint d = 0u; d < dim; d++) {
+        float acc = 0.0f;
+        for (uint s = 0u; s <= row; s++) {
+            uint kbase = ((batch * seq + s) * heads + head) * dim;
+            float dot = 0.0f;
+            for (uint k = 0u; k < dim; k++) {
+                dot = fma(sdpc_q.data[qbase + k],
+                          sdpc_k.data[kbase + k], dot);
+            }
+            acc = fma(exp(dot * scale - maxv), sdpc_v.data[kbase + d], acc);
+        }
+        sdpc_out.data[qbase + d] = acc / sum;
+    }
+}
+
+/* ------------------------------------------------------ vision QKV + RoPE */
+
+layout(set = 0, binding = 0) readonly buffer VisIn { uint16_t data[]; } vis_in;
+layout(set = 0, binding = 1) readonly buffer VisCos { uint16_t data[]; } vis_cos;
+layout(set = 0, binding = 2) readonly buffer VisSin { uint16_t data[]; } vis_sin;
+layout(set = 0, binding = 3) writeonly buffer VisQ { uint16_t data[]; } vis_q;
+layout(set = 0, binding = 4) writeonly buffer VisK { uint16_t data[]; } vis_k;
+layout(set = 0, binding = 5) writeonly buffer VisV { uint16_t data[]; } vis_v;
+
+void main_vision_qkv_rope_bf16() {
+    uint dimension = gl_GlobalInvocationID.x;
+    uint head = gl_GlobalInvocationID.y;
+    uint row = gl_GlobalInvocationID.z;
+    uint head_dim = args.data.input_dim;
+    uint heads = args.data.width;
+    uint sequence = args.data.rows;
+    uint half_dim = args.data.output_dim;
+    if (dimension >= head_dim || head >= heads || row >= sequence) return;
+    uint inner = heads * head_dim;
+    uint row_base = row * inner * 3u;
+    uint q_base = row_base + head * head_dim;
+    uint k_base = row_base + inner + head * head_dim;
+    uint v_base = row_base + inner * 2u + head * head_dim;
+    uint rope_index = row * half_dim + dimension % half_dim;
+    float c = H3_BF16_TO_F32(vis_cos.data[rope_index]);
+    float s = H3_BF16_TO_F32(vis_sin.data[rope_index]);
+    uint pair = dimension < half_dim ? dimension + half_dim :
+                                        dimension - half_dim;
+    float q0 = H3_BF16_TO_F32(vis_in.data[q_base + dimension]);
+    float k0 = H3_BF16_TO_F32(vis_in.data[k_base + dimension]);
+    float q1 = H3_BF16_TO_F32(vis_in.data[q_base + pair]);
+    float k1 = H3_BF16_TO_F32(vis_in.data[k_base + pair]);
+    float qr = dimension < half_dim ? q0 * c - q1 * s : q0 * c + q1 * s;
+    float kr = dimension < half_dim ? k0 * c - k1 * s : k0 * c + k1 * s;
+    uint output_index = (row * heads + head) * head_dim + dimension;
+    vis_q.data[output_index] = uint16_t(h3_f32_to_bf16(qr));
+    vis_k.data[output_index] = uint16_t(h3_f32_to_bf16(kr));
+    vis_v.data[output_index] = vis_in.data[v_base + dimension];
+}
+
 /* The runtime compiles one module per kernel with H3_ENTRY selecting the
  * kernel function; glslc testing uses -DH3_ENTRY=main_<kernel>. */
 void main() { H3_ENTRY(); }

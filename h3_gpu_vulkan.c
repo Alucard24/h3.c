@@ -126,6 +126,15 @@ typedef enum {
     H3_VK_KERNEL_VAE_ENCODER_GROUP_NORM_SILU_F32,
     H3_VK_KERNEL_SDPA_F32,
     H3_VK_KERNEL_CONV3D_F32,
+    H3_VK_KERNEL_WEIGHT_NORM_F32,
+    H3_VK_KERNEL_SNAKE1D_F32,
+    H3_VK_KERNEL_ALIAS_FREE_SNAKE_F32,
+    H3_VK_KERNEL_AUDIO_QKV_SPLIT_F32,
+    H3_VK_KERNEL_AUDIO_ATTENTION_POOL_F32,
+    H3_VK_KERNEL_CONV1D_STRIDE_F32,
+    H3_VK_KERNEL_CONV_TRANSPOSE1D_F32,
+    H3_VK_KERNEL_SDPA_CAUSAL_F32,
+    H3_VK_KERNEL_VISION_QKV_ROPE_BF16,
     H3_VK_KERNEL_COUNT
 } h3_vk_kernel;
 
@@ -150,7 +159,12 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_linear_f32", "main_scale_add_f32",
     "main_swiglu_f32", "main_video_qkv_rope_f32",
     "main_vae_encoder_pad_f32", "main_vae_encoder_group_norm_silu_f32",
-    "main_sdpa_f32", "main_conv3d_f32"
+    "main_sdpa_f32", "main_conv3d_f32",
+    "main_weight_norm_f32", "main_snake1d_f32",
+    "main_alias_free_snake_f32", "main_audio_qkv_split_f32",
+    "main_audio_attention_pool_f32", "main_conv1d_stride_f32",
+    "main_conv_transpose1d_f32", "main_sdpa_causal_f32",
+    "main_vision_qkv_rope_bf16"
 };
 
 /* Storage-buffer bindings consumed by each kernel (0..n-1 plus binding 7
@@ -159,14 +173,14 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
     2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2,
-    5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2, 6, 2, 4, 4, 4
+    5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2, 6, 2, 4, 4, 4, 3, 3, 6, 7, 2, 4, 4, 4, 6
 };
 
 /* Workgroup layout per kernel: 0 = 256 threads, 1 = 16x16 tiles,
  * 2 = 128 threads (SDPA flash). */
 static const int h3_vk_kernel_layout[H3_VK_KERNEL_COUNT] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-    0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1, 1, 1, 0, 0, 1
+    0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1
 };
 
 struct h3_gpu {
@@ -2577,8 +2591,9 @@ int h3_gpu_conv1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       uint32_t length, uint32_t input_channels,
                       uint32_t output_channels, uint32_t kernel,
                       uint32_t padding, uint32_t dilation) {
-(void)gpu; (void)output; (void)input; (void)weight; (void)bias; (void)batch; (void)length; (void)input_channels; (void)output_channels; (void)kernel; (void)padding; (void)dilation;
-    return h3_vk_not_ported(gpu, "h3_gpu_conv1d_f32");
+    return h3_gpu_conv1d_stride_f32(gpu, output, input, weight, bias, batch,
+                                    length, input_channels, output_channels,
+                                    kernel, 1, padding, dilation);
 }
 
 int h3_gpu_conv1d_stride_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -2589,8 +2604,43 @@ int h3_gpu_conv1d_stride_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       uint32_t output_channels, uint32_t kernel,
                       uint32_t stride, uint32_t padding,
                       uint32_t dilation) {
-(void)gpu; (void)output; (void)input; (void)weight; (void)bias; (void)batch; (void)length; (void)input_channels; (void)output_channels; (void)kernel; (void)stride; (void)padding; (void)dilation;
-    return h3_vk_not_ported(gpu, "h3_gpu_conv1d_stride_f32");
+    if (!h3_vk_check_tensors(gpu, 3, output, input, weight)) return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    uint64_t effective = (uint64_t)dilation * (kernel - 1) + 1;
+    if (!batch || !length || !input_channels || !output_channels || !kernel ||
+        !stride || !dilation || (uint64_t)length + 2 * padding < effective) {
+        h3_vk_set_error(gpu, "conv1d invalid dimensions");
+        return -1;
+    }
+    uint32_t output_length = (uint32_t)(((uint64_t)length + 2 * padding -
+                                         effective) / stride + 1);
+    size_t input_count = (size_t)batch * length * input_channels;
+    size_t weight_count = (size_t)output_channels * input_channels * kernel;
+    size_t output_count = (size_t)batch * output_length * output_channels;
+    if (input_count > h3_gpu_tensor_elements(input) ||
+        weight_count > h3_gpu_tensor_elements(weight) ||
+        output_count > h3_gpu_tensor_elements(output) ||
+        (bias && output_channels > h3_gpu_tensor_elements(bias))) {
+        h3_vk_set_error(gpu, "conv1d tensor size mismatch");
+        return -1;
+    }
+    gpu->args->conv_batch = batch;
+    gpu->args->conv_depth = length;
+    gpu->args->conv_in_channels = input_channels;
+    gpu->args->conv_out_channels = output_channels;
+    gpu->args->conv_kernel_width = kernel;
+    gpu->args->conv_stride_width = stride;
+    gpu->args->conv_stride_height = padding;
+    gpu->args->conv_stride_depth = dilation;
+    gpu->args->has_bias = bias ? 1u : 0u;
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    const h3_gpu_tensor *tensors[4] = { input, weight, bias_buffer, output };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_CONV1D_STRIDE_F32,
+                                        tensors, 4);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_CONV1D_STRIDE_F32, set,
+                          (output_channels + 15) / 16,
+                          (output_length + 15) / 16, batch);
 }
 
 int h3_gpu_conv_transpose1d_f32(
@@ -2601,16 +2651,65 @@ int h3_gpu_conv_transpose1d_f32(
                       uint32_t length, uint32_t input_channels,
                       uint32_t output_channels, uint32_t kernel,
                       uint32_t stride, uint32_t padding) {
-(void)gpu; (void)output; (void)input; (void)weight; (void)bias; (void)batch; (void)length; (void)input_channels; (void)output_channels; (void)kernel; (void)stride; (void)padding;
-    return h3_vk_not_ported(gpu, "h3_gpu_conv_transpose1d_f32");
+    if (!h3_vk_check_tensors(gpu, 3, output, input, weight)) return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    if (!batch || !length || !input_channels || !output_channels || !kernel ||
+        !stride || (uint64_t)(length - 1) * stride + kernel < 2 * padding) {
+        h3_vk_set_error(gpu, "conv-transpose1d invalid dimensions");
+        return -1;
+    }
+    uint32_t output_length = (uint32_t)((uint64_t)(length - 1) * stride +
+                                        kernel - 2 * padding);
+    size_t input_count = (size_t)batch * length * input_channels;
+    size_t weight_count = (size_t)input_channels * output_channels * kernel;
+    size_t output_count = (size_t)batch * output_length * output_channels;
+    if (input_count > h3_gpu_tensor_elements(input) ||
+        weight_count > h3_gpu_tensor_elements(weight) ||
+        output_count > h3_gpu_tensor_elements(output) ||
+        (bias && output_channels > h3_gpu_tensor_elements(bias))) {
+        h3_vk_set_error(gpu, "conv-transpose1d tensor size mismatch");
+        return -1;
+    }
+    gpu->args->conv_batch = batch;
+    gpu->args->conv_depth = length;
+    gpu->args->conv_in_channels = input_channels;
+    gpu->args->conv_out_channels = output_channels;
+    gpu->args->conv_kernel_width = kernel;
+    gpu->args->conv_stride_width = stride;
+    gpu->args->conv_stride_height = padding;
+    gpu->args->has_bias = bias ? 1u : 0u;
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    const h3_gpu_tensor *tensors[4] = { input, weight, bias_buffer, output };
+    VkDescriptorSet set = h3_vk_prepare(gpu,
+                                        H3_VK_KERNEL_CONV_TRANSPOSE1D_F32,
+                                        tensors, 4);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_CONV_TRANSPOSE1D_F32, set,
+                          (output_channels + 15) / 16,
+                          (output_length + 15) / 16, batch);
 }
 
 int h3_gpu_weight_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *vector,
                            const h3_gpu_tensor *magnitude,
                            uint32_t outer, uint32_t inner) {
-(void)gpu; (void)output; (void)vector; (void)magnitude; (void)outer; (void)inner;
-    return h3_vk_not_ported(gpu, "h3_gpu_weight_norm_f32");
+    if (!h3_vk_check_tensors(gpu, 3, output, vector, magnitude)) return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    if ((size_t)outer * inner > h3_gpu_tensor_elements(vector) ||
+        outer > h3_gpu_tensor_elements(magnitude) ||
+        (size_t)outer * inner > h3_gpu_tensor_elements(output)) {
+        h3_vk_set_error(gpu, "weight-norm tensor size mismatch");
+        return -1;
+    }
+    gpu->args->rows = outer;
+    gpu->args->width = inner;
+    const h3_gpu_tensor *tensors[3] = { vector, magnitude, output };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_WEIGHT_NORM_F32,
+                                        tensors, 3);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_WEIGHT_NORM_F32, set,
+                          (outer + H3_VK_THREADS - 1) / H3_VK_THREADS,
+                          1, 1);
 }
 
 int h3_gpu_alias_free_snake_f32(
@@ -2622,16 +2721,56 @@ int h3_gpu_alias_free_snake_f32(
                           const h3_gpu_tensor *downsample_filter,
                           uint32_t batch, uint32_t length,
                           uint32_t channels) {
-(void)gpu; (void)output; (void)input; (void)alpha_log; (void)beta_log; (void)upsample_filter; (void)downsample_filter; (void)batch; (void)length; (void)channels;
-    return h3_vk_not_ported(gpu, "h3_gpu_alias_free_snake_f32");
+    if (!h3_vk_check_tensors(gpu, 6, output, input, alpha_log, beta_log,
+                             upsample_filter, downsample_filter))
+        return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    size_t count = (size_t)batch * length * channels;
+    if (count > h3_gpu_tensor_elements(input) ||
+        channels > h3_gpu_tensor_elements(alpha_log) ||
+        channels > h3_gpu_tensor_elements(beta_log) ||
+        12 > h3_gpu_tensor_elements(upsample_filter) ||
+        12 > h3_gpu_tensor_elements(downsample_filter) ||
+        count > h3_gpu_tensor_elements(output)) {
+        h3_vk_set_error(gpu, "alias-free snake tensor size mismatch");
+        return -1;
+    }
+    gpu->args->conv_batch = batch;
+    gpu->args->conv_depth = length;
+    gpu->args->conv_in_channels = channels;
+    const h3_gpu_tensor *tensors[6] = { input, alpha_log, beta_log,
+                                        upsample_filter, downsample_filter,
+                                        output };
+    VkDescriptorSet set = h3_vk_prepare(gpu,
+                                        H3_VK_KERNEL_ALIAS_FREE_SNAKE_F32,
+                                        tensors, 6);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_ALIAS_FREE_SNAKE_F32, set,
+                          (channels + 15) / 16, (length + 15) / 16, batch);
 }
 
 int h3_gpu_snake1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *input,
                        const h3_gpu_tensor *alpha, uint32_t batch,
                        uint32_t length, uint32_t channels) {
-(void)gpu; (void)output; (void)input; (void)alpha; (void)batch; (void)length; (void)channels;
-    return h3_vk_not_ported(gpu, "h3_gpu_snake1d_f32");
+    if (!h3_vk_check_tensors(gpu, 3, output, input, alpha)) return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    size_t count = (size_t)batch * length * channels;
+    if (count > h3_gpu_tensor_elements(input) ||
+        channels > h3_gpu_tensor_elements(alpha) ||
+        count > h3_gpu_tensor_elements(output)) {
+        h3_vk_set_error(gpu, "snake1d tensor size mismatch");
+        return -1;
+    }
+    gpu->args->elements = (uint32_t)count;
+    gpu->args->conv_in_channels = channels;
+    const h3_gpu_tensor *tensors[3] = { input, alpha, output };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_SNAKE1D_F32,
+                                        tensors, 3);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_SNAKE1D_F32, set,
+                          (uint32_t)((count + H3_VK_THREADS - 1) /
+                                     H3_VK_THREADS), 1, 1);
 }
 
 int h3_gpu_audio_qkv_split_f32(h3_gpu *gpu,
@@ -2642,8 +2781,33 @@ int h3_gpu_audio_qkv_split_f32(h3_gpu *gpu,
                        const h3_gpu_tensor *v_bias, uint32_t batch,
                        uint32_t length, uint32_t heads,
                        uint32_t head_dim) {
-(void)gpu; (void)query; (void)key; (void)value; (void)qkv; (void)q_bias; (void)k_bias; (void)v_bias; (void)batch; (void)length; (void)heads; (void)head_dim;
-    return h3_vk_not_ported(gpu, "h3_gpu_audio_qkv_split_f32");
+    if (!h3_vk_check_tensors(gpu, 7, query, key, value, qkv, q_bias, k_bias,
+                             v_bias))
+        return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    size_t width = (size_t)heads * head_dim;
+    size_t count = (size_t)batch * length * width;
+    if (count * 3 > h3_gpu_tensor_elements(qkv) ||
+        width > h3_gpu_tensor_elements(q_bias) ||
+        width > h3_gpu_tensor_elements(k_bias) ||
+        width > h3_gpu_tensor_elements(v_bias) ||
+        count > h3_gpu_tensor_elements(query) ||
+        count > h3_gpu_tensor_elements(key) ||
+        count > h3_gpu_tensor_elements(value)) {
+        h3_vk_set_error(gpu, "audio qkv split tensor size mismatch");
+        return -1;
+    }
+    gpu->args->elements = (uint32_t)count;
+    gpu->args->conv_width = heads;
+    gpu->args->conv_height = head_dim;
+    const h3_gpu_tensor *tensors[7] = { qkv, q_bias, k_bias, v_bias,
+                                        query, key, value };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_AUDIO_QKV_SPLIT_F32,
+                                        tensors, 7);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_AUDIO_QKV_SPLIT_F32, set,
+                          (uint32_t)((count + H3_VK_THREADS - 1) /
+                                     H3_VK_THREADS), 1, 1);
 }
 
 int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -2652,8 +2816,27 @@ int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *value, uint32_t batch,
                        uint32_t sequence, uint32_t heads,
                        uint32_t head_dim, float scale) {
-(void)gpu; (void)output; (void)query; (void)key; (void)value; (void)batch; (void)sequence; (void)heads; (void)head_dim; (void)scale;
-    return h3_vk_not_ported(gpu, "h3_gpu_sdpa_causal_f32");
+    if (!h3_vk_check_tensors(gpu, 4, output, query, key, value)) return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    size_t count = (size_t)batch * sequence * heads * head_dim;
+    if (count > h3_gpu_tensor_elements(query) ||
+        count > h3_gpu_tensor_elements(key) ||
+        count > h3_gpu_tensor_elements(value) ||
+        count > h3_gpu_tensor_elements(output)) {
+        h3_vk_set_error(gpu, "causal sdpa tensor size mismatch");
+        return -1;
+    }
+    gpu->args->rows = sequence;
+    gpu->args->width = heads;
+    gpu->args->input_dim = head_dim;
+    gpu->args->left_scale = scale;
+    gpu->args->conv_batch = batch;
+    const h3_gpu_tensor *tensors[4] = { query, key, value, output };
+    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_SDPA_CAUSAL_F32,
+                                        tensors, 4);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_SDPA_CAUSAL_F32, set, heads,
+                          sequence, batch);
 }
 
 int h3_gpu_audio_attention_pool_f32(h3_gpu *gpu,
@@ -2661,8 +2844,30 @@ int h3_gpu_audio_attention_pool_f32(h3_gpu *gpu,
                        const h3_gpu_tensor *attended, uint32_t batch,
                        uint32_t length, uint32_t heads,
                        uint32_t head_dim, uint32_t output_dim) {
-(void)gpu; (void)output; (void)attended; (void)batch; (void)length; (void)heads; (void)head_dim; (void)output_dim;
-    return h3_vk_not_ported(gpu, "h3_gpu_audio_attention_pool_f32");
+    if (!h3_vk_check_tensors(gpu, 2, output, attended)) return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    if (!output_dim || head_dim % output_dim) {
+        h3_vk_set_error(gpu, "audio pool invalid dimensions");
+        return -1;
+    }
+    size_t count = (size_t)batch * length * output_dim;
+    if ((size_t)batch * length * heads * head_dim >
+            h3_gpu_tensor_elements(attended) ||
+        count > h3_gpu_tensor_elements(output)) {
+        h3_vk_set_error(gpu, "audio pool tensor size mismatch");
+        return -1;
+    }
+    gpu->args->elements = (uint32_t)count;
+    gpu->args->conv_width = heads;
+    gpu->args->conv_height = head_dim;
+    gpu->args->conv_in_channels = output_dim;
+    const h3_gpu_tensor *tensors[2] = { attended, output };
+    VkDescriptorSet set = h3_vk_prepare(
+        gpu, H3_VK_KERNEL_AUDIO_ATTENTION_POOL_F32, tensors, 2);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_AUDIO_ATTENTION_POOL_F32, set,
+                          (uint32_t)((count + H3_VK_THREADS - 1) /
+                                     H3_VK_THREADS), 1, 1);
 }
 
 int h3_gpu_vae_encoder_pad_f32(
@@ -2914,8 +3119,35 @@ int h3_gpu_vision_qkv_rope_bf16(
                      const h3_gpu_tensor *rope_sin, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim,
                      uint32_t rope_half) {
-(void)gpu; (void)query; (void)key; (void)value; (void)qkv; (void)rope_cos; (void)rope_sin; (void)sequence; (void)heads; (void)head_dim; (void)rope_half;
-    return h3_vk_not_ported(gpu, "h3_gpu_vision_qkv_rope_bf16");
+    if (!h3_vk_check_tensors(gpu, 6, query, key, value, qkv, rope_cos,
+                             rope_sin))
+        return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    size_t inner = (size_t)heads * head_dim;
+    size_t count = (size_t)sequence * inner;
+    size_t rope_count = (size_t)sequence * rope_half;
+    if (count * 3 > h3_gpu_tensor_elements(qkv) ||
+        rope_count > h3_gpu_tensor_elements(rope_cos) ||
+        rope_count > h3_gpu_tensor_elements(rope_sin) ||
+        count > h3_gpu_tensor_elements(query) ||
+        count > h3_gpu_tensor_elements(key) ||
+        count > h3_gpu_tensor_elements(value)) {
+        h3_vk_set_error(gpu, "vision qkv rope tensor size mismatch");
+        return -1;
+    }
+    gpu->args->rows = sequence;
+    gpu->args->width = heads;
+    gpu->args->input_dim = head_dim;
+    gpu->args->output_dim = rope_half;
+    const h3_gpu_tensor *tensors[6] = { qkv, rope_cos, rope_sin, query,
+                                        key, value };
+    VkDescriptorSet set = h3_vk_prepare(gpu,
+                                        H3_VK_KERNEL_VISION_QKV_ROPE_BF16,
+                                        tensors, 6);
+    if (set == VK_NULL_HANDLE) return -1;
+    return h3_vk_dispatch(gpu, H3_VK_KERNEL_VISION_QKV_ROPE_BF16, set,
+                          (head_dim + 15) / 16, (heads + 15) / 16,
+                          sequence);
 }
 
 int h3_gpu_gate_adaln_quantize_int8(

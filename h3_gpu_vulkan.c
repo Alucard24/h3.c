@@ -2632,8 +2632,48 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                         const h3_gpu_tensor *fc2_weight, uint32_t rows,
                         uint32_t input_dim, uint32_t hidden_dim,
                         uint32_t output_dim) {
-(void)gpu; (void)output; (void)activated; (void)input; (void)fc1_weight; (void)fc2_weight; (void)rows; (void)input_dim; (void)hidden_dim; (void)output_dim;
-    return h3_vk_not_ported(gpu, "h3_gpu_mlp_nax_bf16");
+    /* The Metal NAX path is a tensor-ops matmul (Apple-only); Vulkan uses
+     * the same fused fc1 -> SwiGLU -> fc2 contract as h3_gpu_mlp_bf16,
+     * writing through the caller-provided activated scratch when usable. */
+    if (!h3_vk_check_tensors(gpu, 4, output, input, fc1_weight, fc2_weight))
+        return -1;
+    if (!h3_vk_require_command(gpu)) return -1;
+    h3_gpu_tensor *fc1 = h3_gpu_tensor_new_bf16(gpu,
+                                                (size_t)rows * hidden_dim * 2);
+    h3_gpu_tensor *scratch = activated;
+    int own_scratch = 0;
+    if (!scratch || h3_gpu_tensor_elements(scratch) <
+                        (size_t)rows * hidden_dim) {
+        scratch = h3_gpu_tensor_new_bf16(gpu, (size_t)rows * hidden_dim);
+        own_scratch = 1;
+    }
+    if (!fc1 || !scratch) {
+        h3_gpu_tensor_free(fc1);
+        if (own_scratch) h3_gpu_tensor_free(scratch);
+        h3_vk_set_error(gpu, "NAX MLP scratch allocation failed");
+        return -1;
+    }
+    int ok = -1;
+    if (h3_vk_linear(gpu, fc1, input, fc1_weight, NULL, rows, input_dim,
+                     hidden_dim * 2) == 0) {
+        gpu->args->elements = (size_t)rows * hidden_dim;
+        gpu->args->width = hidden_dim;
+        const h3_gpu_tensor *tensors[2] = { fc1, scratch };
+        VkDescriptorSet set = h3_vk_prepare(gpu,
+                                            H3_VK_KERNEL_SWIGLU_HALVES_BF16,
+                                            tensors, 2);
+        if (set != VK_NULL_HANDLE &&
+            h3_vk_dispatch(gpu, H3_VK_KERNEL_SWIGLU_HALVES_BF16, set,
+                           (uint32_t)(((uint64_t)rows * hidden_dim +
+                                       H3_VK_THREADS - 1) / H3_VK_THREADS),
+                           1, 1) == 0 &&
+            h3_vk_linear(gpu, output, scratch, fc2_weight, NULL, rows,
+                         hidden_dim, output_dim) == 0)
+            ok = 0;
+    }
+    h3_gpu_tensor_free(fc1);
+    if (own_scratch) h3_gpu_tensor_free(scratch);
+    return ok;
 }
 
 int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -2735,8 +2775,15 @@ int h3_gpu_grouped_qkv_linear_rope_bf16(
                                  uint32_t rows, uint32_t input_dim,
                                  uint32_t heads, uint32_t head_dim,
                                  uint32_t rope_half, float epsilon) {
-(void)gpu; (void)query; (void)key; (void)value; (void)qkv; (void)input; (void)weight; (void)q_norm; (void)k_norm; (void)rope_cos; (void)rope_sin; (void)rows; (void)input_dim; (void)heads; (void)head_dim; (void)rope_half; (void)epsilon;
-    return h3_vk_not_ported(gpu, "h3_gpu_grouped_qkv_linear_rope_bf16");
+    /* Vulkan has no tensor-ops matmul; use the Metal fallback path:
+     * plain BF16 projection followed by the grouped norm/RoPE kernel. */
+    uint32_t inner = heads * head_dim;
+    if (h3_gpu_linear_bf16(gpu, qkv, input, weight, NULL, rows, input_dim,
+                           inner * 3) != 0)
+        return -1;
+    return h3_gpu_grouped_qkv_rope_bf16(gpu, query, key, value, qkv, q_norm,
+                                        k_norm, rope_cos, rope_sin, rows,
+                                        heads, head_dim, rope_half, epsilon);
 }
 
 int h3_gpu_grouped_qkv_linear_rope_int8(

@@ -76,6 +76,9 @@ h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
 h3_vulkan_kernels_test: tests/test_vulkan_kernels.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_vulkan_dit_block_test: tests/test_vulkan_dit_block.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -130,9 +133,10 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 
 ifeq ($(UNAME_S),Linux)
 # Host-only build: deterministic CPU suite until a GPU backend lands.
-test: h3_tests h3_vulkan_kernels_test
+test: h3_tests h3_vulkan_kernels_test h3_vulkan_dit_block_test
 	./h3_tests
 	./h3_vulkan_kernels_test
+	./h3_vulkan_dit_block_test
 
 parity:
 	@echo "parity requires the macOS Metal backend (run on an Apple Silicon Mac)"

@@ -485,9 +485,17 @@ linear/int8 kernels.
 
 ```sh
 make -j8
-make test   # host suite + Vulkan kernel parity tests
+make test   # host suite + Vulkan kernel parity + full DiT block test
 H3_VK_VALIDATION=1 ./h3_vulkan_kernels_test   # with validation layers
 ```
+
+`h3_vulkan_dit_block_test` runs the complete portable DiT block (modulation
+linear, AdaLN, QKV projection, grouped QKV/RoPE, SDPA, attention output,
+gate, MLP AdaLN, fused fc1/SwiGLU/fc2, gate) at production shapes
+(sequence 8, hidden 5376, 56 heads, FFN 14336) with synthetic weights,
+verified against a CPU reference with the same arithmetic order: the
+modulated attention lands within 1 BF16 ulp and the final hidden within
+0.5% relative max.
 
 ## Implementation and performance notes
 

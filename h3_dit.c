@@ -1956,6 +1956,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
            "DiT attention output");
     }
     int fused_int8_mlp_input = dit->int8_mlp &&
+        !getenv("H3_DISABLE_INT8_MLP") &&
         !dit->use_slower_unfused_int8_inputs &&
         !getenv("H3_DISABLE_FUSED_INT8_MLP_INPUT") &&
         !getenv("H3_INT8_MLP_STAGE");

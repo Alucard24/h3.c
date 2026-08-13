@@ -142,6 +142,7 @@ typedef enum {
     H3_VK_KERNEL_GATE_ADALN_QUANTIZE_INT8,
     H3_VK_KERNEL_QUANTIZE_ROWS_GROUPS_BF16_I8,
     H3_VK_KERNEL_LINEAR_INT8_GROUPED_BF16,
+    H3_VK_KERNEL_QUANTIZE_HEAD_MAJOR_ROWS_BF16_I8,
     H3_VK_KERNEL_COUNT
 } h3_vk_kernel;
 
@@ -206,7 +207,8 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_fc1_swiglu_int8_bf16",
     "main_gate_adaln_quantize_int8",
     "main_quantize_rows_groups_bf16_i8",
-    "main_linear_int8_grouped_bf16"
+    "main_linear_int8_grouped_bf16",
+    "main_quantize_head_major_rows_bf16_i8"
 };
 
 /* Storage-buffer bindings consumed by each kernel (0..n-1 plus binding 7
@@ -214,13 +216,13 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
 /* Highest storage-buffer binding used by each kernel plus one (bindings
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
-    2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2, 5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2, 6, 2, 4, 4, 4, 4, 3, 3, 6, 7, 2, 4, 4, 4, 6, 3, 5, 5, 9, 3, 5
+    2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2, 5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2, 6, 2, 4, 4, 4, 4, 3, 3, 6, 7, 2, 4, 4, 4, 6, 3, 5, 5, 9, 3, 5, 3
 };
 
 /* Workgroup layout per kernel: 0 = 256 threads, 1 = 16x16 tiles,
  * 2 = 128 threads (SDPA flash). */
 static const int h3_vk_kernel_layout[H3_VK_KERNEL_COUNT] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1, 1, 1, 0, 0, 2, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1, 1, 1, 0, 0, 2, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0
 };
 
 struct h3_gpu {
@@ -3183,11 +3185,53 @@ int h3_gpu_linear_int8_head_major_bf16(
                             const h3_gpu_tensor *weight_scales,
                             uint32_t rows, uint32_t heads,
                             uint32_t head_dim, uint32_t output_dim) {
-    /* The Metal tensor-op path reorganizes the input per head; the plain
-     * row layout is mathematically identical, so delegate to it. */
-    return h3_gpu_linear_int8_bf16(gpu, output, quantized_input, input_scales,
-                                   input, weight, weight_scales, rows,
-                                   heads * head_dim, output_dim, 0);
+    if (!h3_vk_check_tensors(gpu, 4, output, quantized_input, input_scales,
+                             input) ||
+        !h3_vk_check_tensors(gpu, 3, output, weight, weight_scales))
+        return 0;
+    if (!h3_vk_require_command(gpu)) return 0;
+    if (!heads || !head_dim || head_dim > UINT32_MAX / heads) {
+        h3_vk_set_error(gpu, "head-major int8 linear invalid dimensions");
+        return 0;
+    }
+    uint32_t input_dim = heads * head_dim;
+    if ((size_t)rows * input_dim > h3_gpu_tensor_elements(input) ||
+        (size_t)rows * input_dim > h3_gpu_tensor_elements(quantized_input) ||
+        rows > h3_gpu_tensor_elements(input_scales) ||
+        (size_t)output_dim * input_dim > h3_gpu_tensor_elements(weight) ||
+        output_dim > h3_gpu_tensor_elements(weight_scales) ||
+        (size_t)rows * output_dim > h3_gpu_tensor_elements(output)) {
+        h3_vk_set_error(gpu, "head-major int8 linear tensor size mismatch");
+        return 0;
+    }
+    /* SDPA stores [head,row,dimension]. Gather and quantize directly into
+     * the row-major activation consumed by the projection. */
+    gpu->args->rows = rows;
+    gpu->args->width = heads;
+    gpu->args->input_dim = head_dim;
+    gpu->args->left_scale = 1.0f;
+    {
+        const h3_gpu_tensor *q[3] = { input, quantized_input, input_scales };
+        VkDescriptorSet set = h3_vk_prepare(
+            gpu, H3_VK_KERNEL_QUANTIZE_HEAD_MAJOR_ROWS_BF16_I8, q, 3);
+        if (set == VK_NULL_HANDLE) return 0;
+        if (h3_vk_dispatch(
+                gpu, H3_VK_KERNEL_QUANTIZE_HEAD_MAJOR_ROWS_BF16_I8, set,
+                rows, 1, 1) == 0)
+            return 0;
+    }
+    gpu->args->rows = rows;
+    gpu->args->input_dim = input_dim;
+    gpu->args->output_dim = output_dim;
+    {
+        const h3_gpu_tensor *l[5] = { quantized_input, weight, input_scales,
+                                      weight_scales, output };
+        VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16,
+                                            l, 5);
+        if (set == VK_NULL_HANDLE) return 0;
+        return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
+                              (output_dim + 15) / 16, (rows + 15) / 16, 1);
+    }
 }
 
 int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

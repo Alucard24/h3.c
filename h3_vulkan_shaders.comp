@@ -2083,6 +2083,46 @@ void main_quantize_rows_bf16_i8() {
     }
 }
 
+/* Gather SDPA's [head,row,dimension] output while quantizing directly to the
+ * [row,head*dimension] layout consumed by the projection. */
+void main_quantize_head_major_rows_bf16_i8() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint heads = args.data.width;
+    uint head_dim = args.data.input_dim;
+    uint columns = heads * head_dim;
+    uint output_base = row * columns;
+    float local_max = 0.0f;
+    for (uint column = tid; column < columns; column += 256u) {
+        uint head = column / head_dim;
+        uint dimension = column - head * head_dim;
+        uint source = (head * args.data.rows + row) * head_dim + dimension;
+        local_max = max(local_max,
+                        abs(H3_BF16_TO_F32(q_in.data[source])));
+    }
+    q_reductions[tid] = local_max;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) q_reductions[tid] = max(q_reductions[tid],
+                                                  q_reductions[tid + stride]);
+        barrier();
+    }
+    float max_abs = q_reductions[0];
+    float clipped_max = max_abs * args.data.left_scale;
+    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    if (tid == 0u) q_scales.data[row] = scale;
+    for (uint column = tid; column < columns; column += 256u) {
+        uint head = column / head_dim;
+        uint dimension = column - head * head_dim;
+        uint source = (head * args.data.rows + row) * head_dim + dimension;
+        int quantized = int(roundEven(H3_BF16_TO_F32(q_in.data[source]) *
+                                      inverse));
+        q_out.data[output_base + column] =
+            int8_t(clamp(quantized, -127, 127));
+    }
+}
+
 /* int8 matmul: acc = sum(q_in * w) in int32, out = bf16(acc * in_s * w_s). */
 
 
@@ -2196,7 +2236,10 @@ void main_fc1_swiglu_int8_bf16() {
     }
     if (row < args.data.rows && column < hidden) {
         float input_scale = l8_is.data[row];
-        float gate = float(acc_gate) * input_scale * l8_ws.data[column];
+        /* Metal materializes the gate cooperative fragment in BF16 before
+         * applying SiLU; the up fragment remains F32 until the final product. */
+        float gate = H3_BF16_TO_F32(h3_f32_to_bf16(
+            float(acc_gate) * input_scale * l8_ws.data[column]));
         float up = float(acc_up) * input_scale * l8_ws.data[hidden + column];
         l8_out.data[row * hidden + column] = uint16_t(h3_f32_to_bf16(
             gate / (1.0f + exp(-gate)) * up));

@@ -509,10 +509,10 @@ modulated attention lands within 1 BF16 ulp and the final hidden within
 
 ## End-to-end on Linux (Vulkan)
 
-All 54 kernels on the video-generation path are ported (DiT BF16 native,
+All kernels on the video-generation path are ported (DiT BF16 native,
 Qwen3 text encoder, video/audio VAE, video condition encoder, vision
-encoder, and the full int8 quantization mode); only three unused f32
-variants remain stubbed. To run the real checkpoint:
+encoder, and the full int8 quantization mode); only unused f32 variants
+remain stubbed. To run the real checkpoint:
 
 ```sh
 make model          # downloads MiniMax-H3 FL2VA (~134 GiB) via huggingface_hub
@@ -529,15 +529,22 @@ skip the model-dependent targets when the checkpoint is absent.
 
 ### Int8 quantization on Vulkan
 
-As on M5, the int8 mode is now the default: the DiT quantizes each block's
-MLP weights at load time (always), and the QKV projection and
-attention-output projection at sequence >= 128. The BF16 weights are
-released after quantization, so the resident transformer storage drops by
-roughly 2x. All int8 kernels are scalar and deterministic (no TensorOps
-hardware): per-row activation quantization (`max/127`, round-to-nearest-
-even, clamp to [-127, 127]), int32 accumulation, and per-output-column
-weight scales; the sensitive FC2 input gets one scale per row rather than
-per 1,024 channels.
+As on M5, the int8 mode is the default: the DiT quantizes each block's MLP
+weights at load time (always), and the QKV and attention-output projections at
+sequence >= 128. The BF16 weights are released after quantization, reducing
+resident transformer storage by roughly 2x. Vulkan dynamically quantizes FC1,
+QKV, and attention inputs per row (`max/127`, round-to-nearest-even, clamp to
+`[-127, 127]`) and uses exact int32 accumulation with one weight scale per
+output channel. The default FC2 path is more conservative: it quantizes the
+SwiGLU activation independently in 1,024-channel groups and dequantizes each
+partial product before the final BF16 rounding. The optional row-FC2 path uses
+one scale across the complete activation row.
+
+The current Vulkan int8 kernels use portable scalar integer products inside
+16x16 tiles; they do not yet use NVIDIA integer dot-product instructions.
+Consequently, int8 is primarily a **memory-capacity path** on NVIDIA, not the
+fastest arithmetic path. Resident BF16 projections can be faster when they fit
+in VRAM. This differs from M5 Metal, where native TensorOps make int8 faster.
 
 | Control | Effect |
 |---|---|
@@ -545,17 +552,59 @@ per 1,024 channels.
 | `--use-slower-bf16-mlp` | keep the fused BF16 fc1/SwiGLU/fc2 path |
 | `--use-slower-bf16-qkv` | keep the close-reference BF16 QKV projection |
 | `--use-slower-bf16-attention-output` | keep the BF16 attention-output projection |
-| `--use-int8-row-fc2` | one FC2 activation scale per row (less conservative, ~2.6% faster) |
+| `--use-int8-row-fc2` | one FC2 activation scale per row instead of per 1,024 channels |
 | `--ssd-streaming` | BF16 layers stream from SSD; int8 is disabled (cannot combine with `--use-int8-row-fc2`) |
 | `H3_DISABLE_INT8_QKV=1` | force the BF16 QKV path at runtime |
-| `H3_INT8_MLP_STAGE=fc1` / `fc2` / `bf16` | int8/bf16 A-B split for the MLP |
-| `H3_INT8_KEEP_BF16_MLP=1` (or `_QKV`, `_ATTENTION_OUT`) | retain both weight copies for A/B diagnosis |
+| `H3_INT8_MLP_STAGE=fc1` / `fc2` / `bf16` | int8/BF16 A-B split for the MLP |
+| `H3_INT8_KEEP_BF16_MLP=1` (or `_QKV`, `_ATTENTION_OUT`) | retain both weight copies for A-B diagnosis |
 
-Runtime weight quantization adds startup time. To compare the two paths on
-one render, run `make smoke` with the defaults and again with
-`--use-slower-bf16-mlp --use-slower-bf16-qkv --use-slower-bf16-attention-output`;
-the quantized path can change small edge and fur details (as on Metal) but
-keeps subject, composition, and motion.
+#### Vulkan mixed-precision benchmark and recommendation
+
+The following single-run comparison used an RTX 5070 Ti 16 GB (driver
+610.57.04), seed 42, 256x256 output, 8 requested frames, 5 denoising steps,
+`--reuse 3`, and 35 active layers. Wall time includes model loading, runtime
+weight quantization, encoders, denoising, decoders, and FFmpeg. Fidelity was
+measured on decoded RGB frames against the same-seed all-BF16
+`--ssd-streaming` render; higher PSNR and lower relative L2 are better.
+
+| Resident projection mix | Extra CLI flags | Wall time | vs default | PSNR vs BF16 | RGB relative L2 |
+|---|---|---:|---:|---:|---:|
+| all int8 (default) | none | 354 s | baseline | 18.58 dB | 0.1763 |
+| **QKV BF16, rest int8** | `--use-slower-bf16-qkv` | **328 s** | **7.3% faster** | **23.01 dB** | **0.1058** |
+| attention output BF16, rest int8 | `--use-slower-bf16-attention-output` | 331 s | 6.5% faster | 20.45 dB | 0.1420 |
+| QKV + attention output BF16, MLP int8 | both flags above | 308 s | 13.0% faster | 20.94 dB | 0.1342 |
+
+For this Vulkan backend, **QKV BF16 with int8 MLP and int8 attention output is
+the recommended quality/performance compromise**. QKV errors enter the
+attention softmax and had the largest effect on final-frame fidelity; keeping
+only QKV in BF16 reduced decoded-frame relative L2 by about 40% while also
+shortening this end-to-end run. The two-BF16-projection result was faster but
+not closer on this seed because iterative denoising is nonlinear, so fidelity
+is not guaranteed to improve monotonically as individual projections change.
+Validate additional seeds before changing a production preset.
+
+```sh
+./h3 -d MiniMax-H3 -p "A red fox walking through snow" \
+  --use-slower-bf16-qkv -o outputs/fox-vulkan-mixed.mp4
+```
+
+The tradeoff is resident weight storage. Replacing int8 weights with BF16 adds
+approximately the following capacity (scale arrays are negligible):
+
+| BF16 projection | 35 layers | 50 layers |
+|---|---:|---:|
+| QKV | +3.77 GiB | +5.38 GiB |
+| attention output | +1.26 GiB | +1.79 GiB |
+| QKV + attention output | +5.02 GiB | +7.18 GiB |
+| MLP | +7.54 GiB | +10.77 GiB |
+
+The recommended QKV-BF16 configuration completed the 35-layer test on the
+16 GB card. Larger resolutions, longer sequences, or 50 resident layers may
+require returning QKV to int8 or using all-BF16 `--ssd-streaming`. Runtime
+weight quantization also adds startup time. For an all-int8/all-BF16 A-B, run
+the same seed with the defaults and then with `--ssd-streaming`, which disables
+all three int8 projection paths; quantization can change fine details even
+after layout and scaling are correct.
 
 ## Implementation and performance notes
 

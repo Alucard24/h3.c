@@ -7,6 +7,10 @@ NVCC ?= $(shell command -v nvcc 2>/dev/null || \
 CUDA_HOME ?= $(patsubst %/bin/nvcc,%,$(NVCC))
 CUDA_ARCH ?= native
 NVCCFLAGS ?= -std=c++17 -O3 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+CUDNN ?= $(shell { test -f /usr/include/cudnn.h || \
+	test -f "$(CUDA_HOME)/include/cudnn.h"; } && \
+	{ ldconfig -p 2>/dev/null | grep -q 'libcudnn\.so' || \
+	test -f "$(CUDA_HOME)/lib64/libcudnn.so"; } && echo 1)
 
 # Feature-test macros expose POSIX functions (strdup, setenv, mkdtemp) under
 # strict -std=c11 on both platforms.
@@ -25,8 +29,8 @@ CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 LDLIBS := -lm
 endif
 
-LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c
+LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_int8_cache.c \
+	h3_schedule_cache.c h3_text_encoder.c h3_dit_schedule.c h3_dit.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
@@ -46,10 +50,16 @@ ifeq ($(strip $(NVCC)),)
 $(error GPU=cuda requested but nvcc was not found)
 endif
 GPU_STUB := h3_gpu_cuda.c h3_metal_stub.c
-GPU_EXTRA_OBJ := h3_cuda_kernels.o
+GPU_EXTRA_OBJ := h3_cuda_kernels.o h3_cuda_accel.o
 SHADER_SOURCE := h3_cuda_kernels.cu
 CFLAGS += -I$(CUDA_HOME)/include -DH3_HAVE_CUDA
-LDLIBS += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
+LDLIBS += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 \
+	-lcublasLt -lcudart -lstdc++
+ifeq ($(CUDNN),1)
+CFLAGS += -DH3_HAVE_CUDNN
+NVCCFLAGS += -DH3_HAVE_CUDNN
+LDLIBS += -lcudnn
+endif
 else ifeq ($(GPU),stub)
 GPU_STUB := h3_gpu_stub.c h3_metal_stub.c
 SHADER_SOURCE := h3_shaders.metal
@@ -71,7 +81,7 @@ LIB_M :=
 endif
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o) $(GPU_STUB:.c=.o) $(GPU_EXTRA_OBJ)
 CLI_OBJ := main.o h3_cli.o linenoise.o
-BUILD_CONFIG := .build-config-$(UNAME_S)-$(GPU)
+BUILD_CONFIG := .build-config-$(UNAME_S)-$(GPU)-$(CUDNN)
 
 .PHONY: all test parity real-parity clean
 

@@ -343,8 +343,8 @@ prompt, seed, resolution, frame count, and step count.
   `--show` previews are not written there.
 - `-o ''` disables MP4 encoding; combine it with `--frames-dir` when FFmpeg is
   unavailable.
-- `--profile` reports phase wall time, Metal encoding/wait time, peak live
-  tensor storage, cumulative allocation, and dispatch counts.
+- `--profile` reports phase wall/GPU time, backend encoding/wait time, peak
+  live tensor storage, cumulative allocation, and dispatch counts.
 
 For example:
 
@@ -527,9 +527,9 @@ make real-parity    # real-checkpoint tests (needs the MLX fixtures under
                     # misc/fixtures/, generated on macOS)
 ```
 
-The real-* integration tests are backend-agnostic: they pick the shader
-source through `H3_SHADER_SOURCE` (Metal by default, Vulkan on Linux) and
-skip the model-dependent targets when the checkpoint is absent.
+The real-* integration tests are backend-agnostic: they pick the kernel
+source through `H3_SHADER_SOURCE` (Metal by default, Vulkan or CUDA on Linux)
+and skip the model-dependent targets when the checkpoint is absent.
 
 ### Int8 quantization on Vulkan
 
@@ -625,40 +625,85 @@ The build searches `PATH` and `/opt/cuda/bin` for `nvcc`. `CUDA_HOME` may point
 to another toolkit, `CUDA_ARCH` overrides nvcc's default `native` target (for
 example `CUDA_ARCH=sm_120`), and `H3_CUDA_DEVICE=N` selects a device at runtime.
 The tested configuration is CUDA 12.8, driver 610.57.04, and an RTX 5070 Ti
-(`sm_120`, 16 GB).
+(`sm_120`, 16 GB). cuBLASLt is required by the optimized CUDA build. cuDNN is
+automatically enabled when `/usr/include/cudnn.h` is present; use
+`make GPU=cuda CUDNN=0` to build and test the portable fallback without it.
 
-`h3_gpu_cuda.c` owns CUDA device allocations, file staging, device-to-device
-copies, one ordered nonblocking stream, submission/error handling, and
-per-dispatch argument snapshots. `h3_cuda_kernels.cu` contains 62 native CUDA
-compute entries covering the complete generation path: BF16 and f32 primitives,
-DiT fusions, naive/flash attention, text/vision encoders, video/audio VAE, and
-the row/grouped int8 paths. It is generated from the arithmetic oracle in
-`h3_vulkan_shaders.comp` by `scripts/generate_cuda_kernels.py`; do not edit the
-generated file directly. This keeps FMA order, BF16 boundaries, bindings, and
-workgroup geometry aligned across the two Linux backends while allowing hot
-CUDA kernels to be specialized later.
+`h3_gpu_cuda.c` owns CUDA device allocations, file staging, one ordered
+nonblocking stream, CUDA-event timing, submission/error handling, and
+per-dispatch argument snapshots. The 62 generated correctness kernels remain
+in `h3_cuda_kernels.cu`, with `h3_vulkan_shaders.comp` as their arithmetic
+oracle. Hot paths live separately in `h3_cuda_accel.cu`:
 
-### CUDA validation and 16 GB preset
+- cuBLASLt Tensor Core `int8 x int8 -> int32` for QKV, attention output, FC1,
+  row-FC2, and grouped-per-1024 FC2, followed by exact H3 scale/BF16 epilogues;
+- cuBLASLt pedantic-F32 projections for the visual VAE transformer;
+- tiled online-softmax BF16 and F32 attention, processing 16 query/key rows per
+  block instead of synchronizing once per key;
+- optional deterministic cuDNN Conv3D for the visual reference encoder.
 
-The CUDA build passes 1,765 host checks, 451 GPU-kernel checks, 20 complete DiT
-block checks, and 30 tokenizer checks with the strict C warning flags. The same
-change passes the complete Vulkan regression suite. A real-checkpoint smoke
-used seed 42, 256x256, 8 requested frames, 5 steps, `--reuse 3`, and 35 active
-layers; it produced a 22-frame, 0.925-second H.264/AAC file.
+The old generated kernels remain automatic fallbacks for unsupported shapes.
+`H3_DISABLE_CUBLASLT=1`, `H3_DISABLE_CUBLASLT_F32=1`,
+`H3_DISABLE_CUDA_FLASH2=1`, `H3_DISABLE_CUDA_FLASH2_F32=1`, and
+`H3_DISABLE_CUDNN=1` isolate the corresponding optimized paths.
 
-| CUDA mode on RTX 5070 Ti 16 GB | Wall time | vs int8 | Result |
-|---|---:|---:|---|
-| resident int8 (default) | **105 s** | baseline | success |
-| BF16 streamed from SSD | 135 s | 28.6% slower | success |
-| resident BF16 QKV, rest int8 | — | — | OOM while loading block 45 |
-| resident BF16 attention output, rest int8 | — | — | OOM allocating first denoiser scratch |
+### Persistent CUDA caches
 
-The default int8 render was structurally valid and measured 22.08 dB PSNR /
-0.1196 RGB relative L2 against the same-seed streamed-BF16 render. These are
-single-seed decoded-video measurements, not a perceptual-quality study.
+The resident INT8 path now writes two source-validated caches under the
+transformer directory:
 
-For a 16 GB CUDA card, the best **resident speed/capacity compromise is the
-default all-int8 projection path**:
+- `.h3-cache/cuda-int8-v1`: quantized matrices and F32 scales, about
+  **12.57 GiB** for the 35-layer preset;
+- `.h3-cache/cuda-adaln-v1`: the 50 precomputed timestep/AdaLN projections,
+  about **81 MiB**, replacing roughly 25 GiB of BF16 reads on a cache hit.
+
+Entries are written atomically and invalidated when source shard size, mtime,
+offset, tensor shape, quantization format, or timestep embedding changes. The
+first run builds missing entries; later prompts with the same schedule reuse
+them. Set `H3_DISABLE_INT8_CACHE=1` or `H3_DISABLE_ADALN_CACHE=1` to disable
+one cache. `H3_INT8_CACHE_DIR` and `H3_ADALN_CACHE_DIR` relocate them. Removing
+`.h3-cache` is always safe.
+
+### CUDA validation and measured speedup
+
+The optimized CUDA build passes 1,765 host checks, **503 CUDA GPU checks**, 20
+complete DiT-block checks, and 30 tokenizer checks with zero strict-C warnings.
+`make GPU=cuda CUDNN=0 test` also passes. The same source passes 502 Vulkan GPU
+checks and the full Vulkan regression suite.
+
+The fixed real-checkpoint smoke uses seed 42, 256x256, 8 requested frames, 5
+steps, `--reuse 3`, and 35 active layers, producing a 22-frame H.264/AAC file:
+
+| RTX 5070 Ti stage | Wall time | Relevant phase |
+|---|---:|---:|
+| original scalar CUDA backend | 105 s | baseline |
+| Tensor Core/flash kernels, before warm caches | 86 s | historical intermediate |
+| optimized math + warm INT8 cache | 54-57 s | AdaLN still uncached |
+| **optimized math + both warm caches** | **38 s** | current default |
+
+Representative kernel measurements on the same card:
+
+| Operation/shape | Optimized vs generated fallback |
+|---|---:|
+| INT8 linear, `528 x 5376 x 5376` | **63.7x** |
+| full INT8 MLP, 528 rows | **44.3x** |
+| full INT8 MLP, 8192 rows | **38.4x** |
+| BF16 attention, `8192 x 42 x 128` | **21.1x** |
+| F32 attention, `2053 x 32 x 64` | **8.1x** |
+| DiT denoising phase | 16.0 s -> **0.42 s** |
+| visual VAE decoder | 22.5 s -> **7.9 s** (GPU 15.7 s -> 0.86 s) |
+| AdaLN/DiT load after cache warmup | 31.0 s -> **11.1 s** |
+
+Tensor Core INT8 outputs are byte-identical to the generated integer kernels in
+the linear and full-MLP benchmarks. Cache-build and cache-hit videos were also
+pixel-identical (`PSNR = infinity`). The reordered F32 VAE math measured 52.33
+dB decoded-video PSNR against its generated fallback, with unchanged mean
+luminance and first-frame color count. Tiled attention uses a different valid
+reduction order, so diffusion details can change; use the disable variables
+above for close-reference diagnosis.
+
+For a 16 GB CUDA card, the best resident speed/capacity compromise remains the
+default all-INT8 DiT projection path:
 
 ```sh
 ./h3 -d MiniMax-H3 -p "A red fox walking through snow" \
@@ -666,23 +711,11 @@ default all-int8 projection path**:
   -o outputs/fox-cuda-int8.mp4
 ```
 
-When closer-reference quality matters, `--ssd-streaming` is the recommended
-CUDA quality compromise: it uses all-BF16 block weights with bounded VRAM and
-cost only about 29% in this smoke test.
-
-```sh
-./h3 -d MiniMax-H3 -p "A red fox walking through snow" \
-  --width 256 --height 256 --frames 8 --steps 5 --reuse 3 --layers 35 \
-  --ssd-streaming -o outputs/fox-cuda-bf16.mp4
-```
-
-Unlike Vulkan's driver-managed allocations, CUDA residency enforces the card's
-physical allocation limit, so the Vulkan recommendation to retain QKV in BF16
-does **not** fit this 16 GB CUDA configuration at 35 layers. Cards with more
-VRAM can still use the individual `--use-slower-bf16-*` controls. The current
-correctness kernels already made the observed CUDA int8 smoke about 3.4x faster
-than the comparable Vulkan run; CUDA tensor-core/cuBLASLt specialization remains
-a future optimization rather than a correctness dependency.
+When closer-reference projection quality matters, `--ssd-streaming` uses
+all-BF16 block weights with bounded VRAM. Unlike Vulkan's driver-managed
+allocations, resident BF16 QKV does not fit this tested 16 GB CUDA preset at 35
+layers; cards with more VRAM can use the individual `--use-slower-bf16-*`
+controls.
 
 ## Implementation and performance notes
 
@@ -950,12 +983,12 @@ peak physical footprint and zero swaps.
 
 ### Profiling and diagnostic paths
 
-`--profile` reports each Metal-backed phase separately: wall time, CPU-side
-command encoding, complete commit-to-fence wait, root-command GPU timestamps,
-peak live tensor storage, cumulative allocation, and dispatch counts. The wait
-measurement is the complete command turnaround; the root GPU timestamp alone
-can omit child buffers scheduled internally by MPSGraph and is labeled
-accordingly.
+`--profile` reports each GPU-backed phase separately: wall time, CPU-side
+command encoding, complete synchronization wait, GPU timestamps, peak live
+tensor storage, cumulative allocation, and dispatch counts. Metal labels root
+command timestamps because MPSGraph may schedule child buffers; CUDA uses
+stream events and additionally reports cuBLASLt, tiled-attention, and cuDNN
+launch counts.
 
 The DiT fast path evaluates each BF16 `fc1 -> SwiGLU -> fc2` block as one cached
 graph, avoiding separate graph boundaries and persistent intermediate tensors.

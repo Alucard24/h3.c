@@ -1224,6 +1224,12 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
     return h3_vk_tensor_read(tensor->gpu, tensor, 0, values, elements);
 }
 
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements) {
+    if (!tensor || tensor->dtype != H3_GPU_I8) return 0;
+    return h3_vk_tensor_read(tensor->gpu, tensor, 0, values, elements);
+}
+
 static int h3_vk_tensor_write(h3_gpu *gpu, h3_gpu_tensor *tensor,
                               size_t destination_offset, const void *values,
                               size_t elements) {
@@ -1335,6 +1341,12 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
                                       uint64_t file_offset,
                                       size_t elements) {
     return h3_vk_tensor_load(gpu, path, file_offset, elements, H3_GPU_F32);
+}
+
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *gpu, const char *path,
+                                     uint64_t file_offset,
+                                     size_t elements) {
+    return h3_vk_tensor_load(gpu, path, file_offset, elements, H3_GPU_I8);
 }
 
 static int h3_vk_tensor_read_file(h3_gpu *gpu, h3_gpu_tensor *tensor,

@@ -6,6 +6,7 @@
  * Linux backends retain the same arithmetic boundaries and binding order.
  */
 #include "h3.h"
+#include "h3_cuda_accel.h"
 #include "h3_cuda_kernels.h"
 #include "h3_gpu.h"
 
@@ -111,11 +112,20 @@ struct h3_gpu {
     h3_gpu_stats stats;
     int device;
     cudaStream_t stream;
+    cudaEvent_t batch_start;
+    cudaEvent_t batch_end;
+    h3_cuda_accel *accel;
+    size_t accel_accounted_bytes;
     int command_active;
     h3_cuda_args args_storage;
     h3_cuda_args *args;
     h3_cuda_set prepared;
     double encode_start;
+    char profile_label[96];
+    h3_gpu_stats profile_start_stats;
+    h3_gpu_stats profile_mark_stats;
+    double profile_start_wall;
+    double profile_mark_wall;
     h3_gpu_tensor *pending_head;
     h3_gpu_tensor *pending_tail;
 };
@@ -125,6 +135,65 @@ static double h3_cuda_now(void) {
     if (clock_gettime(CLOCK_MONOTONIC, &timestamp) != 0)
         return 0.0;
     return (double)timestamp.tv_sec + (double)timestamp.tv_nsec * 1e-9;
+}
+
+static int h3_cuda_profile_enabled(void) {
+    const char *value = getenv("H3_PROFILE");
+    return value && *value && strcmp(value, "0") != 0;
+}
+
+static uint64_t h3_cuda_counter_delta(uint64_t value, uint64_t start) {
+    return value >= start ? value - start : 0;
+}
+
+static void h3_cuda_profile_emit(h3_gpu *gpu, const char *phase,
+                                 h3_gpu_stats start, double wall_start) {
+    if (!gpu || !phase || !h3_cuda_profile_enabled())
+        return;
+    h3_gpu_stats value = gpu->stats;
+    fprintf(stderr,
+            "h3 profile: %-24s %-14s wall=%8.3fs encode=%7.3fs "
+            "wait=%8.3fs gpu=%7.3fs peak=%7.3fGiB alloc=%7.3fGiB "
+            "submissions=%llu kernels=%llu cublaslt=%llu attention=%llu "
+            "cudnn=%llu\n",
+            gpu->profile_label[0] ? gpu->profile_label : "CUDA context", phase,
+            h3_cuda_now() - wall_start,
+            value.command_encode_seconds - start.command_encode_seconds,
+            value.command_wait_seconds - start.command_wait_seconds,
+            value.gpu_seconds - start.gpu_seconds,
+            (double)value.peak_live_bytes / (1024.0 * 1024.0 * 1024.0),
+            (double)h3_cuda_counter_delta(value.allocated_bytes,
+                                          start.allocated_bytes) /
+                (1024.0 * 1024.0 * 1024.0),
+            (unsigned long long)h3_cuda_counter_delta(value.submissions,
+                                                       start.submissions),
+            (unsigned long long)h3_cuda_counter_delta(
+                value.direct_dispatches, start.direct_dispatches),
+            (unsigned long long)h3_cuda_counter_delta(
+                value.mps_linear_dispatches, start.mps_linear_dispatches),
+            (unsigned long long)h3_cuda_counter_delta(
+                value.mps_sdpa_dispatches, start.mps_sdpa_dispatches),
+            (unsigned long long)h3_cuda_counter_delta(
+                value.mps_conv_dispatches, start.mps_conv_dispatches));
+}
+
+static void h3_cuda_account_accel(h3_gpu *gpu,
+                                  h3_cuda_accel_stats accelerated) {
+    if (!gpu)
+        return;
+    size_t bytes = h3_cuda_accel_device_bytes(gpu->accel);
+    if (bytes > gpu->accel_accounted_bytes) {
+        size_t added = bytes - gpu->accel_accounted_bytes;
+        gpu->stats.allocated_bytes += added;
+        gpu->stats.live_bytes += added;
+        if (gpu->stats.live_bytes > gpu->stats.peak_live_bytes)
+            gpu->stats.peak_live_bytes = gpu->stats.live_bytes;
+        gpu->accel_accounted_bytes = bytes;
+    }
+    gpu->stats.mps_linear_dispatches += accelerated.matmul_launches;
+    gpu->stats.mps_sdpa_dispatches += accelerated.attention_launches;
+    gpu->stats.mps_conv_dispatches += accelerated.convolution_launches;
+    gpu->stats.direct_dispatches += accelerated.epilogue_launches;
 }
 
 static void h3_cuda_set_error(h3_gpu *gpu, const char *format, ...) {
@@ -225,16 +294,29 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
         return NULL;
     }
     gpu->args = &gpu->args_storage;
+    snprintf(gpu->profile_label, sizeof(gpu->profile_label), "CUDA context");
+    gpu->profile_start_wall = h3_cuda_now();
+    gpu->profile_mark_wall = gpu->profile_start_wall;
+    struct cudaDeviceProp properties;
+    memset(&properties, 0, sizeof(properties));
     if (!h3_cuda_selected_device(error, error_size, &gpu->device) ||
         !h3_cuda_result(gpu, cudaSetDevice(gpu->device), "cudaSetDevice") ||
+        !h3_cuda_result(gpu,
+                        cudaGetDeviceProperties(&properties, gpu->device),
+                        "cudaGetDeviceProperties") ||
         !h3_cuda_result(
             gpu, cudaStreamCreateWithFlags(&gpu->stream, cudaStreamNonBlocking),
-            "cudaStreamCreateWithFlags")) {
+            "cudaStreamCreateWithFlags") ||
+        !h3_cuda_result(gpu, cudaEventCreate(&gpu->batch_start),
+                        "cudaEventCreate batch start") ||
+        !h3_cuda_result(gpu, cudaEventCreate(&gpu->batch_end),
+                        "cudaEventCreate batch end")) {
         if (error && error_size && gpu->error[0])
             snprintf(error, error_size, "%s", gpu->error);
         h3_gpu_free(gpu);
         return NULL;
     }
+    gpu->accel = h3_cuda_accel_create(properties.major, properties.minor);
     return gpu;
 }
 
@@ -267,7 +349,17 @@ void h3_gpu_free(h3_gpu *gpu) {
         return;
     if (gpu->stream)
         (void)cudaStreamSynchronize(gpu->stream);
+    h3_cuda_profile_emit(gpu, "total", gpu->profile_start_stats,
+                         gpu->profile_start_wall);
     h3_cuda_drain_pending(gpu);
+    h3_cuda_accel_free(gpu->accel);
+    gpu->accel = NULL;
+    if (gpu->stats.live_bytes >= gpu->accel_accounted_bytes)
+        gpu->stats.live_bytes -= gpu->accel_accounted_bytes;
+    if (gpu->batch_start)
+        (void)cudaEventDestroy(gpu->batch_start);
+    if (gpu->batch_end)
+        (void)cudaEventDestroy(gpu->batch_end);
     if (gpu->stream)
         (void)cudaStreamDestroy(gpu->stream);
     free(gpu);
@@ -431,6 +523,13 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
     return h3_cuda_tensor_read(tensor, 0, values, elements);
 }
 
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements) {
+    if (!tensor || tensor->dtype != H3_GPU_I8)
+        return 0;
+    return h3_cuda_tensor_read(tensor, 0, values, elements);
+}
+
 static int h3_cuda_tensor_write(h3_gpu_tensor *tensor,
                                 size_t destination_offset, const void *values,
                                 size_t elements) {
@@ -532,6 +631,11 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
     return h3_cuda_tensor_load(gpu, path, file_offset, elements, H3_GPU_F32);
 }
 
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *gpu, const char *path,
+                                     uint64_t file_offset, size_t elements) {
+    return h3_cuda_tensor_load(gpu, path, file_offset, elements, H3_GPU_I8);
+}
+
 static int h3_cuda_tensor_read_file(h3_gpu_tensor *tensor, const char *path,
                                     uint64_t file_offset, size_t elements,
                                     char *error, size_t error_size) {
@@ -581,6 +685,9 @@ int h3_gpu_begin(h3_gpu *gpu) {
                                    : "null CUDA context");
         return 0;
     }
+    if (!h3_cuda_result(gpu, cudaEventRecord(gpu->batch_start, gpu->stream),
+                        "cudaEventRecord batch start"))
+        return 0;
     gpu->command_active = 1;
     gpu->encode_start = h3_cuda_now();
     return 1;
@@ -599,13 +706,22 @@ int h3_gpu_submit(h3_gpu *gpu) {
     if (!h3_cuda_require_command(gpu))
         return 0;
     gpu->stats.command_encode_seconds += h3_cuda_now() - gpu->encode_start;
+    if (!h3_cuda_result(gpu, cudaEventRecord(gpu->batch_end, gpu->stream),
+                        "cudaEventRecord batch end"))
+        return 0;
     double wait_start = h3_cuda_now();
     if (!h3_cuda_result(gpu, cudaStreamSynchronize(gpu->stream),
                         "cudaStreamSynchronize"))
         return 0;
     double waited = h3_cuda_now() - wait_start;
+    float elapsed_ms = 0.0f;
+    if (!h3_cuda_result(
+            gpu, cudaEventElapsedTime(&elapsed_ms, gpu->batch_start,
+                                      gpu->batch_end),
+            "cudaEventElapsedTime"))
+        return 0;
     gpu->stats.command_wait_seconds += waited;
-    gpu->stats.gpu_seconds += waited;
+    gpu->stats.gpu_seconds += (double)elapsed_ms * 1e-3;
     gpu->stats.submissions++;
     gpu->command_active = 0;
     h3_cuda_drain_pending(gpu);
@@ -1238,6 +1354,16 @@ static int h3_cuda_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
                         int head_major_output) {
     if (!h3_cuda_check_tensors(gpu, 4, output, query, key, value))
         return 0;
+    if (!h3_cuda_require_command(gpu))
+        return 0;
+    size_t required = (size_t)sequence * heads * head_dim;
+    if (required > h3_gpu_tensor_elements(output) ||
+        required > h3_gpu_tensor_elements(query) ||
+        required > h3_gpu_tensor_elements(key) ||
+        required > h3_gpu_tensor_elements(value)) {
+        h3_cuda_set_error(gpu, "BF16 SDPA tensor size mismatch");
+        return 0;
+    }
     gpu->args->rows = sequence;
     gpu->args->width = heads;
     gpu->args->input_dim = head_dim;
@@ -1247,6 +1373,20 @@ static int h3_cuda_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
      * one-thread-per-output naive kernel, whose bit-exact reference order
      * is what the parity tests compare against. */
     int flash = sequence >= 128 && head_dim <= 128;
+    if (flash) {
+        h3_cuda_accel_stats accelerated = {0};
+        int used = 0;
+        int ok = h3_cuda_accel_sdpa_bf16(
+            gpu->accel, (void *)gpu->stream, output->data, query->data,
+            key->data, value->data, sequence, heads, head_dim, scale,
+            head_major_output, &used, &accelerated, gpu->error,
+            sizeof(gpu->error));
+        h3_cuda_account_accel(gpu, accelerated);
+        if (!ok)
+            return 0;
+        if (used)
+            return 1;
+    }
     h3_cuda_kernel kernel =
         flash ? H3_CUDA_KERNEL_SDPA_FLASH_BF16 : H3_CUDA_KERNEL_SDPA_BF16;
     const h3_gpu_tensor *tensors[4] = {query, key, value, output};
@@ -1555,13 +1695,18 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 }
 
 void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label) {
-    (void)gpu;
-    (void)label;
+    if (!gpu || !label || !*label)
+        return;
+    snprintf(gpu->profile_label, sizeof(gpu->profile_label), "%s", label);
 }
 
 void h3_gpu_profile_mark(h3_gpu *gpu, const char *phase) {
-    (void)gpu;
-    (void)phase;
+    if (!gpu || !phase || !*phase || !h3_cuda_profile_enabled())
+        return;
+    h3_cuda_profile_emit(gpu, phase, gpu->profile_mark_stats,
+                         gpu->profile_mark_wall);
+    gpu->profile_mark_stats = gpu->stats;
+    gpu->profile_mark_wall = h3_cuda_now();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1592,6 +1737,17 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     gpu->args->input_dim = input_dim;
     gpu->args->output_dim = output_dim;
     gpu->args->has_bias = bias ? 1u : 0u;
+    h3_cuda_accel_stats accelerated = {0};
+    int accelerated_linear = 0;
+    if (!h3_cuda_accel_linear_f32(
+            gpu->accel, (void *)gpu->stream, output->data, input->data,
+            weight->data, bias ? bias->data : NULL, rows, input_dim,
+            output_dim, &accelerated_linear, &accelerated, gpu->error,
+            sizeof(gpu->error)))
+        return 0;
+    h3_cuda_account_accel(gpu, accelerated);
+    if (accelerated_linear)
+        return 1;
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     const h3_gpu_tensor *tensors[4] = {input, weight, bias_buffer, output};
     h3_cuda_set *set =
@@ -1723,12 +1879,31 @@ int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
         return 0;
     if (!h3_cuda_require_command(gpu))
         return 0;
+    size_t required = (size_t)sequence * heads * head_dim;
+    if (required > h3_gpu_tensor_elements(output) ||
+        required > h3_gpu_tensor_elements(query) ||
+        required > h3_gpu_tensor_elements(key) ||
+        required > h3_gpu_tensor_elements(value)) {
+        h3_cuda_set_error(gpu, "F32 SDPA tensor size mismatch");
+        return 0;
+    }
     gpu->args->rows = sequence;
     gpu->args->width = heads;
     gpu->args->input_dim = head_dim;
     gpu->args->left_scale = scale;
-    /* Long sequences use the flash kernel; short ones keep the naive
-     * one-thread-per-output kernel, matching the BF16 policy. */
+    /* Long sequences use the tiled online-softmax accelerator; unsupported
+     * dimensions retain the generated correctness kernels. */
+    h3_cuda_accel_stats accelerated = {0};
+    int accelerated_attention = 0;
+    if (!h3_cuda_accel_sdpa_f32(
+            gpu->accel, (void *)gpu->stream, output->data, query->data,
+            key->data, value->data, sequence, heads, head_dim, scale,
+            &accelerated_attention, &accelerated, gpu->error,
+            sizeof(gpu->error)))
+        return 0;
+    h3_cuda_account_accel(gpu, accelerated);
+    if (accelerated_attention)
+        return 1;
     h3_cuda_kernel kernel = (sequence >= 128 && head_dim <= 128)
                                 ? H3_CUDA_KERNEL_SDPA_FLASH_F32
                                 : H3_CUDA_KERNEL_SDPA_F32;
@@ -2213,6 +2388,19 @@ int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     gpu->args->conv_stride_height = stride_height;
     gpu->args->conv_stride_width = stride_width;
     gpu->args->has_bias = bias ? 1u : 0u;
+    h3_cuda_accel_stats accelerated = {0};
+    int accelerated_conv = 0;
+    if (!h3_cuda_accel_conv3d_f32(
+            gpu->accel, (void *)gpu->stream, output->data, input->data,
+            weight->data, bias ? bias->data : NULL, batch, depth, height,
+            width, input_channels, output_channels, kernel_depth,
+            kernel_height, kernel_width, stride_depth, stride_height,
+            stride_width, &accelerated_conv, &accelerated, gpu->error,
+            sizeof(gpu->error)))
+        return 0;
+    h3_cuda_account_accel(gpu, accelerated);
+    if (accelerated_conv)
+        return 1;
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     const h3_gpu_tensor *tensors[4] = {input, weight, bias_buffer, output};
     h3_cuda_set *set =
@@ -2337,6 +2525,49 @@ int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_cuda_dispatch(gpu, H3_CUDA_KERNEL_QUANTIZE_ROWS_BF16_I8, set,
                             rows, 1, 1);
 }
+static int h3_cuda_accelerated_linear_int8(
+    h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *input_scales,
+    const h3_gpu_tensor *weight_scales, uint32_t rows, uint32_t input_dim,
+    uint32_t output_dim, int *used) {
+    h3_cuda_accel_stats accelerated = {0};
+    int ok = h3_cuda_accel_linear_int8_bf16(
+        gpu->accel, (void *)gpu->stream, output->data, input->data,
+        weight->data, input_scales->data, weight_scales->data, rows, input_dim,
+        output_dim, used, &accelerated, gpu->error, sizeof(gpu->error));
+    h3_cuda_account_accel(gpu, accelerated);
+    return ok;
+}
+
+static int h3_cuda_accelerated_fc1_swiglu_int8(
+    h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *input_scales,
+    const h3_gpu_tensor *weight_scales, uint32_t rows, uint32_t input_dim,
+    uint32_t hidden_dim, int *used) {
+    h3_cuda_accel_stats accelerated = {0};
+    int ok = h3_cuda_accel_fc1_swiglu_int8_bf16(
+        gpu->accel, (void *)gpu->stream, output->data, input->data,
+        weight->data, input_scales->data, weight_scales->data, rows, input_dim,
+        hidden_dim, used, &accelerated, gpu->error, sizeof(gpu->error));
+    h3_cuda_account_accel(gpu, accelerated);
+    return ok;
+}
+
+static int h3_cuda_accelerated_grouped_linear_int8(
+    h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *input_scales,
+    const h3_gpu_tensor *weight_scales, uint32_t rows, uint32_t input_dim,
+    uint32_t output_dim, uint32_t group_size, uint32_t groups, int *used) {
+    h3_cuda_accel_stats accelerated = {0};
+    int ok = h3_cuda_accel_linear_int8_grouped_bf16(
+        gpu->accel, (void *)gpu->stream, output->data, input->data,
+        weight->data, input_scales->data, weight_scales->data, rows, input_dim,
+        output_dim, group_size, groups, used, &accelerated, gpu->error,
+        sizeof(gpu->error));
+    h3_cuda_account_accel(gpu, accelerated);
+    return ok;
+}
+
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,
@@ -2378,6 +2609,13 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     gpu->args->rows = rows;
     gpu->args->input_dim = input_dim;
     gpu->args->output_dim = output_dim;
+    int accelerated = 0;
+    if (!h3_cuda_accelerated_linear_int8(
+            gpu, output, quantized_input, weight, input_scales, weight_scales,
+            rows, input_dim, output_dim, &accelerated))
+        return 0;
+    if (accelerated)
+        return 1;
     {
         const h3_gpu_tensor *l[5] = {quantized_input, weight, input_scales,
                                      weight_scales, output};
@@ -2434,6 +2672,13 @@ int h3_gpu_linear_int8_head_major_bf16(
     gpu->args->rows = rows;
     gpu->args->input_dim = input_dim;
     gpu->args->output_dim = output_dim;
+    int accelerated = 0;
+    if (!h3_cuda_accelerated_linear_int8(
+            gpu, output, quantized_input, weight, input_scales, weight_scales,
+            rows, input_dim, output_dim, &accelerated))
+        return 0;
+    if (accelerated)
+        return 1;
     {
         const h3_gpu_tensor *l[5] = {quantized_input, weight, input_scales,
                                      weight_scales, output};
@@ -2507,11 +2752,18 @@ int h3_gpu_mlp_int8_bf16(
                              rows, 1, 1) == 0)
             return 0;
     }
-    /* Fused FC1 + SwiGLU (gate | up halves). */
+    /* Fused FC1 + SwiGLU (gate | up halves). cuBLASLt computes both exact
+     * INT32 projections in bounded chunks; the portable tile remains the
+     * fallback for unaligned or unsupported dimensions. */
     gpu->args->rows = rows;
     gpu->args->input_dim = input_dim;
     gpu->args->output_dim = hidden_dim;
-    {
+    int accelerated_fc1 = 0;
+    if (!h3_cuda_accelerated_fc1_swiglu_int8(
+            gpu, activated, fc1_input, fc1_weight, activation_scales,
+            fc1_scales, rows, input_dim, hidden_dim, &accelerated_fc1))
+        return 0;
+    if (!accelerated_fc1) {
         const h3_gpu_tensor *f[5] = {fc1_input, fc1_weight, activation_scales,
                                      fc1_scales, activated};
         h3_cuda_set *set =
@@ -2541,6 +2793,14 @@ int h3_gpu_mlp_int8_bf16(
         gpu->args->rows = rows;
         gpu->args->input_dim = hidden_dim;
         gpu->args->output_dim = output_dim;
+        int accelerated_fc2 = 0;
+        if (!h3_cuda_accelerated_linear_int8(
+                gpu, output, quantized_activation, fc2_weight,
+                activation_scales, fc2_scales, rows, hidden_dim, output_dim,
+                &accelerated_fc2))
+            return 0;
+        if (accelerated_fc2)
+            return 1;
         {
             const h3_gpu_tensor *l[5] = {quantized_activation, fc2_weight,
                                          activation_scales, fc2_scales, output};
@@ -2576,6 +2836,14 @@ int h3_gpu_mlp_int8_bf16(
     gpu->args->output_dim = output_dim;
     gpu->args->width = 1024u;
     gpu->args->elements = groups;
+    int accelerated_fc2 = 0;
+    if (!h3_cuda_accelerated_grouped_linear_int8(
+            gpu, output, quantized_activation, fc2_weight, activation_scales,
+            fc2_scales, rows, hidden_dim, output_dim, 1024u, groups,
+            &accelerated_fc2))
+        return 0;
+    if (accelerated_fc2)
+        return 1;
     {
         const h3_gpu_tensor *l[5] = {quantized_activation, fc2_weight,
                                      activation_scales, fc2_scales, output};
@@ -2681,8 +2949,8 @@ int h3_gpu_grouped_qkv_linear_rope_bf16(
     const h3_gpu_tensor *rope_cos, const h3_gpu_tensor *rope_sin, uint32_t rows,
     uint32_t input_dim, uint32_t heads, uint32_t head_dim, uint32_t rope_half,
     float epsilon) {
-    /* CUDA has no tensor-ops matmul; use the Metal fallback path:
-     * plain BF16 projection followed by the grouped norm/RoPE kernel. */
+    /* Keep the portable BF16 projection followed by grouped norm/RoPE.
+     * The CUDA accelerator currently specializes the resident INT8 QKV path. */
     uint32_t inner = heads * head_dim;
     if (h3_gpu_linear_bf16(gpu, qkv, input, weight, NULL, rows, input_dim,
                            inner * 3) == 0)
@@ -2746,7 +3014,12 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     gpu->args->rows = rows;
     gpu->args->input_dim = input_dim;
     gpu->args->output_dim = inner * 3;
-    {
+    int accelerated = 0;
+    if (!h3_cuda_accelerated_linear_int8(
+            gpu, qkv_scratch, quantized_input, weight, input_scales,
+            weight_scales, rows, input_dim, inner * 3, &accelerated))
+        return 0;
+    if (!accelerated) {
         const h3_gpu_tensor *l[5] = {quantized_input, weight, input_scales,
                                      weight_scales, qkv_scratch};
         h3_cuda_set *set =

@@ -1,6 +1,8 @@
 /* Linux GPU kernel tests: parity against CPU references computed with the
  * same arithmetic as h3_shaders.metal. Shared by Vulkan and CUDA. */
 #include "h3_gpu.h"
+#include "h3_int8_cache.h"
+#include "h3_schedule_cache.h"
 
 #include <fcntl.h>
 #include <math.h>
@@ -1314,6 +1316,83 @@ static void test_conv3d_f32(h3_gpu *gpu) {
     h3_gpu_tensor_free(b);
     h3_gpu_tensor_free(out);
     free(input); free(weight); free(bias); free(expected); free(got);
+}
+
+static void test_conv3d_accelerated(h3_gpu *gpu) {
+    enum { BATCH = 1, DEPTH = 4, HEIGHT = 8, WIDTH = 8,
+           IC = 8, OC = 16, KD = 3, KH = 3, KW = 3 };
+    enum { OD = DEPTH - KD + 1, OH = HEIGHT - KH + 1,
+           OW = WIDTH - KW + 1 };
+    size_t input_count = (size_t)BATCH * DEPTH * HEIGHT * WIDTH * IC;
+    size_t weight_count = (size_t)OC * IC * KD * KH * KW;
+    size_t output_count = (size_t)BATCH * OD * OH * OW * OC;
+    float *input = malloc(input_count * sizeof(*input));
+    float *weight = malloc(weight_count * sizeof(*weight));
+    float *bias = malloc(OC * sizeof(*bias));
+    float *expected = malloc(output_count * sizeof(*expected));
+    float *got = malloc(output_count * sizeof(*got));
+    CHECK(input && weight && bias && expected && got);
+    if (input && weight && bias && expected && got) {
+        for (size_t index = 0; index < input_count; index++)
+            input[index] = (float)sin((double)index * 0.13) * 0.4f;
+        for (size_t index = 0; index < weight_count; index++)
+            weight[index] = (float)cos((double)index * 0.17) * 0.08f;
+        for (size_t index = 0; index < OC; index++)
+            bias[index] = (float)sin((double)index * 0.19) * 0.03f;
+        for (uint32_t t = 0; t < OD; t++)
+            for (uint32_t y = 0; y < OH; y++)
+                for (uint32_t x = 0; x < OW; x++)
+                    for (uint32_t oc = 0; oc < OC; oc++) {
+                        float sum = bias[oc];
+                        for (uint32_t kt = 0; kt < KD; kt++)
+                            for (uint32_t ky = 0; ky < KH; ky++)
+                                for (uint32_t kx = 0; kx < KW; kx++)
+                                    for (uint32_t ic = 0; ic < IC; ic++) {
+                                        size_t source =
+                                            ((((size_t)(t + kt) * HEIGHT +
+                                               y + ky) * WIDTH + x + kx) *
+                                             IC + ic);
+                                        size_t filter =
+                                            ((((size_t)oc * IC + ic) * KD +
+                                               kt) * KH + ky) * KW + kx;
+                                        sum = fmaf(input[source],
+                                                   weight[filter], sum);
+                                    }
+                        expected[(((size_t)t * OH + y) * OW + x) * OC + oc] =
+                            sum;
+                    }
+        h3_gpu_tensor *in = h3_gpu_tensor_from_f32(gpu, input, input_count);
+        h3_gpu_tensor *w = h3_gpu_tensor_from_f32(gpu, weight, weight_count);
+        h3_gpu_tensor *b = h3_gpu_tensor_from_f32(gpu, bias, OC);
+        h3_gpu_tensor *out = h3_gpu_tensor_new_f32(gpu, output_count);
+        CHECK(in && w && b && out);
+        if (in && w && b && out) {
+            h3_gpu_stats before, after;
+            CHECK(h3_gpu_get_stats(gpu, &before) == 1);
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_conv3d_f32(
+                      gpu, out, in, w, b, BATCH, DEPTH, HEIGHT, WIDTH, IC, OC,
+                      KD, KH, KW, 1, 1, 1) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
+            CHECK(h3_gpu_tensor_read_f32(out, got, output_count) == 1);
+            CHECK(check_f32(got, expected, output_count, 1e-4f,
+                            "conv3d_accelerated"));
+            CHECK(h3_gpu_get_stats(gpu, &after) == 1);
+#if defined(H3_HAVE_CUDA) && defined(H3_HAVE_CUDNN)
+            CHECK(after.mps_conv_dispatches ==
+                  before.mps_conv_dispatches + 1);
+#endif
+        }
+        h3_gpu_tensor_free(in);
+        h3_gpu_tensor_free(w);
+        h3_gpu_tensor_free(b);
+        h3_gpu_tensor_free(out);
+    }
+    free(input);
+    free(weight);
+    free(bias);
+    free(expected);
+    free(got);
 }
 
 static void test_weight_norm_f32(h3_gpu *gpu) {
@@ -3258,6 +3337,34 @@ static void test_sdpa_flash_bf16(h3_gpu *gpu) {
              * linear FMA order, so allow a few more ulps. */
             CHECK(check_bf16_ulp_abs(got, expected, count, 8, 2e-7f,
                                       "sdpa_flash"));
+            h3_gpu_tensor *head_out = h3_gpu_tensor_new_bf16(gpu, count);
+            uint16_t *head_got = malloc(count * 2);
+            CHECK(head_out && head_got);
+            if (head_out && head_got) {
+                h3_gpu_begin(gpu);
+                CHECK(h3_gpu_sdpa_bf16_head_major_output(
+                          gpu, head_out, tq, tk, tv, SEQ, HEADS, DIM,
+                          scale) == 1);
+                CHECK(h3_gpu_submit(gpu) == 1);
+                CHECK(h3_gpu_tensor_read_bf16(head_out, head_got, count) == 1);
+                int same = 1;
+                for (uint32_t row = 0; row < SEQ && same; row++)
+                    for (uint32_t head = 0; head < HEADS && same; head++)
+                        for (uint32_t dimension = 0; dimension < DIM;
+                             dimension++) {
+                            size_t row_index =
+                                ((size_t)row * HEADS + head) * DIM + dimension;
+                            size_t head_index =
+                                ((size_t)head * SEQ + row) * DIM + dimension;
+                            if (got[row_index] != head_got[head_index]) {
+                                same = 0;
+                                break;
+                            }
+                        }
+                CHECK(same);
+            }
+            h3_gpu_tensor_free(head_out);
+            free(head_got);
             free(got);
             h3_gpu_tensor_free(tq);
             h3_gpu_tensor_free(tk);
@@ -3287,16 +3394,16 @@ static void test_sdpa_flash_bench(h3_gpu *gpu) {
         h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, count);
         CHECK(tq && tk && tv && out);
         if (!failed) {
-            h3_gpu_stats stats;
-            /* Naive (force by temporary threshold override is not exposed;
-             * the flash path is the one used at this size). */
+            h3_gpu_stats before, after;
+            CHECK(h3_gpu_get_stats(gpu, &before) == 1);
             h3_gpu_begin(gpu);
             CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
                                    1.0f / sqrtf((float)DIM)) == 1);
             CHECK(h3_gpu_submit(gpu) == 1);
-            h3_gpu_get_stats(gpu, &stats);
-            printf("SDPA seq=%d heads=%d: flash kernel %.1f ms (GPU wait)\n",
-                   SEQ, HEADS, stats.command_wait_seconds * 1e3);
+            CHECK(h3_gpu_get_stats(gpu, &after) == 1);
+            printf("SDPA seq=%d heads=%d: flash kernel %.1f ms GPU\n",
+                   SEQ, HEADS,
+                   (after.gpu_seconds - before.gpu_seconds) * 1e3);
         }
         h3_gpu_tensor_free(tq);
         h3_gpu_tensor_free(tk);
@@ -3342,8 +3449,10 @@ static void test_token_pool_expand(h3_gpu *gpu) {
     h3_gpu_tensor *pr = h3_gpu_tensor_from_u32(gpu, pairs, ROWS * 2);
     h3_gpu_tensor *bi = h3_gpu_tensor_from_u32(gpu, baseline_indices, ROWS);
     h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, ROWS * WIDTH);
-    h3_gpu_tensor *orig = h3_gpu_tensor_new_bf16(gpu, INPUT_ROWS * WIDTH);
-    h3_gpu_tensor *base = h3_gpu_tensor_new_bf16(gpu, BASELINE_ROWS * WIDTH);
+    h3_gpu_tensor *orig = h3_gpu_tensor_from_bf16(
+        gpu, expected_orig, INPUT_ROWS * WIDTH);
+    h3_gpu_tensor *base = h3_gpu_tensor_from_bf16(
+        gpu, expected_base, BASELINE_ROWS * WIDTH);
     CHECK(in && pr && bi && out && orig && base);
     if (!failed) {
         h3_gpu_begin(gpu);
@@ -3598,6 +3707,164 @@ static void test_device_local_load(h3_gpu *gpu) {
         h3_gpu_tensor_free(out);
         unlink(path);
     }
+}
+
+static void test_int8_disk_cache(h3_gpu *gpu) {
+    enum { ROWS = 5, COLUMNS = 32, ELEMENTS = ROWS * COLUMNS };
+    char root[] = "/tmp/h3-int8-cache-XXXXXX";
+    char *created = mkdtemp(root);
+    CHECK(created != NULL);
+    if (!created)
+        return;
+    char source_path[256], cache_directory[256], cache_path[320];
+    snprintf(source_path, sizeof(source_path), "%s/source.bin", root);
+    snprintf(cache_directory, sizeof(cache_directory), "%s/cache", root);
+    snprintf(cache_path, sizeof(cache_path), "%s/weights_test.h3i8",
+             cache_directory);
+    int descriptor = open(source_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK(descriptor >= 0);
+    uint16_t values[ELEMENTS];
+    for (size_t index = 0; index < ELEMENTS; index++)
+        values[index] = bf16_bits((float)sin((double)index * 0.37) * 0.8f);
+    if (descriptor >= 0) {
+        CHECK(write(descriptor, values, sizeof(values)) ==
+              (ssize_t)sizeof(values));
+        close(descriptor);
+    }
+    h3_gpu_tensor *input = h3_gpu_tensor_from_bf16(gpu, values, ELEMENTS);
+    h3_gpu_tensor *weight = h3_gpu_tensor_new_i8(gpu, ELEMENTS);
+    h3_gpu_tensor *scales = h3_gpu_tensor_new_f32(gpu, ROWS);
+    CHECK(input && weight && scales);
+    if (input && weight && scales && descriptor >= 0) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_quantize_weight_int8(gpu, weight, scales, input, ROWS,
+                                          COLUMNS) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        uint64_t stored = 0;
+        char error[512] = {0};
+        CHECK(h3_int8_cache_save(cache_directory, "weights.test", source_path,
+                                 0, ROWS, COLUMNS, weight, scales, &stored,
+                                 error, sizeof(error)) == 1);
+        CHECK(stored == ELEMENTS + ROWS * sizeof(float));
+        h3_gpu_tensor *loaded_weight = NULL, *loaded_scales = NULL;
+        int hit = 0;
+        uint64_t loaded = 0;
+        CHECK(h3_int8_cache_load(gpu, cache_directory, "weights.test",
+                                 source_path, 0, ROWS, COLUMNS, &loaded_weight,
+                                 &loaded_scales, &hit, &loaded, error,
+                                 sizeof(error)) == 1);
+        CHECK(hit == 1 && loaded_weight && loaded_scales);
+        CHECK(loaded == stored);
+        int8_t expected_weight[ELEMENTS], got_weight[ELEMENTS];
+        float expected_scales[ROWS], got_scales[ROWS];
+        CHECK(h3_gpu_tensor_read_i8(weight, expected_weight, ELEMENTS) == 1);
+        CHECK(h3_gpu_tensor_read_i8(loaded_weight, got_weight, ELEMENTS) == 1);
+        CHECK(memcmp(expected_weight, got_weight, sizeof(got_weight)) == 0);
+        CHECK(h3_gpu_tensor_read_f32(scales, expected_scales, ROWS) == 1);
+        CHECK(h3_gpu_tensor_read_f32(loaded_scales, got_scales, ROWS) == 1);
+        CHECK(memcmp(expected_scales, got_scales, sizeof(got_scales)) == 0);
+        h3_gpu_tensor_free(loaded_weight);
+        h3_gpu_tensor_free(loaded_scales);
+        descriptor = open(source_path, O_WRONLY | O_APPEND);
+        CHECK(descriptor >= 0);
+        if (descriptor >= 0) {
+            const unsigned char marker = 1;
+            CHECK(write(descriptor, &marker, 1) == 1);
+            close(descriptor);
+        }
+        loaded_weight = NULL;
+        loaded_scales = NULL;
+        hit = 1;
+        CHECK(h3_int8_cache_load(gpu, cache_directory, "weights.test",
+                                 source_path, 0, ROWS, COLUMNS, &loaded_weight,
+                                 &loaded_scales, &hit, NULL, error,
+                                 sizeof(error)) == 1);
+        CHECK(hit == 0 && !loaded_weight && !loaded_scales);
+    }
+    h3_gpu_tensor_free(input);
+    h3_gpu_tensor_free(weight);
+    h3_gpu_tensor_free(scales);
+    unlink(cache_path);
+    unlink(source_path);
+    rmdir(cache_directory);
+    rmdir(root);
+}
+
+static void test_schedule_disk_cache(h3_gpu *gpu) {
+    enum { ROWS = 3, COLUMNS = 7, ELEMENTS = ROWS * COLUMNS };
+    char root[] = "/tmp/h3-schedule-cache-XXXXXX";
+    char *created = mkdtemp(root);
+    CHECK(created != NULL);
+    if (!created)
+        return;
+    char weight_path[256], bias_path[256], directory[256], entry[320];
+    snprintf(weight_path, sizeof(weight_path), "%s/weight.bin", root);
+    snprintf(bias_path, sizeof(bias_path), "%s/bias.bin", root);
+    snprintf(directory, sizeof(directory), "%s/cache", root);
+    snprintf(entry, sizeof(entry), "%s/adaln_test.h3adaln", directory);
+    unsigned char source[32];
+    for (size_t index = 0; index < sizeof(source); index++)
+        source[index] = (unsigned char)index;
+    int weight_fd = open(weight_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int bias_fd = open(bias_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK(weight_fd >= 0 && bias_fd >= 0);
+    if (weight_fd >= 0) {
+        CHECK(write(weight_fd, source, sizeof(source)) ==
+              (ssize_t)sizeof(source));
+        close(weight_fd);
+    }
+    if (bias_fd >= 0) {
+        CHECK(write(bias_fd, source, sizeof(source)) ==
+              (ssize_t)sizeof(source));
+        close(bias_fd);
+    }
+    uint16_t values[ELEMENTS], got[ELEMENTS];
+    for (size_t index = 0; index < ELEMENTS; index++)
+        values[index] = bf16_bits((float)cos((double)index * 0.23));
+    h3_gpu_tensor *tensor = h3_gpu_tensor_from_bf16(gpu, values, ELEMENTS);
+    CHECK(tensor != NULL);
+    if (tensor && weight_fd >= 0 && bias_fd >= 0) {
+        char error[512] = {0};
+        uint64_t stored = 0;
+        CHECK(h3_schedule_cache_save(
+                  directory, "adaln.test", weight_path, 3, bias_path, 5,
+                  UINT64_C(0x123456789abcdef0), ROWS, COLUMNS, tensor, &stored,
+                  error, sizeof(error)) == 1);
+        CHECK(stored == ELEMENTS * sizeof(uint16_t));
+        h3_gpu_tensor *loaded_tensor = NULL;
+        int hit = 0;
+        uint64_t loaded = 0;
+        CHECK(h3_schedule_cache_load(
+                  gpu, directory, "adaln.test", weight_path, 3, bias_path, 5,
+                  UINT64_C(0x123456789abcdef0), ROWS, COLUMNS, &loaded_tensor,
+                  &hit, &loaded, error, sizeof(error)) == 1);
+        CHECK(hit == 1 && loaded_tensor != NULL && loaded == stored);
+        if (loaded_tensor) {
+            CHECK(h3_gpu_tensor_read_bf16(loaded_tensor, got, ELEMENTS) == 1);
+            CHECK(memcmp(got, values, sizeof(got)) == 0);
+        }
+        h3_gpu_tensor_free(loaded_tensor);
+        bias_fd = open(bias_path, O_WRONLY | O_APPEND);
+        CHECK(bias_fd >= 0);
+        if (bias_fd >= 0) {
+            const unsigned char marker = 1;
+            CHECK(write(bias_fd, &marker, 1) == 1);
+            close(bias_fd);
+        }
+        loaded_tensor = NULL;
+        hit = 1;
+        CHECK(h3_schedule_cache_load(
+                  gpu, directory, "adaln.test", weight_path, 3, bias_path, 5,
+                  UINT64_C(0x123456789abcdef0), ROWS, COLUMNS, &loaded_tensor,
+                  &hit, NULL, error, sizeof(error)) == 1);
+        CHECK(hit == 0 && loaded_tensor == NULL);
+    }
+    h3_gpu_tensor_free(tensor);
+    unlink(entry);
+    unlink(weight_path);
+    unlink(bias_path);
+    rmdir(directory);
+    rmdir(root);
 }
 
 static void test_text_qk_rope_bf16(h3_gpu *gpu) {
@@ -3882,6 +4149,7 @@ int main(int argc, char **argv) {
     test_vae_group_norm_silu_f32(gpu);
     test_sdpa_f32(gpu);
     test_conv3d_f32(gpu);
+    test_conv3d_accelerated(gpu);
     test_weight_norm_f32(gpu);
     test_snake1d_f32(gpu);
     test_alias_free_snake_f32(gpu);
@@ -3914,6 +4182,8 @@ int main(int argc, char **argv) {
     test_token_pool_expand(gpu);
     test_token_pool_adaln(gpu);
     test_device_local_load(gpu);
+    test_int8_disk_cache(gpu);
+    test_schedule_disk_cache(gpu);
     test_text_qk_rope_bf16(gpu);
     test_rope_text_bf16(gpu);
     test_gqa_causal_bf16(gpu);

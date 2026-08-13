@@ -1,10 +1,12 @@
 #include "h3_dit_schedule.h"
+#include "h3_schedule_cache.h"
 
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum {
     TIME_INPUT = 256,
@@ -234,10 +236,147 @@ cleanup:
     return result;
 }
 
-h3_dit_schedule *h3_dit_schedule_precompute(
+typedef struct {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t loaded_bytes;
+    uint64_t stored_bytes;
+    double load_seconds;
+    double store_seconds;
+} schedule_cache_stats;
+
+static double schedule_now(void) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0)
+        return 0.0;
+    return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
+}
+
+static uint64_t schedule_time_hash(const h3_gpu_tensor *time,
+                                   uint32_t rows) {
+    size_t elements = (size_t)rows * H3_DIT_TIME_DIM;
+    uint16_t *values = malloc(elements * sizeof(*values));
+    if (!values || !h3_gpu_tensor_read_bf16(time, values, elements)) {
+        free(values);
+        return 0;
+    }
+    const unsigned char *bytes = (const unsigned char *)values;
+    size_t byte_count = elements * sizeof(*values);
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t index = 0; index < byte_count; index++) {
+        hash ^= bytes[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    free(values);
+    return hash ? hash : 1u;
+}
+
+static int schedule_projection_sources(
+    const h3_weight_store *weights, const char *weight_name,
+    const char *bias_name, uint32_t output_dim,
+    const h3_st_tensor **weight_source, const h3_st_header **weight_header,
+    const h3_st_tensor **bias_source, const h3_st_header **bias_header,
+    char *error, size_t error_size) {
+    *weight_source = h3_weight_find(weights, weight_name, weight_header);
+    *bias_source = h3_weight_find(weights, bias_name, bias_header);
+    if (!*weight_source || !*weight_header ||
+        (*weight_source)->dtype != H3_DTYPE_BF16 ||
+        (*weight_source)->ndim != 2 ||
+        (*weight_source)->shape[0] != output_dim ||
+        (*weight_source)->shape[1] != H3_DIT_TIME_DIM || !*bias_source ||
+        !*bias_header || (*bias_source)->dtype != H3_DTYPE_BF16 ||
+        (*bias_source)->ndim != 1 ||
+        (*bias_source)->shape[0] != output_dim) {
+        fail(error, error_size, "AdaLN projection source has wrong schema: %s",
+             weight_name);
+        return 0;
+    }
+    return 1;
+}
+
+static h3_gpu_tensor *schedule_projection(
+    const h3_weight_store *weights, h3_gpu *gpu,
+    const h3_gpu_tensor *time, uint32_t time_rows,
+    const char *weight_name, const char *bias_name, uint32_t output_dim,
+    const char *operation, const char *cache_directory, uint64_t time_hash,
+    schedule_cache_stats *cache_stats, char *error, size_t error_size) {
+    const h3_st_tensor *weight_source = NULL, *bias_source = NULL;
+    const h3_st_header *weight_header = NULL, *bias_header = NULL;
+    if (!schedule_projection_sources(
+            weights, weight_name, bias_name, output_dim, &weight_source,
+            &weight_header, &bias_source, &bias_header, error, error_size))
+        return NULL;
+    h3_gpu_tensor *result = NULL;
+    int hit = 0;
+    if (cache_directory && time_hash) {
+        uint64_t loaded = 0;
+        char cache_error[512] = {0};
+        double started = schedule_now();
+        int cache_ok = h3_schedule_cache_load(
+            gpu, cache_directory, weight_name, weight_header->path,
+            weight_source->file_offset, bias_header->path,
+            bias_source->file_offset, time_hash, time_rows, output_dim,
+            &result, &hit, &loaded, cache_error, sizeof(cache_error));
+        cache_stats->load_seconds += schedule_now() - started;
+        if (cache_ok && hit) {
+            cache_stats->hits++;
+            cache_stats->loaded_bytes += loaded;
+            return result;
+        }
+        h3_gpu_tensor_free(result);
+        result = NULL;
+        cache_stats->misses++;
+        if (!cache_ok && getenv("H3_PROFILE"))
+            fprintf(stderr, "h3: ignoring AdaLN cache for %s: %s\n",
+                    weight_name,
+                    cache_error[0] ? cache_error : "unknown error");
+    }
+    h3_gpu_tensor *weight = weight_bf16_2d(
+        weights, gpu, weight_name, output_dim, H3_DIT_TIME_DIM,
+        error, error_size);
+    h3_gpu_tensor *bias = weight_bf16_1d(
+        weights, gpu, bias_name, output_dim, error, error_size);
+    result = h3_gpu_tensor_new_bf16(gpu, (size_t)time_rows * output_dim);
+    int ok = weight && bias && result &&
+             gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
+             gpu_op(gpu,
+                    h3_gpu_linear_bf16(gpu, result, time, weight, bias,
+                                       time_rows, H3_DIT_TIME_DIM, output_dim),
+                    error, error_size, operation) &&
+             gpu_op(gpu, h3_gpu_submit(gpu), error, error_size, operation);
+    free_tensor(&weight);
+    free_tensor(&bias);
+    if (!ok) {
+        if ((!error || !*error) && !result)
+            fail(error, error_size, "cannot allocate %s: %s", operation,
+                 h3_gpu_error(gpu));
+        h3_gpu_tensor_free(result);
+        return NULL;
+    }
+    if (cache_directory && time_hash) {
+        uint64_t stored = 0;
+        char cache_error[512] = {0};
+        double started = schedule_now();
+        int saved = h3_schedule_cache_save(
+            cache_directory, weight_name, weight_header->path,
+            weight_source->file_offset, bias_header->path,
+            bias_source->file_offset, time_hash, time_rows, output_dim, result,
+            &stored, cache_error, sizeof(cache_error));
+        cache_stats->store_seconds += schedule_now() - started;
+        if (saved)
+            cache_stats->stored_bytes += stored;
+        else if (getenv("H3_PROFILE"))
+            fprintf(stderr, "h3: cannot save AdaLN cache for %s: %s\n",
+                    weight_name,
+                    cache_error[0] ? cache_error : "unknown error");
+    }
+    return result;
+}
+
+h3_dit_schedule *h3_dit_schedule_precompute_cached(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
-    int audio_condition,
+    int audio_condition, const char *cache_directory,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
@@ -260,6 +399,10 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     free(features);
     features = NULL;
     if (!time) goto failed;
+    uint64_t time_hash = cache_directory
+                             ? schedule_time_hash(time, schedule->time_rows)
+                             : 0;
+    schedule_cache_stats cache_stats = {0};
 
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
         char weight_name[128], bias_name[128], operation[128];
@@ -267,32 +410,12 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                  "blocks.%u.adaln_proj.linear.weight", block);
         snprintf(bias_name, sizeof(bias_name),
                  "blocks.%u.adaln_proj.linear.bias", block);
-        h3_gpu_tensor *weight = weight_bf16_2d(
-            weights, gpu, weight_name, BLOCK_OUTPUT, H3_DIT_TIME_DIM,
-            error, error_size);
-        h3_gpu_tensor *bias = weight_bf16_1d(
-            weights, gpu, bias_name, BLOCK_OUTPUT, error, error_size);
-        schedule->blocks[block] = h3_gpu_tensor_new_bf16(
-            gpu, (size_t)schedule->time_rows * BLOCK_OUTPUT);
-        if (!weight || !bias || !schedule->blocks[block]) {
-            if (!error || !*error)
-                fail(error, error_size, "cannot allocate AdaLN block %u: %s",
-                     block, h3_gpu_error(gpu));
-            free_tensor(&weight);
-            free_tensor(&bias);
-            h3_gpu_tensor_free(time);
-            goto failed;
-        }
         snprintf(operation, sizeof(operation), "AdaLN block %u", block);
-        int ok = gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
-            gpu_op(gpu, h3_gpu_linear_bf16(
-                gpu, schedule->blocks[block], time, weight, bias,
-                schedule->time_rows, H3_DIT_TIME_DIM, BLOCK_OUTPUT),
-                error, error_size, operation) &&
-            gpu_op(gpu, h3_gpu_submit(gpu), error, error_size, operation);
-        free_tensor(&weight);
-        free_tensor(&bias);
-        if (!ok) {
+        schedule->blocks[block] = schedule_projection(
+            weights, gpu, time, schedule->time_rows, weight_name, bias_name,
+            BLOCK_OUTPUT, operation, cache_directory, time_hash, &cache_stats,
+            error, error_size);
+        if (!schedule->blocks[block]) {
             h3_gpu_tensor_free(time);
             goto failed;
         }
@@ -300,40 +423,44 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                                progress_opaque);
     }
 
-    h3_gpu_tensor *final_w = weight_bf16_2d(
-        weights, gpu, "final_layer.adaln_proj.linear.weight",
-        FINAL_OUTPUT, H3_DIT_TIME_DIM, error, error_size);
-    h3_gpu_tensor *final_b = weight_bf16_1d(
-        weights, gpu, "final_layer.adaln_proj.linear.bias",
-        FINAL_OUTPUT, error, error_size);
-    schedule->final = h3_gpu_tensor_new_bf16(
-        gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
-    if (!final_w || !final_b || !schedule->final ||
-        !gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
-                "begin final AdaLN") ||
-        !gpu_op(gpu, h3_gpu_linear_bf16(
-            gpu, schedule->final, time, final_w, final_b, schedule->time_rows,
-            H3_DIT_TIME_DIM, FINAL_OUTPUT), error, error_size,
-            "final AdaLN projection") ||
-        !gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
-                "submit final AdaLN")) {
-        if ((!error || !*error) && (!final_w || !final_b || !schedule->final))
-            fail(error, error_size, "cannot allocate final AdaLN tensors: %s",
-                 h3_gpu_error(gpu));
-        free_tensor(&final_w);
-        free_tensor(&final_b);
-        h3_gpu_tensor_free(time);
-        goto failed;
-    }
-    free_tensor(&final_w);
-    free_tensor(&final_b);
+    schedule->final = schedule_projection(
+        weights, gpu, time, schedule->time_rows,
+        "final_layer.adaln_proj.linear.weight",
+        "final_layer.adaln_proj.linear.bias", FINAL_OUTPUT,
+        "final AdaLN projection", cache_directory, time_hash, &cache_stats,
+        error, error_size);
     h3_gpu_tensor_free(time);
+    if (!schedule->final)
+        goto failed;
+    if (cache_directory && getenv("H3_PROFILE")) {
+        fprintf(stderr,
+                "h3: AdaLN cache hits=%llu misses=%llu "
+                "loaded=%.3fGiB/%.3fs stored=%.3fGiB/%.3fs path=%s\n",
+                (unsigned long long)cache_stats.hits,
+                (unsigned long long)cache_stats.misses,
+                (double)cache_stats.loaded_bytes /
+                    (1024.0 * 1024.0 * 1024.0),
+                cache_stats.load_seconds,
+                (double)cache_stats.stored_bytes /
+                    (1024.0 * 1024.0 * 1024.0),
+                cache_stats.store_seconds, cache_directory);
+    }
     return schedule;
 
 failed:
     free(features);
     h3_dit_schedule_free(schedule);
     return NULL;
+}
+
+h3_dit_schedule *h3_dit_schedule_precompute(
+    const h3_weight_store *weights, h3_gpu *gpu,
+    const h3_sigma_schedule *sigmas, int visual_condition,
+    int audio_condition, h3_dit_schedule_progress progress,
+    void *progress_opaque, char *error, size_t error_size) {
+    return h3_dit_schedule_precompute_cached(
+        weights, gpu, sigmas, visual_condition, audio_condition, NULL,
+        progress, progress_opaque, error, error_size);
 }
 
 void h3_dit_schedule_free(h3_dit_schedule *schedule) {

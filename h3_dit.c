@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_int8_cache.h"
 #include "h3_weights.h"
 
 #include <math.h>
@@ -88,6 +89,14 @@ struct h3_dit {
     int use_int8_row_fc2;
     int ssd_streaming;
     int keep_bf16_mlp;
+    char *int8_cache_directory;
+    char *schedule_cache_directory;
+    uint64_t int8_cache_hits;
+    uint64_t int8_cache_misses;
+    uint64_t int8_cache_loaded_bytes;
+    uint64_t int8_cache_stored_bytes;
+    double int8_cache_load_seconds;
+    double int8_cache_store_seconds;
     int activation_aliases;
     int fused_patch_projection;
     int fused_patch_pack;
@@ -689,74 +698,132 @@ static void *read_stream_layer_thread(void *opaque) {
     return NULL;
 }
 
-static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
-                              char *error, size_t error_size) {
-    block->fc1_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)FFN * 2 * HIDDEN);
-    block->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
-    block->fc2_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)HIDDEN * FFN);
-    block->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
-    int ok = block->fc1_int8 && block->fc1_scales &&
-             block->fc2_int8 && block->fc2_scales &&
-             h3_gpu_begin(dit->gpu) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->fc1_int8, block->fc1_scales, block->fc1,
-                 FFN * 2, HIDDEN) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->fc2_int8, block->fc2_scales, block->fc2,
-                 HIDDEN, FFN) &&
-             h3_gpu_submit(dit->gpu);
-    if (!ok) {
-        fail(error, error_size, "cannot quantize DiT MLP weights: %s",
-             h3_gpu_error(dit->gpu));
-        return 0;
+#if defined(H3_HAVE_CUDA)
+static char *default_cache_path(const char *root, const char *suffix) {
+    size_t root_length = strlen(root);
+    size_t suffix_length = strlen(suffix);
+    if (root_length > SIZE_MAX - suffix_length - 1u)
+        return NULL;
+    char *path = malloc(root_length + suffix_length + 1u);
+    if (path)
+        snprintf(path, root_length + suffix_length + 1u, "%s%s", root,
+                 suffix);
+    return path;
+}
+#endif
+
+static void configure_cuda_caches(h3_dit *dit,
+                                  const char *weight_directory) {
+#if defined(H3_HAVE_CUDA)
+    if (!dit)
+        return;
+    if (!getenv("H3_DISABLE_ADALN_CACHE")) {
+        const char *override = getenv("H3_ADALN_CACHE_DIR");
+        if (!(override && (!*override || strcmp(override, "0") == 0)))
+            dit->schedule_cache_directory = override
+                ? strdup(override)
+                : default_cache_path(
+                      weight_directory, "/.h3-cache/cuda-adaln-v1");
     }
-    if (!dit->keep_bf16_mlp) {
-        free_tensor(&block->fc1);
-        free_tensor(&block->fc2);
-    }
-    return 1;
+    if ((!dit->int8_mlp && !dit->int8_qkv &&
+         !dit->int8_attention_out) || getenv("H3_DISABLE_INT8_CACHE"))
+        return;
+    const char *override = getenv("H3_INT8_CACHE_DIR");
+    if (override && (!*override || strcmp(override, "0") == 0))
+        return;
+    dit->int8_cache_directory = override
+        ? strdup(override)
+        : default_cache_path(weight_directory,
+                             "/.h3-cache/cuda-int8-v1");
+#else
+    (void)dit;
+    (void)weight_directory;
+#endif
 }
 
-static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
-                              char *error, size_t error_size) {
-    block->qkv_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)INNER * 3 * HIDDEN);
-    block->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
-    int ok = block->qkv_int8 && block->qkv_scales &&
-             h3_gpu_begin(dit->gpu) &&
+static int quantize_resident_matrix(
+    h3_dit *dit, const char *name, uint32_t rows, uint32_t columns,
+    int keep_bf16, h3_gpu_tensor **bf16_weight,
+    h3_gpu_tensor **int8_weight, h3_gpu_tensor **scales,
+    char *error, size_t error_size) {
+    if (!dit || !name || !bf16_weight || !int8_weight || !scales ||
+        !rows || !columns) {
+        fail(error, error_size, "invalid cached int8 matrix request");
+        return 0;
+    }
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *source = h3_weight_find(dit->weights, name, &header);
+    if (!source || !header || source->dtype != H3_DTYPE_BF16 ||
+        source->ndim != 2 || source->shape[0] != rows ||
+        source->shape[1] != columns) {
+        fail(error, error_size, "int8 source weight has wrong schema: %s",
+             name);
+        return 0;
+    }
+    int hit = 0;
+    if (dit->int8_cache_directory) {
+        uint64_t loaded = 0;
+        char cache_error[512] = {0};
+        double started = stream_now();
+        int cache_ok = h3_int8_cache_load(
+            dit->gpu, dit->int8_cache_directory, name, header->path,
+            source->file_offset, rows, columns, int8_weight, scales, &hit,
+            &loaded, cache_error, sizeof(cache_error));
+        dit->int8_cache_load_seconds += stream_now() - started;
+        if (!cache_ok) {
+            if (getenv("H3_PROFILE"))
+                fprintf(stderr, "h3: ignoring int8 cache read for %s: %s\n",
+                        name, cache_error[0] ? cache_error : "unknown error");
+            free_tensor(int8_weight);
+            free_tensor(scales);
+            hit = 0;
+        }
+        if (hit) {
+            dit->int8_cache_hits++;
+            dit->int8_cache_loaded_bytes += loaded;
+            if (keep_bf16) {
+                *bf16_weight = bf2(dit, name, rows, columns,
+                                   error, error_size);
+                if (!*bf16_weight)
+                    return 0;
+            }
+            return 1;
+        }
+        dit->int8_cache_misses++;
+    }
+    *bf16_weight = bf2(dit, name, rows, columns, error, error_size);
+    if (!*bf16_weight)
+        return 0;
+    size_t weight_elements = (size_t)rows * columns;
+    *int8_weight = h3_gpu_tensor_new_i8(dit->gpu, weight_elements);
+    *scales = h3_gpu_tensor_new_f32(dit->gpu, rows);
+    int ok = *int8_weight && *scales && h3_gpu_begin(dit->gpu) &&
              h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->qkv_int8, block->qkv_scales, block->qkv,
-                 INNER * 3, HIDDEN) &&
+                 dit->gpu, *int8_weight, *scales, *bf16_weight, rows,
+                 columns) &&
              h3_gpu_submit(dit->gpu);
     if (!ok) {
-        fail(error, error_size, "cannot quantize DiT QKV weight: %s",
+        fail(error, error_size, "cannot quantize DiT weight %s: %s", name,
              h3_gpu_error(dit->gpu));
         return 0;
     }
-    if (!dit->keep_bf16_qkv) free_tensor(&block->qkv);
-    return 1;
-}
-
-static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
-                                        char *error, size_t error_size) {
-    block->out_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)HIDDEN * INNER);
-    block->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
-    int ok = block->out_int8 && block->out_scales &&
-             h3_gpu_begin(dit->gpu) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->out_int8, block->out_scales, block->out,
-                 HIDDEN, INNER) &&
-             h3_gpu_submit(dit->gpu);
-    if (!ok) {
-        fail(error, error_size,
-             "cannot quantize DiT attention-output weight: %s",
-             h3_gpu_error(dit->gpu));
-        return 0;
+    if (dit->int8_cache_directory) {
+        uint64_t stored = 0;
+        char cache_error[512] = {0};
+        double started = stream_now();
+        int saved = h3_int8_cache_save(
+            dit->int8_cache_directory, name, header->path,
+            source->file_offset, rows, columns, *int8_weight, *scales,
+            &stored, cache_error, sizeof(cache_error));
+        dit->int8_cache_store_seconds += stream_now() - started;
+        if (saved)
+            dit->int8_cache_stored_bytes += stored;
+        else if (getenv("H3_PROFILE"))
+            fprintf(stderr, "h3: cannot save int8 cache for %s: %s\n", name,
+                    cache_error[0] ? cache_error : "unknown error");
     }
-    if (!dit->keep_bf16_attention_out) free_tensor(&block->out);
+    if (!keep_bf16)
+        free_tensor(bf16_weight);
     return 1;
 }
 
@@ -1238,6 +1305,68 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
     }
 }
 
+static int load_resident_block(h3_dit *dit, h3_dit_block *block,
+                               unsigned index, char *error,
+                               size_t error_size) {
+    char prefix[64];
+    char name[160];
+    snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
+    if (!load_block_norms(dit, block, prefix, error, error_size))
+        return 0;
+#define MATRIX_NAME(suffix)                                                     \
+    snprintf(name, sizeof(name), "blocks.%u.%s", index, suffix)
+    MATRIX_NAME("attn.qkv_proj.weight");
+    if (dit->int8_qkv) {
+        if (!quantize_resident_matrix(
+                dit, name, INNER * 3, HIDDEN, dit->keep_bf16_qkv,
+                &block->qkv, &block->qkv_int8, &block->qkv_scales,
+                error, error_size))
+            return 0;
+    } else {
+        block->qkv = bf2(dit, name, INNER * 3, HIDDEN, error, error_size);
+        if (!block->qkv)
+            return 0;
+    }
+    MATRIX_NAME("attn.out_proj.weight");
+    if (dit->int8_attention_out) {
+        if (!quantize_resident_matrix(
+                dit, name, HIDDEN, INNER, dit->keep_bf16_attention_out,
+                &block->out, &block->out_int8, &block->out_scales,
+                error, error_size))
+            return 0;
+    } else {
+        block->out = bf2(dit, name, HIDDEN, INNER, error, error_size);
+        if (!block->out)
+            return 0;
+    }
+    MATRIX_NAME("mlp.fc1.weight");
+    if (dit->int8_mlp) {
+        if (!quantize_resident_matrix(
+                dit, name, FFN * 2, HIDDEN, dit->keep_bf16_mlp,
+                &block->fc1, &block->fc1_int8, &block->fc1_scales,
+                error, error_size))
+            return 0;
+    } else {
+        block->fc1 = bf2(dit, name, FFN * 2, HIDDEN, error, error_size);
+        if (!block->fc1)
+            return 0;
+    }
+    MATRIX_NAME("mlp.fc2.weight");
+    if (dit->int8_mlp) {
+        if (!quantize_resident_matrix(
+                dit, name, HIDDEN, FFN, dit->keep_bf16_mlp,
+                &block->fc2, &block->fc2_int8, &block->fc2_scales,
+                error, error_size))
+            return 0;
+    } else {
+        block->fc2 = bf2(dit, name, HIDDEN, FFN, error, error_size);
+        if (!block->fc2)
+            return 0;
+    }
+#undef MATRIX_NAME
+    return 1;
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
@@ -1253,18 +1382,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
-        } else {
-            if (!load_block(dit, &dit->blocks[index], prefix,
-                            error, error_size)) return 0;
-            if (dit->int8_mlp &&
-                !quantize_block_mlp(dit, &dit->blocks[index],
-                                    error, error_size)) return 0;
-            if (dit->int8_qkv &&
-                !quantize_block_qkv(dit, &dit->blocks[index],
-                                    error, error_size)) return 0;
-            if (dit->int8_attention_out &&
-                !quantize_block_attention_out(
-                    dit, &dit->blocks[index], error, error_size)) return 0;
+        } else if (!load_resident_block(
+                       dit, &dit->blocks[index], index, error, error_size)) {
+            return 0;
         }
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
@@ -1665,14 +1785,16 @@ static h3_dit *load_dit(const char *weight_directory,
          getenv("H3_BENCH_INT8_MLP_AB") ||
          getenv("H3_INT8_MLP_STAGE") ||
          getenv("H3_DISABLE_INT8_MLP"));
+    configure_cuda_caches(dit, weight_directory);
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
     report(progress, progress_opaque, "refine text", 1, 1);
     schedule_progress schedule_state = {progress, progress_opaque};
-    dit->schedule = h3_dit_schedule_precompute(
+    dit->schedule = h3_dit_schedule_precompute_cached(
         dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
-        dit->audio_condition_rows != 0, schedule_report, &schedule_state,
+        dit->audio_condition_rows != 0, dit->schedule_cache_directory,
+        schedule_report, &schedule_state,
         error, error_size);
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
@@ -3059,9 +3181,24 @@ void h3_dit_free(h3_dit *dit) {
                     ? gib / dit->stream_read_seconds : 0.0,
                 dit->stream_wait_seconds);
     }
+    if (dit->int8_cache_directory && getenv("H3_PROFILE")) {
+        double loaded = (double)dit->int8_cache_loaded_bytes /
+                        (1024.0 * 1024.0 * 1024.0);
+        double stored = (double)dit->int8_cache_stored_bytes /
+                        (1024.0 * 1024.0 * 1024.0);
+        fprintf(stderr,
+                "h3: int8 cache hits=%llu misses=%llu loaded=%.3fGiB/%.3fs "
+                "stored=%.3fGiB/%.3fs path=%s\n",
+                (unsigned long long)dit->int8_cache_hits,
+                (unsigned long long)dit->int8_cache_misses, loaded,
+                dit->int8_cache_load_seconds, stored,
+                dit->int8_cache_store_seconds, dit->int8_cache_directory);
+    }
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);
     h3_layout_free(&dit->layout);
+    free(dit->int8_cache_directory);
+    free(dit->schedule_cache_directory);
     free(dit);
 }
 

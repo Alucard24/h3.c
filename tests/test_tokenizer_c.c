@@ -146,6 +146,33 @@ int main(void) {
         h3_tokenizer_ids_free(ids);
     }
 
+    /* Regression: the pre-tokenizer must grow beyond its initial 16-piece
+     * array without writing past the allocation. */
+    enum { LONG_WORDS = 128 };
+    char long_text[LONG_WORDS * 6];
+    size_t long_length = 0;
+    for (size_t index = 0; index < LONG_WORDS; index++) {
+        if (index) long_text[long_length++] = ' ';
+        memcpy(long_text + long_length, "hello", 5);
+        long_length += 5;
+    }
+    long_text[long_length] = '\0';
+    uint32_t *long_ids = NULL;
+    size_t long_count = 0;
+    CHECK(h3_tokenizer_encode(tokenizer, long_text, 0, &long_ids,
+                              &long_count, error, sizeof(error)));
+    CHECK(long_count == LONG_WORDS);
+    int long_values_match = long_ids && long_count == LONG_WORDS &&
+                            long_ids[0] == 7;
+    for (size_t index = 1; index < long_count && long_values_match; index++)
+        long_values_match = long_ids[index] == 13;
+    CHECK(long_values_match);
+    char *long_decoded = h3_tokenizer_decode(
+        tokenizer, long_ids, long_count, error, sizeof(error));
+    CHECK(long_decoded && strcmp(long_decoded, long_text) == 0);
+    free(long_decoded);
+    h3_tokenizer_ids_free(long_ids);
+
     h3_tokenizer_free(tokenizer);
     unlink(path);
     free(path);

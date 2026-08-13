@@ -443,6 +443,30 @@ static char *h3_slice(const char *text, const h3_codepoint *points,
     return result;
 }
 
+static int h3_append_slice(char ***pieces, size_t *count, size_t *capacity,
+                           const char *text, const h3_codepoint *points,
+                           size_t start, size_t stop) {
+    char *piece = h3_slice(text, points, start, stop);
+    if (!piece) return 0;
+    if (*count == *capacity) {
+        if (*capacity > SIZE_MAX / 2 ||
+            *capacity * 2 > SIZE_MAX / sizeof(**pieces)) {
+            free(piece);
+            return 0;
+        }
+        size_t grown_capacity = *capacity * 2;
+        char **grown = realloc(*pieces, grown_capacity * sizeof(**pieces));
+        if (!grown) {
+            free(piece);
+            return 0;
+        }
+        *pieces = grown;
+        *capacity = grown_capacity;
+    }
+    (*pieces)[(*count)++] = piece;
+    return 1;
+}
+
 static size_t h3_contraction(const h3_codepoint *points, size_t count,
                              size_t index) {
     static const char *values[] = {"'s", "'t", "'re", "'ve", "'m", "'ll",
@@ -487,8 +511,11 @@ static char **h3_pretokenize(const char *text, size_t length, size_t *count,
     while (index < point_count) {
         size_t contraction = h3_contraction(points, point_count, index);
         if (contraction) {
-            pieces[piece_count++] = h3_slice(text, points, index,
-                                             index + contraction);
+            if (!h3_append_slice(&pieces, &piece_count, &piece_capacity,
+                                 text, points, index, index + contraction)) {
+                failed = 1;
+                break;
+            }
             index += contraction;
             continue;
         }
@@ -506,12 +533,20 @@ static char **h3_pretokenize(const char *text, size_t length, size_t *count,
         if (letter_start >= 0) {
             size_t stop = (size_t)letter_start;
             while (stop < point_count && h3_letter(points[stop].value)) stop++;
-            pieces[piece_count++] = h3_slice(text, points, index, stop);
+            if (!h3_append_slice(&pieces, &piece_count, &piece_capacity,
+                                 text, points, index, stop)) {
+                failed = 1;
+                break;
+            }
             index = stop;
             continue;
         }
         if (h3_number(value)) {
-            pieces[piece_count++] = h3_slice(text, points, index, index + 1);
+            if (!h3_append_slice(&pieces, &piece_count, &piece_capacity,
+                                 text, points, index, index + 1)) {
+                failed = 1;
+                break;
+            }
             index++;
             continue;
         }
@@ -528,7 +563,11 @@ static char **h3_pretokenize(const char *text, size_t length, size_t *count,
             while (stop < point_count &&
                    (points[stop].value == '\r' ||
                     points[stop].value == '\n')) stop++;
-            pieces[piece_count++] = h3_slice(text, points, index, stop);
+            if (!h3_append_slice(&pieces, &piece_count, &piece_capacity,
+                                 text, points, index, stop)) {
+                failed = 1;
+                break;
+            }
             index = stop;
             continue;
         }
@@ -551,22 +590,21 @@ static char **h3_pretokenize(const char *text, size_t length, size_t *count,
                 piece_end = whitespace_end - 1;
             else
                 piece_end = index + 1;
-            pieces[piece_count++] = h3_slice(text, points, index, piece_end);
+            if (!h3_append_slice(&pieces, &piece_count, &piece_capacity,
+                                 text, points, index, piece_end)) {
+                failed = 1;
+                break;
+            }
             index = piece_end;
             continue;
         }
         /* Unreachable in the Qwen2 grammar; emit the codepoint alone. */
-        pieces[piece_count++] = h3_slice(text, points, index, index + 1);
-        index++;
-        if (piece_count >= piece_capacity) {
-            piece_capacity *= 2;
-            char **grown = realloc(pieces, piece_capacity * sizeof(*pieces));
-            if (!grown) {
-                failed = 1;
-                break;
-            }
-            pieces = grown;
+        if (!h3_append_slice(&pieces, &piece_count, &piece_capacity,
+                             text, points, index, index + 1)) {
+            failed = 1;
+            break;
         }
+        index++;
     }
     free(points);
     if (failed) {

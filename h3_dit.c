@@ -77,6 +77,7 @@ struct h3_dit {
     int int8_mlp;
     int int8_qkv;
     int int8_attention_out;
+    int fused_int8_mlp_input;
     int keep_bf16_qkv;
     int keep_bf16_attention_out;
     int use_slower_row_major_attention_output;
@@ -98,6 +99,7 @@ struct h3_dit {
     double int8_cache_load_seconds;
     double int8_cache_store_seconds;
     int activation_aliases;
+    int activated_aliases_qkv;
     int fused_patch_projection;
     int fused_patch_pack;
     int token_reduction;
@@ -1599,7 +1601,17 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         dit->fc1 = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN * 2);
     }
     if (!dit->fused_mlp || dit->nax_mlp || dit->int8_mlp) {
-        dit->activated = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN);
+        /* Once attention output is projected, QKV storage is dead for the
+         * block. With a prequantized FC1 input it can safely hold SwiGLU,
+         * saving a sequence x FFN BF16 allocation on long CUDA renders. */
+        if (dit->activation_aliases && dit->fused_int8_mlp_input &&
+            !dit->token_reduction) {
+            dit->activated = dit->qkv;
+            dit->activated_aliases_qkv = 1;
+        } else {
+            dit->activated = h3_gpu_tensor_new_bf16(
+                dit->gpu, sequence * FFN);
+        }
         if ((!dit->fused_mlp && !dit->fc1) || !dit->activated) {
             fail(error, error_size,
                  "cannot allocate diagnostic DiT MLP tensors: %s",
@@ -1780,6 +1792,11 @@ static h3_dit *load_dit(const char *weight_directory,
          getenv("H3_DISABLE_INT8_QKV"));
     dit->use_slower_grouped_quantizer = use_slower_grouped_quantizer;
     dit->use_int8_row_fc2 = dit->int8_mlp && use_int8_row_fc2;
+    dit->fused_int8_mlp_input = dit->int8_mlp &&
+        !getenv("H3_DISABLE_INT8_MLP") &&
+        !dit->use_slower_unfused_int8_inputs &&
+        !getenv("H3_DISABLE_FUSED_INT8_MLP_INPUT") &&
+        !getenv("H3_INT8_MLP_STAGE");
     dit->keep_bf16_mlp = dit->int8_mlp &&
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||
@@ -2077,11 +2094,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
     }
-    int fused_int8_mlp_input = dit->int8_mlp &&
-        !getenv("H3_DISABLE_INT8_MLP") &&
-        !dit->use_slower_unfused_int8_inputs &&
-        !getenv("H3_DISABLE_FUSED_INT8_MLP_INPUT") &&
-        !getenv("H3_INT8_MLP_STAGE");
+    int fused_int8_mlp_input = dit->fused_int8_mlp_input;
     if (fused_int8_mlp_input) {
         uint32_t padded_rows = (rows + 127u) & ~127u;
         OP(h3_gpu_gate_adaln_quantize_int8(
@@ -3152,6 +3165,8 @@ void h3_dit_free(h3_dit *dit) {
         dit->attention_heads = NULL;
         dit->mod_mlp = NULL;
     }
+    if (dit->activated_aliases_qkv)
+        dit->activated = NULL;
     FREE(video_input); FREE(audio_input);
     FREE(video_projected_f32); FREE(audio_projected_f32);
     FREE(video_projected); FREE(audio_projected);

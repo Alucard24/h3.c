@@ -181,8 +181,8 @@ layout(set = 0, binding = 2) writeonly buffer OutF32B2 { float data[]; } out_f32
 void main_add_scaled_f32() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= args.data.elements) return;
-    out_f32_b2.data[gid] = in_f32.data[gid] * args.data.left_scale +
-                           in_f32_b1.data[gid] * args.data.right_scale;
+    out_f32_b2.data[gid] = fma(in_f32_b1.data[gid], args.data.right_scale,
+                               in_f32.data[gid] * args.data.left_scale);
 }
 
 void main_geglu_f32() {

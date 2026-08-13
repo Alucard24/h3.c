@@ -282,7 +282,6 @@ static int h3_json_skip_value(h3_json *json) {
     if (json->cursor >= json->end) return 0;
     char c = *json->cursor;
     if (c == '{' || c == '[') {
-        char closing = c == '{' ? '}' : ']';
         json->cursor++;
         int depth = 1;
         while (json->cursor < json->end && depth > 0) {

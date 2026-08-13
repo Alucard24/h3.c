@@ -3,10 +3,12 @@ misc/
 MiniMax-H3/
 outputs/
 .ruff_cache/
+.serena/
 
 # Compiler and test outputs.
 *.o
 *.d
+.build-config-*
 *.air
 *.metallib
 h3

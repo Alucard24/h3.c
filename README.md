@@ -1,13 +1,14 @@
 # h3-metal
 
-Native MiniMax-H3 inference for Apple Silicon. The project is being built as a
-sequence of working vertical slices: deterministic host/model metadata first,
-then portable Metal block parity, prompt encoding, prompt-to-video/audio, and
-first/last-frame conditioning and then ordered references.
+Native MiniMax-H3 inference for Apple Silicon and Linux/NVIDIA, with Metal,
+Vulkan, and CUDA GPU backends. The project is built as a sequence of working
+vertical slices: deterministic host/model metadata, backend parity, prompt
+encoding, prompt-to-video/audio, first/last-frame conditioning, and ordered
+references.
 
 Prompt-to-video/audio, first/last-frame conditioning, and ordered Ref2VA
-image/video/audio references work end to end. The current work is incremental
-H3-specific Metal performance and memory optimization on M3 Max and M5 Max.
+image/video/audio references work end to end. Metal performance work targets
+M3 Max and M5 Max; the Linux backends are validated on an RTX 5070 Ti.
 
 ## Tutorial
 
@@ -22,9 +23,9 @@ mkdir -p outputs
 ./h3 --info -d ./MiniMax-H3
 ```
 
-`--info` checks the model layout and prints the selected Metal device without
-mapping all weights or generating media. Run `./h3 --help` for the complete CLI
-reference.
+`--info` checks the model layout and prints the selected GPU backend and device
+without mapping all weights or generating media. Run `./h3 --help` for the
+complete CLI reference.
 
 Without `-p`, the same binary starts an Iris-style interactive session:
 
@@ -424,27 +425,30 @@ FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 32 kHz stereo F32 PCM are fed through concurrent pipes; no intermediate
 uncompressed media file is created.
 
-## Linux host build (backend scaffolding)
+## Linux builds and backend selection
 
-The Metal runtime (`h3_metal.m`, `h3_gpu.m`) and the Foundation tokenizer
-(`h3_tokenizer.m`) are macOS-only. On Linux the Makefile replaces them with
-host stubs (`h3_gpu_stub.c`, `h3_metal_stub.c`, `h3_tokenizer_stub.c`) that
-fail cleanly, so the deterministic CPU suite builds and runs without any GPU:
+The Metal runtime (`h3_metal.m`, `h3_gpu.m`) and Foundation tokenizer
+(`h3_tokenizer.m`) are macOS-only. Linux uses the portable ICU tokenizer and C
+host/media code. The Makefile selects Vulkan automatically when Vulkan 1.3 and
+shaderc are available; `GPU=cuda` explicitly selects the native CUDA backend,
+and `GPU=stub` keeps a host-only diagnostic build.
 
 ```sh
-make -j8
-make test
+make -j8                    # Vulkan when available
+make GPU=cuda -j8           # native CUDA
+make GPU=stub -j8           # no GPU runtime
+make GPU=cuda test          # host + CUDA kernels + DiT block + tokenizer
 ```
 
-The high-quality RGB resize falls back to a portable bilinear implementation
-(`h3_host.c`) when Accelerate/vImage is absent. `make test` on Linux runs only
-`h3_tests`; the Metal parity targets require an Apple Silicon Mac. GPU
-operations, tokenization, and media generation report a clear error in this
-configuration.
+A build-configuration stamp forces C objects to rebuild when `GPU` changes, so
+a manual clean is not required when switching backends. The high-quality RGB
+resize falls back to portable bilinear C when Accelerate/vImage is absent.
+Metal/MLX parity targets still require Apple Silicon; Linux real-checkpoint
+fixtures use `make GPU=cuda real-parity` or the default Vulkan build.
 
-This is the entry point for the Vulkan/CUDA backend work: `h3_gpu.h` is the
-stable backend contract, and the stub files are replaced incrementally by real
-implementations (kernel by kernel) as they land.
+`h3_gpu.h` is the stable backend contract. Vulkan and CUDA implement the same
+103 public entry points; composition helpers route those calls through the
+backend's native tensor, stream/queue, copy, and kernel primitives.
 
 ## Vulkan backend (Linux/NVIDIA)
 
@@ -605,6 +609,80 @@ weight quantization also adds startup time. For an all-int8/all-BF16 A-B, run
 the same seed with the defaults and then with `--ssd-streaming`, which disables
 all three int8 projection paths; quantization can change fine details even
 after layout and scaling are correct.
+
+## CUDA backend (Linux/NVIDIA)
+
+Select CUDA explicitly so installing the CUDA toolkit does not silently change
+a working Vulkan build:
+
+```sh
+make GPU=cuda -j8
+make GPU=cuda test
+make GPU=cuda smoke
+```
+
+The build searches `PATH` and `/opt/cuda/bin` for `nvcc`. `CUDA_HOME` may point
+to another toolkit, `CUDA_ARCH` overrides nvcc's default `native` target (for
+example `CUDA_ARCH=sm_120`), and `H3_CUDA_DEVICE=N` selects a device at runtime.
+The tested configuration is CUDA 12.8, driver 610.57.04, and an RTX 5070 Ti
+(`sm_120`, 16 GB).
+
+`h3_gpu_cuda.c` owns CUDA device allocations, file staging, device-to-device
+copies, one ordered nonblocking stream, submission/error handling, and
+per-dispatch argument snapshots. `h3_cuda_kernels.cu` contains 62 native CUDA
+compute entries covering the complete generation path: BF16 and f32 primitives,
+DiT fusions, naive/flash attention, text/vision encoders, video/audio VAE, and
+the row/grouped int8 paths. It is generated from the arithmetic oracle in
+`h3_vulkan_shaders.comp` by `scripts/generate_cuda_kernels.py`; do not edit the
+generated file directly. This keeps FMA order, BF16 boundaries, bindings, and
+workgroup geometry aligned across the two Linux backends while allowing hot
+CUDA kernels to be specialized later.
+
+### CUDA validation and 16 GB preset
+
+The CUDA build passes 1,765 host checks, 451 GPU-kernel checks, 20 complete DiT
+block checks, and 30 tokenizer checks with the strict C warning flags. The same
+change passes the complete Vulkan regression suite. A real-checkpoint smoke
+used seed 42, 256x256, 8 requested frames, 5 steps, `--reuse 3`, and 35 active
+layers; it produced a 22-frame, 0.925-second H.264/AAC file.
+
+| CUDA mode on RTX 5070 Ti 16 GB | Wall time | vs int8 | Result |
+|---|---:|---:|---|
+| resident int8 (default) | **105 s** | baseline | success |
+| BF16 streamed from SSD | 135 s | 28.6% slower | success |
+| resident BF16 QKV, rest int8 | — | — | OOM while loading block 45 |
+| resident BF16 attention output, rest int8 | — | — | OOM allocating first denoiser scratch |
+
+The default int8 render was structurally valid and measured 22.08 dB PSNR /
+0.1196 RGB relative L2 against the same-seed streamed-BF16 render. These are
+single-seed decoded-video measurements, not a perceptual-quality study.
+
+For a 16 GB CUDA card, the best **resident speed/capacity compromise is the
+default all-int8 projection path**:
+
+```sh
+./h3 -d MiniMax-H3 -p "A red fox walking through snow" \
+  --width 256 --height 256 --frames 8 --steps 5 --reuse 3 --layers 35 \
+  -o outputs/fox-cuda-int8.mp4
+```
+
+When closer-reference quality matters, `--ssd-streaming` is the recommended
+CUDA quality compromise: it uses all-BF16 block weights with bounded VRAM and
+cost only about 29% in this smoke test.
+
+```sh
+./h3 -d MiniMax-H3 -p "A red fox walking through snow" \
+  --width 256 --height 256 --frames 8 --steps 5 --reuse 3 --layers 35 \
+  --ssd-streaming -o outputs/fox-cuda-bf16.mp4
+```
+
+Unlike Vulkan's driver-managed allocations, CUDA residency enforces the card's
+physical allocation limit, so the Vulkan recommendation to retain QKV in BF16
+does **not** fit this 16 GB CUDA configuration at 35 layers. Cards with more
+VRAM can still use the individual `--use-slower-bf16-*` controls. The current
+correctness kernels already made the observed CUDA int8 smoke about 3.4x faster
+than the comparable Vulkan run; CUDA tensor-core/cuBLASLt specialization remains
+a future optimization rather than a correctness dependency.
 
 ## Implementation and performance notes
 

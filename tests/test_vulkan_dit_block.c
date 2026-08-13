@@ -1,13 +1,9 @@
-/* End-to-end DiT block on the Vulkan backend.
+/* End-to-end portable DiT block on the active Linux GPU backend.
  *
  * Replicates tests/test_real_dit_block.c's run_dit_block_inplace sequence
  * (modulation linear, AdaLN, QKV, grouped QKV/RoPE, SDPA, attention
  * output, gate, MLP AdaLN, fc1/SwiGLU/fc2, gate) with synthetic weights
  * and a CPU reference that reproduces the kernel arithmetic order.
- * Verifies the whole portable DiT block chain on Vulkan without the MLX
- * fixtures.
- *
- * Skips cleanly when no Vulkan backend is available.
  */
 #include "h3_gpu.h"
 
@@ -17,6 +13,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#if defined(H3_HAVE_CUDA)
+#define H3_TEST_BACKEND "CUDA"
+#else
+#define H3_TEST_BACKEND "Vulkan"
+#endif
 
 enum {
     SEQUENCE = 8, HIDDEN = 5376, HEADS = 56, HEAD_DIM = 128,
@@ -95,20 +97,6 @@ static void ref_linear(const uint16_t *input, const uint16_t *weight,
                            bf16f(weight[column * input_dim + k]), sum);
             }
             output[row * output_dim + column] = bf16(sum);
-        }
-    }
-}
-
-static void ref_rms_norm(const uint16_t *input, const uint16_t *weight,
-                         uint16_t *output, uint32_t rows, uint32_t width,
-                         float epsilon) {
-    for (uint32_t row = 0; row < rows; row++) {
-        float inverse = 1.0f / sqrtf(tree_sum256(input + row * width, width) /
-                                     (float)width + epsilon);
-        for (uint32_t column = 0; column < width; column++) {
-            float normalized = bf16f(input[row * width + column]) * inverse *
-                               bf16f(weight[column]);
-            output[row * width + column] = bf16(normalized);
         }
     }
 }
@@ -313,11 +301,12 @@ static h3_gpu_tensor *u32_tensor(h3_gpu *gpu, const uint32_t *values,
 }
 
 int main(int argc, char **argv) {
-    const char *shader_path = argc > 1 ? argv[1] : "h3_vulkan_shaders.comp";
+    const char *shader_path = argc > 1 ? argv[1] : H3_SHADER_SOURCE;
     char error[512] = {0};
     h3_gpu *gpu = h3_gpu_create(shader_path, error, sizeof(error));
     if (!gpu) {
-        printf("SKIP: no Vulkan backend available (%s)\n", error);
+        printf("SKIP: no %s backend available (%s)\n", H3_TEST_BACKEND,
+               error);
         return 0;
     }
 
@@ -531,7 +520,7 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &end);
     double seconds = (double)(end.tv_sec - start.tv_sec) +
                      (double)(end.tv_nsec - start.tv_nsec) * 1e-9;
-    printf("DiT block (Vulkan): %.2f s\n", seconds);
+    printf("DiT block (%s): %.2f s\n", H3_TEST_BACKEND, seconds);
 
     h3_gpu_free(gpu);
     free(adaln_w); free(adaln_b); free(norm1); free(norm2);
@@ -547,6 +536,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAILED: %d of %d checks\n", failed, tests_run);
         return 1;
     }
-    printf("ok: %d checks (DiT block on Vulkan)\n", tests_run);
+    printf("ok: %d checks (DiT block on %s)\n", tests_run,
+           H3_TEST_BACKEND);
     return 0;
 }

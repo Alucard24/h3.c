@@ -1,6 +1,5 @@
-/* Vulkan backend kernel tests: parity against CPU references computed with
- * the same arithmetic as h3_shaders.metal. Skips cleanly when no Vulkan
- * device is available. */
+/* Linux GPU kernel tests: parity against CPU references computed with the
+ * same arithmetic as h3_shaders.metal. Shared by Vulkan and CUDA. */
 #include "h3_gpu.h"
 
 #include <fcntl.h>
@@ -10,6 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#if defined(H3_HAVE_CUDA)
+#define H3_TEST_BACKEND "CUDA"
+#else
+#define H3_TEST_BACKEND "Vulkan"
+#endif
 
 static int tests_run;
 static int failed;
@@ -3848,11 +3853,12 @@ static void test_continue_chain(h3_gpu *gpu) {
 }
 
 int main(int argc, char **argv) {
-    const char *shader_path = argc > 1 ? argv[1] : "h3_vulkan_shaders.comp";
+    const char *shader_path = argc > 1 ? argv[1] : H3_SHADER_SOURCE;
     char error[512] = {0};
     h3_gpu *gpu = h3_gpu_create(shader_path, error, sizeof(error));
     if (!gpu) {
-        printf("SKIP: no Vulkan backend available (%s)\n", error);
+        printf("SKIP: no %s backend available (%s)\n", H3_TEST_BACKEND,
+               error);
         return 0;
     }
     test_cast_and_unary(gpu);
@@ -3917,6 +3923,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAILED: %d of %d checks\n", failed, tests_run);
         return 1;
     }
-    printf("ok: %d checks (Vulkan backend)\n", tests_run);
+    printf("ok: %d checks (%s backend)\n", tests_run, H3_TEST_BACKEND);
     return 0;
 }

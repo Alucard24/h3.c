@@ -99,20 +99,6 @@ static void ref_linear(const uint16_t *input, const uint16_t *weight,
     }
 }
 
-static void ref_rms_norm(const uint16_t *input, const uint16_t *weight,
-                         uint16_t *output, uint32_t rows, uint32_t width,
-                         float epsilon) {
-    for (uint32_t row = 0; row < rows; row++) {
-        float inverse = 1.0f / sqrtf(tree_sum256(input + row * width, width) /
-                                     (float)width + epsilon);
-        for (uint32_t column = 0; column < width; column++) {
-            float normalized = bf16f(input[row * width + column]) * inverse *
-                               bf16f(weight[column]);
-            output[row * width + column] = bf16(normalized);
-        }
-    }
-}
-
 static void ref_adaln(const uint16_t *input, const uint16_t *norm_weight,
                       const uint16_t *modulation, const uint32_t *row_map,
                       uint16_t *output, uint32_t rows, uint32_t width,

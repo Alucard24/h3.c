@@ -469,11 +469,15 @@ int h3_gpu_grouped_qkv_linear_rope_bf16(
                                  uint32_t rows, uint32_t input_dim,
                                  uint32_t heads, uint32_t head_dim,
                                  uint32_t rope_half, float epsilon);
+/* Portable int8 backends use qkv_scratch for the BF16 projection boundary;
+ * direct fused implementations may leave it untouched. Its capacity is
+ * rows * heads * head_dim * 3 BF16 elements. */
 int h3_gpu_grouped_qkv_linear_rope_int8(
                                  h3_gpu *gpu,
                                  h3_gpu_tensor *query,
                                  h3_gpu_tensor *key,
                                  h3_gpu_tensor *value,
+                                 h3_gpu_tensor *qkv_scratch,
                                  h3_gpu_tensor *quantized_input,
                                  h3_gpu_tensor *input_scales,
                                  const h3_gpu_tensor *input,

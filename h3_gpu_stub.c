@@ -769,6 +769,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  h3_gpu_tensor *query,
                                  h3_gpu_tensor *key,
                                  h3_gpu_tensor *value,
+                                 h3_gpu_tensor *qkv_scratch,
                                  h3_gpu_tensor *quantized_input,
                                  h3_gpu_tensor *input_scales,
                                  const h3_gpu_tensor *input,
@@ -785,7 +786,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int use_slower_unfused_qkv_rope,
                                  int use_slower_scalar_qkv_rms,
                                  int use_slower_uncached_int8_scales) {
-(void)gpu; (void)query; (void)key; (void)value; (void)quantized_input; (void)input_scales; (void)input; (void)weight; (void)weight_scales; (void)q_norm; (void)k_norm; (void)rope_cos; (void)rope_sin; (void)rows; (void)input_dim; (void)heads; (void)head_dim; (void)rope_half; (void)epsilon; (void)input_is_quantized; (void)use_slower_unfused_qkv_rope; (void)use_slower_scalar_qkv_rms; (void)use_slower_uncached_int8_scales;
+(void)gpu; (void)query; (void)key; (void)value; (void)qkv_scratch; (void)quantized_input; (void)input_scales; (void)input; (void)weight; (void)weight_scales; (void)q_norm; (void)k_norm; (void)rope_cos; (void)rope_sin; (void)rows; (void)input_dim; (void)heads; (void)head_dim; (void)rope_half; (void)epsilon; (void)input_is_quantized; (void)use_slower_unfused_qkv_rope; (void)use_slower_scalar_qkv_rms; (void)use_slower_uncached_int8_scales;
     return -1;
 }
 

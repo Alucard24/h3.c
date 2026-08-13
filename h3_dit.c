@@ -1903,7 +1903,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             0, 1, 1e-5f), "DiT attention AdaLN");
     if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
-            dit->gpu, dit->query, dit->key, dit->value,
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
             dit->int8_activation, dit->int8_activation_scales,
             dit->mod_attention, weight->qkv_int8, weight->qkv_scales,
             weight->q_norm, weight->k_norm, rope_cos, rope_sin,

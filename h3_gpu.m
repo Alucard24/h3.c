@@ -3887,6 +3887,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  h3_gpu_tensor *query,
                                  h3_gpu_tensor *key,
                                  h3_gpu_tensor *value,
+                                 h3_gpu_tensor *qkv_scratch,
                                  h3_gpu_tensor *quantized_input,
                                  h3_gpu_tensor *input_scales,
                                  const h3_gpu_tensor *input,
@@ -3904,6 +3905,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int use_slower_scalar_qkv_rms,
                                  int use_slower_uncached_int8_scales) {
     H3GPU *gpu = GPU(opaque);
+    (void)qkv_scratch;
     gpu.headMajorSDPAInputs = NO;
     uint32_t inner = heads * head_dim;
     uint32_t padded_rows = (rows + 127u) & ~127u;

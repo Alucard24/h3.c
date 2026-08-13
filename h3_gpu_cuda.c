@@ -2693,7 +2693,8 @@ int h3_gpu_grouped_qkv_linear_rope_bf16(
 }
 int h3_gpu_grouped_qkv_linear_rope_int8(
     h3_gpu *gpu, h3_gpu_tensor *query, h3_gpu_tensor *key, h3_gpu_tensor *value,
-    h3_gpu_tensor *quantized_input, h3_gpu_tensor *input_scales,
+    h3_gpu_tensor *qkv_scratch, h3_gpu_tensor *quantized_input,
+    h3_gpu_tensor *input_scales,
     const h3_gpu_tensor *input, const h3_gpu_tensor *weight,
     const h3_gpu_tensor *weight_scales, const h3_gpu_tensor *q_norm,
     const h3_gpu_tensor *k_norm, const h3_gpu_tensor *rope_cos,
@@ -2702,8 +2703,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     int input_is_quantized, int use_slower_unfused_qkv_rope,
     int use_slower_scalar_qkv_rms, int use_slower_uncached_int8_scales) {
 
-    if (!h3_cuda_check_tensors(gpu, 6, query, key, value, quantized_input,
-                               input_scales, input) ||
+    if (!h3_cuda_check_tensors(gpu, 7, query, key, value, qkv_scratch,
+                               quantized_input, input_scales, input) ||
         !h3_cuda_check_tensors(gpu, 5, query, weight, weight_scales, q_norm,
                                k_norm) ||
         !h3_cuda_check_tensors(gpu, 3, query, rope_cos, rope_sin))
@@ -2722,7 +2723,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
         inner * 3 > h3_gpu_tensor_elements(weight_scales) ||
         projected > h3_gpu_tensor_elements(query) ||
         projected > h3_gpu_tensor_elements(key) ||
-        projected > h3_gpu_tensor_elements(value)) {
+        projected > h3_gpu_tensor_elements(value) ||
+        projected * 3 > h3_gpu_tensor_elements(qkv_scratch)) {
         h3_cuda_set_error(gpu, "int8 QKV projection tensor size mismatch");
         return 0;
     }
@@ -2739,36 +2741,25 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                              rows, 1, 1) == 0)
             return 0;
     }
-    /* Projection into a temporary BF16 QKV stream, then the ported grouped
-     * norm/RoPE kernel. */
-    h3_gpu_tensor *qkv = h3_gpu_tensor_new_bf16(gpu, projected * 3);
-    if (!qkv) {
-        h3_cuda_set_error(gpu, "int8 QKV scratch allocation failed");
-        return 0;
-    }
+    /* Reuse the caller's persistent BF16 QKV arena. Allocating this per block
+     * creates a large transient peak at full video resolution. */
     gpu->args->rows = rows;
     gpu->args->input_dim = input_dim;
     gpu->args->output_dim = inner * 3;
     {
         const h3_gpu_tensor *l[5] = {quantized_input, weight, input_scales,
-                                     weight_scales, qkv};
+                                     weight_scales, qkv_scratch};
         h3_cuda_set *set =
             h3_cuda_prepare(gpu, H3_CUDA_KERNEL_LINEAR_INT8_BF16, l, 5);
-        if (set == NULL) {
-            h3_gpu_tensor_free(qkv);
+        if (set == NULL)
             return 0;
-        }
         if (h3_cuda_dispatch(gpu, H3_CUDA_KERNEL_LINEAR_INT8_BF16, set,
-                             (inner * 3 + 15) / 16, (rows + 15) / 16, 1) == 0) {
-            h3_gpu_tensor_free(qkv);
+                             (inner * 3 + 15) / 16, (rows + 15) / 16, 1) == 0)
             return 0;
-        }
     }
-    int ok = h3_gpu_grouped_qkv_rope_bf16(gpu, query, key, value, qkv, q_norm,
-                                          k_norm, rope_cos, rope_sin, rows,
-                                          heads, head_dim, rope_half, epsilon);
-    h3_gpu_tensor_free(qkv);
-    return ok;
+    return h3_gpu_grouped_qkv_rope_bf16(
+        gpu, query, key, value, qkv_scratch, q_norm, k_norm, rope_cos, rope_sin,
+        rows, heads, head_dim, rope_half, epsilon);
 }
 
 int h3_gpu_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

@@ -112,6 +112,7 @@ struct h3_gpu {
     h3_gpu_stats stats;
     int device;
     cudaStream_t stream;
+    cudaStream_t upload_stream;
     cudaEvent_t batch_start;
     cudaEvent_t batch_end;
     h3_cuda_accel *accel;
@@ -307,6 +308,10 @@ h3_gpu *h3_gpu_create(const char *shader_source_path, char *error,
         !h3_cuda_result(
             gpu, cudaStreamCreateWithFlags(&gpu->stream, cudaStreamNonBlocking),
             "cudaStreamCreateWithFlags") ||
+        !h3_cuda_result(
+            gpu, cudaStreamCreateWithFlags(&gpu->upload_stream,
+                                           cudaStreamNonBlocking),
+            "cudaStreamCreateWithFlags upload") ||
         !h3_cuda_result(gpu, cudaEventCreate(&gpu->batch_start),
                         "cudaEventCreate batch start") ||
         !h3_cuda_result(gpu, cudaEventCreate(&gpu->batch_end),
@@ -349,6 +354,8 @@ void h3_gpu_free(h3_gpu *gpu) {
         return;
     if (gpu->stream)
         (void)cudaStreamSynchronize(gpu->stream);
+    if (gpu->upload_stream)
+        (void)cudaStreamSynchronize(gpu->upload_stream);
     h3_cuda_profile_emit(gpu, "total", gpu->profile_start_stats,
                          gpu->profile_start_wall);
     h3_cuda_drain_pending(gpu);
@@ -360,6 +367,8 @@ void h3_gpu_free(h3_gpu *gpu) {
         (void)cudaEventDestroy(gpu->batch_start);
     if (gpu->batch_end)
         (void)cudaEventDestroy(gpu->batch_end);
+    if (gpu->upload_stream)
+        (void)cudaStreamDestroy(gpu->upload_stream);
     if (gpu->stream)
         (void)cudaStreamDestroy(gpu->stream);
     free(gpu);
@@ -376,6 +385,11 @@ int h3_gpu_has_nax_mlp(const h3_gpu *gpu) {
 }
 
 int h3_gpu_has_int8_mlp(const h3_gpu *gpu) {
+    (void)gpu;
+    return 1;
+}
+
+int h3_gpu_has_int8_streaming(const h3_gpu *gpu) {
     (void)gpu;
     return 1;
 }
@@ -652,11 +666,12 @@ static int h3_cuda_tensor_read_file(h3_gpu_tensor *tensor, const char *path,
         ok = h3_cuda_result(tensor->gpu,
                             cudaMemcpyAsync(tensor->data, staging, bytes,
                                             cudaMemcpyHostToDevice,
-                                            tensor->gpu->stream),
+                                            tensor->gpu->upload_stream),
                             "CUDA streamed weight upload") &&
-             h3_cuda_result(tensor->gpu,
-                            cudaStreamSynchronize(tensor->gpu->stream),
-                            "CUDA streamed weight synchronization");
+             h3_cuda_result(
+                 tensor->gpu,
+                 cudaStreamSynchronize(tensor->gpu->upload_stream),
+                 "CUDA streamed weight synchronization");
     if (!ok && error && error_size)
         snprintf(error, error_size, "%s",
                  tensor->gpu->error[0] ? tensor->gpu->error
@@ -675,6 +690,15 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                    uint64_t file_offset, size_t elements,
                                    char *error, size_t error_size) {
+    if (!tensor || tensor->dtype != H3_GPU_BF16)
+        return 0;
+    return h3_cuda_tensor_read_file(tensor, path, file_offset, elements, error,
+                                    error_size);
+}
+
+int h3_gpu_tensor_stream_file(h3_gpu_tensor *tensor, const char *path,
+                              uint64_t file_offset, size_t elements,
+                              char *error, size_t error_size) {
     return h3_cuda_tensor_read_file(tensor, path, file_offset, elements, error,
                                     error_size);
 }

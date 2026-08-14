@@ -18,8 +18,8 @@ typedef int (*h3_dit_preview)(int completed_steps, int total_steps,
                               size_t video_elements, void *opaque);
 
 /* Load a text-only FL2VA transformer. Text refinement and AdaLN precomputation
- * happen before the persistent core is loaded. SSD streaming retains only the
- * small block norms and two alternating BF16 matrix slots. */
+ * happen before the persistent core is loaded. Streaming retains only the
+ * small block norms and two alternating BF16 or cached-INT8 matrix slots. */
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
@@ -29,6 +29,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          unsigned core_reuse_interval,
                          int token_reduction,
                          int ssd_streaming,
+                         int int8_streaming,
                          float spatial_rope_scale,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
@@ -57,6 +58,7 @@ h3_dit *h3_dit_load_conditioned(
                          unsigned core_reuse_interval,
                          int token_reduction,
                          int ssd_streaming,
+                         int int8_streaming,
                          float spatial_rope_scale,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,

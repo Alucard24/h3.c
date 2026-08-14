@@ -154,9 +154,11 @@ their full peaks to it; the OS, media buffers, and output resolution still need
 headroom. `--show` keeps a preview VAE resident and adds roughly 10 GiB, so omit
 it for the lowest-memory run.
 
-SSD streaming is an explicit memory/speed tradeoff and is not the default. It
-cannot be combined with `--use-int8-row-fc2`. In an interactive session, use
-`!ssd-streaming on`.
+BF16 SSD streaming is an explicit memory/speed tradeoff and is not the default.
+It cannot be combined with `--use-int8-row-fc2`. On CUDA, the separate
+`--int8-streaming` mode described below preserves the default INT8 arithmetic
+while bounding DiT residency. In an interactive session, use
+`!ssd-streaming on` or `!int8-streaming on`.
 
 ### 3. Move toward reference quality
 
@@ -559,6 +561,7 @@ in VRAM. This differs from M5 Metal, where native TensorOps make int8 faster.
 | `--use-slower-bf16-attention-output` | keep the BF16 attention-output projection |
 | `--use-int8-row-fc2` | one FC2 activation scale per row instead of per 1,024 channels |
 | `--ssd-streaming` | BF16 layers stream from SSD; int8 is disabled (cannot combine with `--use-int8-row-fc2`) |
+| `--int8-streaming` | CUDA-only cached-INT8 block streaming; unsupported by Vulkan |
 | `H3_DISABLE_INT8_QKV=1` | force the BF16 QKV path at runtime |
 | `H3_INT8_MLP_STAGE=fc1` / `fc2` / `bf16` | int8/BF16 A-B split for the MLP |
 | `H3_INT8_KEEP_BF16_MLP=1` (or `_QKV`, `_ATTENTION_OUT`) | retain both weight copies for A-B diagnosis |
@@ -654,7 +657,7 @@ The resident INT8 path now writes two source-validated caches under the
 transformer directory:
 
 - `.h3-cache/cuda-int8-v1`: quantized matrices and F32 scales, about
-  **12.57 GiB** for the 35-layer preset;
+  **12.57 GiB** for 35 layers or **17.96 GiB** for all 50 layers;
 - `.h3-cache/cuda-adaln-v1`: the 50 precomputed timestep/AdaLN projections,
   about **81 MiB**, replacing roughly 25 GiB of BF16 reads on a cache hit.
 
@@ -667,10 +670,11 @@ one cache. `H3_INT8_CACHE_DIR` and `H3_ADALN_CACHE_DIR` relocate them. Removing
 
 ### CUDA validation and measured speedup
 
-The optimized CUDA build passes 1,765 host checks, **503 CUDA GPU checks**, 20
-complete DiT-block checks, and 30 tokenizer checks with zero strict-C warnings.
-`make GPU=cuda CUDNN=0 test` also passes. The same source passes 502 Vulkan GPU
-checks and the full Vulkan regression suite.
+The optimized CUDA build passes 1,767 host checks, **517 CUDA GPU checks** with
+cuDNN (516 without it), 20 complete DiT-block checks, and 34 tokenizer checks
+with zero strict-C warnings. The same source passes 516 Vulkan GPU checks and
+the full Vulkan regression suite. The CUDA/cuDNN and Vulkan counts differ by
+one accelerated-convolution assertion.
 
 The fixed real-checkpoint smoke uses seed 42, 256x256, 8 requested frames, 5
 steps, `--reuse 3`, and 35 active layers, producing a 22-frame H.264/AAC file:
@@ -704,7 +708,7 @@ reduction order, so diffusion details can change; use the disable variables
 above for close-reference diagnosis.
 
 For a 16 GB CUDA card, the best resident speed/capacity compromise remains the
-default all-INT8 DiT projection path:
+default all-INT8 DiT projection path when the selected layers fit:
 
 ```sh
 ./h3 -d MiniMax-H3 -p "A red fox walking through snow" \
@@ -712,11 +716,47 @@ default all-INT8 DiT projection path:
   -o outputs/fox-cuda-int8.mp4
 ```
 
-When closer-reference projection quality matters, `--ssd-streaming` uses
-all-BF16 block weights with bounded VRAM. Unlike Vulkan's driver-managed
-allocations, resident BF16 QKV does not fit this tested 16 GB CUDA preset at 35
-layers; cards with more VRAM can use the individual `--use-slower-bf16-*`
-controls.
+For Ref2VA speech, do not trade away transformer depth merely to fit VRAM.
+**Treat all 50 layers as required for intelligible reference-driven speech and
+lip synchronization.** A 35- or 40-layer render may be acceptable for quick
+previews, music, or ambient/non-verbal sound, but it does not reliably preserve
+spoken language. Keep `--reuse 1` and `--core-reuse 1` when speech quality is
+the priority.
+
+On a same-prompt, same-seed 256x256/39-frame/20-step test, the 35-layer
+resident render produced a clipped, DC-biased waveform (mean 0.0790, RMS
+0.4526, 0.91% samples at or above 0.98 magnitude) and Whisper transcribed only
+`RIPRESA`. Keeping all 50 blocks with cached INT8 streaming produced clean
+speech (mean -0.000029, RMS 0.0384, peak 0.287, no clipped samples) transcribed
+as `Io sono una pipa.` for the requested `Io sono una PIPPA!`. Use:
+
+```sh
+./h3 --profile -d MiniMax-H3 -p "$(cat prompt.txt)" \
+  --width 256 --height 256 --frames 39 --steps 20 \
+  --layers 50 --reuse 1 --core-reuse 1 --int8-streaming \
+  --ref-image portrait.jpg --ref-audio voice.mp3 \
+  -o outputs/talking-portrait.mp4
+```
+
+`--int8-streaming` keeps two complete quantized block slots in VRAM, reads
+weights and F32 scales from the source-validated persistent cache, and overlaps
+the next upload with the current block. The first run builds missing cache
+entries; later runs reuse them. On RTX 5070 Ti, the validated 50-block render
+completed in 320 seconds with a reported DiT peak of 1.65 GiB. Its denoising
+phase read 359.5 GiB at 1.39 GiB/s over 20 steps; SSD waits dominated runtime,
+so this mode prioritizes model depth and memory capacity rather than speed.
+A same-shape one-forward test used 1.49 GiB and produced identical video/audio
+hashes to the resident INT8 path at the same layer count.
+
+`--int8-streaming` is CUDA-only, mutually exclusive with `--ssd-streaming`, and
+cannot be combined with the three `--use-slower-bf16-*` projection overrides.
+It needs about 18 GiB of persistent disk cache for all 50 layers. Set
+`H3_INT8_CACHE_DIR` to place that cache on a fast SSD; removing it is safe.
+When closer-reference projection quality matters instead,
+`--ssd-streaming` uses all-BF16 block weights with bounded VRAM. Unlike
+Vulkan's driver-managed allocations, resident BF16 QKV does not fit this tested
+16 GB CUDA preset at 35 layers; cards with more VRAM can use the individual
+`--use-slower-bf16-*` controls.
 
 ## Implementation and performance notes
 
@@ -841,12 +881,16 @@ and `H3_QWEN_PREFETCH_DEPTH=1` through `6` overrides the ring depth.
 `--ssd-streaming` is a separate, more aggressive residency mode for the DiT.
 Only its small per-block normalization weights remain resident. Two complete
 BF16 matrix slots alternate while a background reader fills the next slot in
-checkpoint-offset order; the current Metal command buffer runs concurrently.
+checkpoint-offset order; the current GPU command stream runs concurrently.
 Darwin uncached reads avoid retaining a second copy in the filesystem cache.
 The first active block is prefetched again during the final block, so a cached
 interactive DiT is ready for its next denoiser evaluation. Measurements reached
-about 13--14.6 GiB/s from the internal SSD. `H3_PROFILE=1` reports total bytes,
-read throughput, and the part of the read wait that was not hidden by GPU work.
+about 13--14.6 GiB/s from the internal SSD. CUDA additionally provides
+`--int8-streaming`, which uses the same two-slot scheduler with I8 weights and
+F32 scales read from `.h3-cache/cuda-int8-v1`; it keeps INT8 arithmetic but
+trades substantially more SSD traffic for bounded VRAM. `H3_PROFILE=1` reports
+total bytes, read throughput, and the part of the read wait that was not hidden
+by GPU work.
 
 ### Metal 4 and TensorOps paths
 

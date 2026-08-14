@@ -881,6 +881,11 @@ int h3_gpu_has_int8_mlp(const h3_gpu *gpu) {
     return 1;
 }
 
+int h3_gpu_has_int8_streaming(const h3_gpu *gpu) {
+    (void)gpu;
+    return 0;
+}
+
 const char *h3_gpu_error(const h3_gpu *gpu) {
     return gpu ? gpu->error : "null gpu";
 }
@@ -1412,6 +1417,14 @@ int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
      * residency. */
     return h3_gpu_tensor_read_file_bf16(tensor, path, file_offset, elements,
                                         error, error_size);
+}
+
+int h3_gpu_tensor_stream_file(h3_gpu_tensor *tensor, const char *path,
+                              uint64_t file_offset, size_t elements,
+                              char *error, size_t error_size) {
+    return tensor ? h3_vk_tensor_read_file(
+                        tensor->gpu, tensor, path, file_offset, elements,
+                        error, error_size) : 0;
 }
 
 /* ------------------------------------------------------------ commands */

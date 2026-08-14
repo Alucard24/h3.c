@@ -8,6 +8,12 @@
 
 /* Persistent row-wise int8 weight cache. Cache entries are validated against
  * the source shard metadata and tensor schema before any GPU allocation. */
+int h3_int8_cache_resolve(const char *directory, const char *key,
+                          const char *source_path, uint64_t source_offset,
+                          uint64_t rows, uint64_t columns, char **entry_path,
+                          uint64_t *weight_offset, uint64_t *scale_offset,
+                          int *hit, char *error, size_t error_size);
+
 int h3_int8_cache_load(h3_gpu *gpu, const char *directory, const char *key,
                        const char *source_path, uint64_t source_offset,
                        uint64_t rows, uint64_t columns,

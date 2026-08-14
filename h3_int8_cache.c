@@ -171,6 +171,59 @@ static int cache_headers_equal(const h3_int8_cache_header *left,
     return memcmp(left, right, sizeof(*left)) == 0;
 }
 
+int h3_int8_cache_resolve(const char *directory, const char *key,
+                          const char *source_path, uint64_t source_offset,
+                          uint64_t rows, uint64_t columns, char **entry_path,
+                          uint64_t *weight_offset, uint64_t *scale_offset,
+                          int *hit, char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (entry_path) *entry_path = NULL;
+    if (weight_offset) *weight_offset = 0;
+    if (scale_offset) *scale_offset = 0;
+    if (hit) *hit = 0;
+    if (!entry_path || !weight_offset || !scale_offset || !hit) {
+        cache_fail(error, error_size, "invalid int8 cache resolve request");
+        return 0;
+    }
+    h3_int8_cache_header expected;
+    if (!cache_source_header(&expected, source_path, source_offset, rows,
+                             columns, error, error_size))
+        return 0;
+    char *path = cache_entry_path(directory, key, ".h3i8");
+    if (!path) {
+        cache_fail(error, error_size, "cannot allocate int8 cache path");
+        return 0;
+    }
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+        int missing = errno == ENOENT;
+        if (!missing)
+            cache_fail(error, error_size, "cannot open int8 cache: %s",
+                       strerror(errno));
+        free(path);
+        return missing;
+    }
+    struct stat status;
+    h3_int8_cache_header found;
+    uint64_t expected_bytes = sizeof(found) + expected.weight_elements +
+                              expected.scale_elements * sizeof(float);
+    int valid = fstat(descriptor, &status) == 0 &&
+                cache_read_all(descriptor, &found, sizeof(found), 0) &&
+                cache_headers_equal(&found, &expected) &&
+                (uint64_t)status.st_size == expected_bytes;
+    close(descriptor);
+    if (!valid) {
+        (void)unlink(path);
+        free(path);
+        return 1;
+    }
+    *entry_path = path;
+    *weight_offset = sizeof(found);
+    *scale_offset = sizeof(found) + expected.weight_elements;
+    *hit = 1;
+    return 1;
+}
+
 int h3_int8_cache_load(h3_gpu *gpu, const char *directory, const char *key,
                        const char *source_path, uint64_t source_offset,
                        uint64_t rows, uint64_t columns,

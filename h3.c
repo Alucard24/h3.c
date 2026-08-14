@@ -175,12 +175,13 @@ static char *h3_prepared_key(const char *conditioning,
             &key,
             "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
             "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
-            "|slow=%d%d%d%d%d%d%d%d%d%d",
+            "|int8-streaming=%d|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
             params->steps, params->dit_layers, params->core_reuse,
             params->token_reduction, params->use_int8_row_fc2,
             params->use_reference_rope,
             params->ssd_streaming,
+            params->int8_streaming,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,
             params->use_slower_bf16_attention_output,
@@ -554,6 +555,26 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     }
     if (params->ssd_streaming != 0 && params->ssd_streaming != 1) {
         h3_set_error(ctx, "SSD streaming must be zero or one");
+        return 0;
+    }
+    if (params->int8_streaming != 0 && params->int8_streaming != 1) {
+        h3_set_error(ctx, "INT8 streaming must be zero or one");
+        return 0;
+    }
+    if (params->ssd_streaming && params->int8_streaming) {
+        h3_set_error(ctx, "BF16 and INT8 streaming are mutually exclusive");
+        return 0;
+    }
+#if !defined(H3_HAVE_CUDA)
+    if (params->int8_streaming) {
+        h3_set_error(ctx, "INT8 streaming requires the CUDA backend");
+        return 0;
+    }
+#endif
+    if (params->int8_streaming &&
+        (params->use_slower_bf16_mlp || params->use_slower_bf16_qkv ||
+         params->use_slower_bf16_attention_output)) {
+        h3_set_error(ctx, "INT8 streaming cannot use BF16 DiT projections");
         return 0;
     }
     if (params->ssd_streaming && params->use_int8_row_fc2) {
@@ -1486,6 +1507,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,
+            params->int8_streaming,
             spatial_rope_scale,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,
@@ -1507,6 +1529,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,
+            params->int8_streaming,
             spatial_rope_scale,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,

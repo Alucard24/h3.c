@@ -59,9 +59,13 @@ enum {
 
 typedef struct {
     const char *path;
+    char *owned_path;
     uint64_t file_offset;
     size_t elements;
+    uint64_t scale_offset;
+    size_t scale_elements;
     unsigned field;
+    int int8;
 } h3_dit_stream_source;
 
 typedef struct {
@@ -89,6 +93,7 @@ struct h3_dit {
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
     int ssd_streaming;
+    int int8_streaming;
     int keep_bf16_mlp;
     char *int8_cache_directory;
     char *schedule_cache_directory;
@@ -610,11 +615,12 @@ static int prepare_stream_source(h3_dit *dit,
     source->file_offset = tensor->file_offset;
     source->elements = (size_t)(rows * columns);
     source->field = field;
+    source->int8 = 0;
     return 1;
 }
 
-static int prepare_stream_layer(h3_dit *dit, unsigned layer,
-                                char *error, size_t error_size) {
+static int prepare_bf16_stream_layer(h3_dit *dit, unsigned layer,
+                                     char *error, size_t error_size) {
     char name[160];
     h3_dit_stream_layer *stream = &dit->stream_layers[layer];
 #define SOURCE(index, suffix, rows, columns, field) do {                        \
@@ -635,6 +641,28 @@ static int prepare_stream_layer(h3_dit *dit, unsigned layer,
 
 static int allocate_stream_slot(h3_dit *dit, h3_dit_block *slot,
                                 char *error, size_t error_size) {
+    if (dit->int8_streaming) {
+        slot->qkv_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)INNER * 3 * HIDDEN);
+        slot->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
+        slot->out_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)HIDDEN * INNER);
+        slot->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+        slot->fc1_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)FFN * 2 * HIDDEN);
+        slot->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
+        slot->fc2_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)HIDDEN * FFN);
+        slot->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+        if (!slot->qkv_int8 || !slot->qkv_scales || !slot->out_int8 ||
+            !slot->out_scales || !slot->fc1_int8 || !slot->fc1_scales ||
+            !slot->fc2_int8 || !slot->fc2_scales) {
+            fail(error, error_size, "cannot allocate INT8 SSD layer slot: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+        return 1;
+    }
     slot->qkv = h3_gpu_tensor_new_bf16(
         dit->gpu, (size_t)INNER * 3 * HIDDEN);
     slot->out = h3_gpu_tensor_new_bf16(
@@ -652,7 +680,20 @@ static int allocate_stream_slot(h3_dit *dit, h3_dit_block *slot,
 }
 
 static h3_gpu_tensor *stream_slot_target(h3_dit_block *slot,
-                                         unsigned field) {
+                                         unsigned field, int scale) {
+    if (field == STREAM_QKV)
+        return scale ? slot->qkv_scales : slot->qkv_int8;
+    if (field == STREAM_OUT)
+        return scale ? slot->out_scales : slot->out_int8;
+    if (field == STREAM_FC1)
+        return scale ? slot->fc1_scales : slot->fc1_int8;
+    if (field == STREAM_FC2)
+        return scale ? slot->fc2_scales : slot->fc2_int8;
+    return NULL;
+}
+
+static h3_gpu_tensor *bf16_stream_slot_target(h3_dit_block *slot,
+                                              unsigned field) {
     if (field == STREAM_QKV) return slot->qkv;
     if (field == STREAM_OUT) return slot->out;
     if (field == STREAM_FC1) return slot->fc1;
@@ -679,17 +720,41 @@ static int read_stream_layer(h3_dit_stream_job *job) {
     job->error[0] = '\0';
     for (unsigned index = 0; index < STREAM_MATRICES; index++) {
         const h3_dit_stream_source *source = &layer->sources[index];
-        h3_gpu_tensor *target = stream_slot_target(slot, source->field);
-        if (!target || !h3_gpu_tensor_stream_file_bf16(
-                target, source->path, source->file_offset, source->elements,
-                job->error, sizeof(job->error))) {
-            if (!job->error[0])
-                snprintf(job->error, sizeof(job->error),
-                         "invalid BF16 streaming destination");
-            job->ok = 0;
-            break;
+        if (source->int8) {
+            h3_gpu_tensor *weight = stream_slot_target(
+                slot, source->field, 0);
+            h3_gpu_tensor *scales = stream_slot_target(
+                slot, source->field, 1);
+            if (!weight || !scales ||
+                !h3_gpu_tensor_stream_file(
+                    weight, source->path, source->file_offset,
+                    source->elements, job->error, sizeof(job->error)) ||
+                !h3_gpu_tensor_stream_file(
+                    scales, source->path, source->scale_offset,
+                    source->scale_elements, job->error,
+                    sizeof(job->error))) {
+                if (!job->error[0])
+                    snprintf(job->error, sizeof(job->error),
+                             "invalid INT8 streaming destination");
+                job->ok = 0;
+                break;
+            }
+            job->bytes += (uint64_t)source->elements +
+                          (uint64_t)source->scale_elements * sizeof(float);
+        } else {
+            h3_gpu_tensor *target = bf16_stream_slot_target(
+                slot, source->field);
+            if (!target || !h3_gpu_tensor_stream_file_bf16(
+                    target, source->path, source->file_offset,
+                    source->elements, job->error, sizeof(job->error))) {
+                if (!job->error[0])
+                    snprintf(job->error, sizeof(job->error),
+                             "invalid BF16 streaming destination");
+                job->ok = 0;
+                break;
+            }
+            job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
         }
-        job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
     }
     job->seconds = stream_now() - started;
     return job->ok;
@@ -753,6 +818,9 @@ static int quantize_resident_matrix(
         fail(error, error_size, "invalid cached int8 matrix request");
         return 0;
     }
+    *bf16_weight = NULL;
+    *int8_weight = NULL;
+    *scales = NULL;
     const h3_st_header *header = NULL;
     const h3_st_tensor *source = h3_weight_find(dit->weights, name, &header);
     if (!source || !header || source->dtype != H3_DTYPE_BF16 ||
@@ -826,6 +894,84 @@ static int quantize_resident_matrix(
     }
     if (!keep_bf16)
         free_tensor(bf16_weight);
+    return 1;
+}
+
+static int prepare_int8_stream_source(
+    h3_dit *dit, h3_dit_stream_source *source, const char *name,
+    uint32_t rows, uint32_t columns, unsigned field,
+    char *error, size_t error_size) {
+    if (!dit->int8_cache_directory) {
+        fail(error, error_size,
+             "INT8 streaming requires the persistent CUDA weight cache");
+        return 0;
+    }
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(dit->weights, name, &header);
+    if (!tensor || !header || tensor->dtype != H3_DTYPE_BF16 ||
+        tensor->ndim != 2 || tensor->shape[0] != rows ||
+        tensor->shape[1] != columns) {
+        fail(error, error_size, "INT8 stream source has wrong schema: %s",
+             name);
+        return 0;
+    }
+    char *path = NULL;
+    uint64_t weight_offset = 0, scale_offset = 0;
+    int hit = 0;
+    if (!h3_int8_cache_resolve(
+            dit->int8_cache_directory, name, header->path,
+            tensor->file_offset, rows, columns, &path, &weight_offset,
+            &scale_offset, &hit, error, error_size))
+        return 0;
+    if (hit)
+        dit->int8_cache_hits++;
+    else {
+        h3_gpu_tensor *bf16 = NULL, *weight = NULL, *scales = NULL;
+        int built = quantize_resident_matrix(
+            dit, name, rows, columns, 0, &bf16, &weight, &scales,
+            error, error_size);
+        free_tensor(&bf16);
+        free_tensor(&weight);
+        free_tensor(&scales);
+        if (!built || !h3_int8_cache_resolve(
+                dit->int8_cache_directory, name, header->path,
+                tensor->file_offset, rows, columns, &path, &weight_offset,
+                &scale_offset, &hit, error, error_size) || !hit) {
+            free(path);
+            if (built && error && error_size && !error[0])
+                snprintf(error, error_size,
+                         "cannot resolve generated INT8 cache entry %s", name);
+            return 0;
+        }
+    }
+    source->path = path;
+    source->owned_path = path;
+    source->file_offset = weight_offset;
+    source->elements = (size_t)rows * columns;
+    source->scale_offset = scale_offset;
+    source->scale_elements = rows;
+    source->field = field;
+    source->int8 = 1;
+    return 1;
+}
+
+static int prepare_int8_stream_layer(h3_dit *dit, unsigned layer,
+                                     char *error, size_t error_size) {
+    char name[160];
+    h3_dit_stream_layer *stream = &dit->stream_layers[layer];
+#define SOURCE(index, suffix, rows, columns, field) do {                        \
+    snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix);              \
+    if (!prepare_int8_stream_source(dit, &stream->sources[index], name,       \
+                                    rows, columns, field, error, error_size))  \
+        return 0;                                                              \
+} while (0)
+    SOURCE(0, "attn.qkv_proj.weight", INNER * 3, HIDDEN, STREAM_QKV);
+    SOURCE(1, "attn.out_proj.weight", HIDDEN, INNER, STREAM_OUT);
+    SOURCE(2, "mlp.fc1.weight", FFN * 2, HIDDEN, STREAM_FC1);
+    SOURCE(3, "mlp.fc2.weight", HIDDEN, FFN, STREAM_FC2);
+#undef SOURCE
+    qsort(stream->sources, STREAM_MATRICES, sizeof(stream->sources[0]),
+          compare_stream_sources);
     return 1;
 }
 
@@ -1379,10 +1525,14 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         }
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
-        if (dit->ssd_streaming) {
+        if (dit->ssd_streaming || dit->int8_streaming) {
             if (!load_block_norms(dit, &dit->blocks[index], prefix,
                                   error, error_size) ||
-                !prepare_stream_layer(dit, index, error, error_size))
+                !(dit->int8_streaming
+                      ? prepare_int8_stream_layer(
+                            dit, index, error, error_size)
+                      : prepare_bf16_stream_layer(
+                            dit, index, error, error_size)))
                 return 0;
         } else if (!load_resident_block(
                        dit, &dit->blocks[index], index, error, error_size)) {
@@ -1391,7 +1541,7 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
     }
-    if (dit->ssd_streaming) {
+    if (dit->ssd_streaming || dit->int8_streaming) {
         if (!allocate_stream_slot(dit, &dit->stream_slots[0],
                                   error, error_size) ||
             !allocate_stream_slot(dit, &dit->stream_slots[1],
@@ -1697,6 +1847,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         unsigned core_reuse_interval,
                         int token_reduction,
                         int ssd_streaming,
+                        int int8_streaming,
                         float spatial_rope_scale,
                         int use_slower_bf16_mlp,
                         int use_slower_bf16_qkv,
@@ -1718,6 +1869,8 @@ static h3_dit *load_dit(const char *weight_directory,
     if (error && error_size) error[0] = '\0';
     if (!weight_directory || !shader_source_path || !layout || !sigmas ||
         (ssd_streaming != 0 && ssd_streaming != 1) ||
+        (int8_streaming != 0 && int8_streaming != 1) ||
+        (ssd_streaming && int8_streaming) ||
         !isfinite(spatial_rope_scale) || spatial_rope_scale <= 0.0f ||
         active_blocks < H3_DIT_BLOCKS / 2 ||
         active_blocks > H3_DIT_BLOCKS || core_reuse_interval < 1 ||
@@ -1738,6 +1891,7 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->bf16_final = getenv("H3_DIT_F32_FINAL") == NULL;
     dit->core_reuse_interval = core_reuse_interval;
     dit->ssd_streaming = ssd_streaming;
+    dit->int8_streaming = int8_streaming;
     dit->spatial_rope_scale = spatial_rope_scale;
     configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
@@ -1761,6 +1915,12 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!dit->weights) goto failed;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
+    if (dit->int8_streaming &&
+        !h3_gpu_has_int8_streaming(dit->gpu)) {
+        fail(error, error_size,
+             "INT8 streaming is not supported by this GPU backend");
+        goto failed;
+    }
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
@@ -1772,6 +1932,15 @@ static h3_dit *load_dit(const char *weight_directory,
                               !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
+    if (dit->int8_streaming &&
+        (!dit->int8_mlp || !dit->int8_qkv || !dit->int8_attention_out ||
+         getenv("H3_DISABLE_INT8_MLP") || getenv("H3_DISABLE_INT8_QKV") ||
+         getenv("H3_DISABLE_INT8_ATTENTION_OUT") ||
+         getenv("H3_INT8_MLP_STAGE"))) {
+        fail(error, error_size,
+             "INT8 streaming requires all three INT8 projection paths");
+        goto failed;
+    }
     dit->use_slower_row_major_attention_output =
         use_slower_row_major_attention_output;
     dit->use_slower_unfused_int8_inputs =
@@ -1849,6 +2018,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          unsigned core_reuse_interval,
                          int token_reduction,
                          int ssd_streaming,
+                         int int8_streaming,
                          float spatial_rope_scale,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
@@ -1865,8 +2035,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
-                    ssd_streaming,
-                    spatial_rope_scale,
+                    ssd_streaming, int8_streaming, spatial_rope_scale,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
                     use_slower_row_major_attention_output,
@@ -1891,6 +2060,7 @@ h3_dit *h3_dit_load_conditioned(
                          unsigned core_reuse_interval,
                          int token_reduction,
                          int ssd_streaming,
+                         int int8_streaming,
                          float spatial_rope_scale,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
@@ -1911,8 +2081,7 @@ h3_dit *h3_dit_load_conditioned(
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
-                    ssd_streaming,
-                    spatial_rope_scale,
+                    ssd_streaming, int8_streaming, spatial_rope_scale,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
                     use_slower_row_major_attention_output,
@@ -2314,7 +2483,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     if (evaluate_core) {
         unsigned command_blocks = disable_command_split
             ? 0 : command_block_interval(dit);
-        if (dit->ssd_streaming) command_blocks = 0;
+        if (dit->ssd_streaming || dit->int8_streaming) command_blocks = 0;
         unsigned completed_blocks = 0;
         int carried_attention_adaln = 0;
         int carried_attention_input_quantized = 0;
@@ -2359,7 +2528,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             h3_dit_stream_job stream_job;
             pthread_t stream_thread;
             int stream_started = 0;
-            if (dit->ssd_streaming) {
+            if (dit->ssd_streaming || dit->int8_streaming) {
                 if (dit->stream_ready_layer != block ||
                     dit->stream_ready_slot > 1) {
                     fail(error, error_size,
@@ -2370,10 +2539,21 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 h3_dit_block *slot =
                     &dit->stream_slots[dit->stream_ready_slot];
                 streamed_weight = dit->blocks[block];
-                streamed_weight.qkv = slot->qkv;
-                streamed_weight.out = slot->out;
-                streamed_weight.fc1 = slot->fc1;
-                streamed_weight.fc2 = slot->fc2;
+                if (dit->int8_streaming) {
+                    streamed_weight.qkv_int8 = slot->qkv_int8;
+                    streamed_weight.qkv_scales = slot->qkv_scales;
+                    streamed_weight.out_int8 = slot->out_int8;
+                    streamed_weight.out_scales = slot->out_scales;
+                    streamed_weight.fc1_int8 = slot->fc1_int8;
+                    streamed_weight.fc1_scales = slot->fc1_scales;
+                    streamed_weight.fc2_int8 = slot->fc2_int8;
+                    streamed_weight.fc2_scales = slot->fc2_scales;
+                } else {
+                    streamed_weight.qkv = slot->qkv;
+                    streamed_weight.out = slot->out;
+                    streamed_weight.fc1 = slot->fc1;
+                    streamed_weight.fc2 = slot->fc2;
+                }
                 weight = &streamed_weight;
 
                 unsigned future = next_active_block(dit, block);
@@ -3153,8 +3333,11 @@ void h3_dit_free(h3_dit *dit) {
     free_tensor(&dit->reduced_rope_sin);
     free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
     free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
-    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
         free_block(&dit->blocks[block]);
+        for (unsigned matrix = 0; matrix < STREAM_MATRICES; matrix++)
+            free(dit->stream_layers[block].sources[matrix].owned_path);
+    }
     free_block(&dit->stream_slots[0]);
     free_block(&dit->stream_slots[1]);
     free_tensor(&dit->final_norm);
@@ -3186,12 +3369,13 @@ void h3_dit_free(h3_dit *dit) {
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
 #undef FREE
     h3_dit_schedule_free(dit->schedule);
-    if (dit->ssd_streaming && getenv("H3_PROFILE")) {
+    if ((dit->ssd_streaming || dit->int8_streaming) && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,
-                "h3: BF16 SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
+                "h3: %s SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
                 "unhidden wait %.3fs\n",
-                gib, dit->stream_read_seconds,
+                dit->int8_streaming ? "INT8" : "BF16", gib,
+                dit->stream_read_seconds,
                 dit->stream_read_seconds > 0.0
                     ? gib / dit->stream_read_seconds : 0.0,
                 dit->stream_wait_seconds);

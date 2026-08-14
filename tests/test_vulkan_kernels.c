@@ -3763,6 +3763,28 @@ static void test_int8_disk_cache(h3_gpu *gpu) {
         CHECK(h3_gpu_tensor_read_f32(scales, expected_scales, ROWS) == 1);
         CHECK(h3_gpu_tensor_read_f32(loaded_scales, got_scales, ROWS) == 1);
         CHECK(memcmp(expected_scales, got_scales, sizeof(got_scales)) == 0);
+        /* Refill preallocated streaming slots from the cache payload. */
+        h3_gpu_tensor *stream_weight = h3_gpu_tensor_new_i8(gpu, ELEMENTS);
+        h3_gpu_tensor *stream_scales = h3_gpu_tensor_new_f32(gpu, ROWS);
+        CHECK(stream_weight && stream_scales);
+        if (stream_weight && stream_scales) {
+            CHECK(h3_gpu_tensor_stream_file(
+                      stream_weight, cache_path, 80, ELEMENTS,
+                      error, sizeof(error)) == 1);
+            CHECK(h3_gpu_tensor_stream_file(
+                      stream_scales, cache_path, 80 + ELEMENTS, ROWS,
+                      error, sizeof(error)) == 1);
+            CHECK(h3_gpu_tensor_read_i8(
+                      stream_weight, got_weight, ELEMENTS) == 1);
+            CHECK(memcmp(expected_weight, got_weight,
+                         sizeof(got_weight)) == 0);
+            CHECK(h3_gpu_tensor_read_f32(
+                      stream_scales, got_scales, ROWS) == 1);
+            CHECK(memcmp(expected_scales, got_scales,
+                         sizeof(got_scales)) == 0);
+        }
+        h3_gpu_tensor_free(stream_weight);
+        h3_gpu_tensor_free(stream_scales);
         h3_gpu_tensor_free(loaded_weight);
         h3_gpu_tensor_free(loaded_scales);
         descriptor = open(source_path, O_WRONLY | O_APPEND);
@@ -4175,6 +4197,11 @@ int main(int argc, char **argv) {
                error);
         return 0;
     }
+#if defined(H3_HAVE_CUDA)
+    CHECK(h3_gpu_has_int8_streaming(gpu) == 1);
+#else
+    CHECK(h3_gpu_has_int8_streaming(gpu) == 0);
+#endif
     test_cast_and_unary(gpu);
     test_silu_bf16(gpu);
     test_add_sub_silu_mul(gpu);

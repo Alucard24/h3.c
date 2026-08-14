@@ -525,6 +525,8 @@ static int text_encode_bf16_impl(
     h3_gpu_profile_set_label(gpu, "Qwen text encoder");
     load_context load = {store, gpu, {NULL}, 0, error, error_size};
     uint32_t tokens = (uint32_t)token_count;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: Qwen text sequence %u rows\n", tokens);
     size_t hidden_count = token_count * TEXT_HIDDEN;
     size_t query_count = token_count * TEXT_QUERY_DIM;
     size_t kv_count = token_count * TEXT_KV_DIM;

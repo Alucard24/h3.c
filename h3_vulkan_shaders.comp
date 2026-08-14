@@ -1342,8 +1342,9 @@ void main_rope_text_bf16() {
 }
 
 /* Causal GQA attention (Qwen3 text decoder). The scale is applied to Q
- * before the contraction, matching MLX's fused SDPA order; scores live in
- * threadgroup memory, so the host caps the sequence at 4096. */
+ * before the contraction, matching MLX's fused SDPA order. Sequences through
+ * 4096 keep the original full-score arithmetic; longer contexts use tiled
+ * online softmax with bounded threadgroup memory. */
 layout(set = 0, binding = 0) readonly buffer GqQ { uint16_t data[]; } gq_q;
 layout(set = 0, binding = 1) readonly buffer GqK { uint16_t data[]; } gq_k;
 layout(set = 0, binding = 2) readonly buffer GqV { uint16_t data[]; } gq_v;
@@ -1352,6 +1353,7 @@ layout(set = 0, binding = 3) writeonly buffer GqOut { uint16_t data[]; } gq_out;
 shared float gq_scores[4096];
 shared float gq_reductions[128];
 shared float gq_shared_query[128];
+shared float gq_online_state[3];
 
 void main_gqa_causal_bf16() {
     uint query_row = gl_WorkGroupID.x;
@@ -1370,6 +1372,85 @@ void main_gqa_causal_bf16() {
             H3_BF16_TO_F32(gq_q.data[q_base + d]) * args.data.left_scale)));
     }
     barrier();
+
+    if (seq > 4096u) {
+        float accumulator = 0.0f;
+        if (tid == 0u) {
+            gq_online_state[0] = -3.402823466e+38f;
+            gq_online_state[1] = 0.0f;
+            gq_online_state[2] = 0.0f;
+        }
+        barrier();
+        for (uint tile_start = 0u; tile_start < key_count;
+             tile_start += 128u) {
+            uint key_row = tile_start + tid;
+            float dot = -3.402823466e+38f;
+            if (key_row < key_count) {
+                uint k_base =
+                    (key_row * kv_heads + kv_head) * head_dim;
+                dot = 0.0f;
+                for (uint d = 0u; d < head_dim; d++) {
+                    dot = fma(gq_shared_query[d],
+                              H3_BF16_TO_F32(gq_k.data[k_base + d]), dot);
+                }
+            }
+            gq_scores[tid] = dot;
+            gq_reductions[tid] = dot;
+            barrier();
+            for (uint stride = 64u; stride > 0u; stride >>= 1) {
+                if (tid < stride)
+                    gq_reductions[tid] = max(
+                        gq_reductions[tid],
+                        gq_reductions[tid + stride]);
+                barrier();
+            }
+            if (tid == 0u) {
+                float previous_max = gq_online_state[0];
+                float maximum = max(previous_max, gq_reductions[0]);
+                gq_online_state[2] = gq_online_state[1] > 0.0f ?
+                    exp(previous_max - maximum) : 0.0f;
+                gq_online_state[0] = maximum;
+            }
+            barrier();
+            float probability = key_row < key_count ?
+                exp(gq_scores[tid] - gq_online_state[0]) : 0.0f;
+            gq_scores[tid] = probability;
+            gq_reductions[tid] = probability;
+            barrier();
+            for (uint stride = 64u; stride > 0u; stride >>= 1) {
+                if (tid < stride)
+                    gq_reductions[tid] += gq_reductions[tid + stride];
+                barrier();
+            }
+            if (tid == 0u) {
+                gq_online_state[1] =
+                    gq_online_state[1] * gq_online_state[2] +
+                    gq_reductions[0];
+            }
+            barrier();
+            if (tid < head_dim) {
+                uint tile_count = key_count - tile_start;
+                if (tile_count > 128u) tile_count = 128u;
+                float tile_sum = 0.0f;
+                for (uint offset = 0u; offset < tile_count; offset++) {
+                    uint v_index =
+                        ((tile_start + offset) * kv_heads + kv_head) *
+                        head_dim + tid;
+                    tile_sum = fma(gq_scores[offset],
+                                   H3_BF16_TO_F32(gq_v.data[v_index]),
+                                   tile_sum);
+                }
+                accumulator = fma(accumulator, gq_online_state[2], tile_sum);
+            }
+            barrier();
+        }
+        if (tid < head_dim) {
+            gq_out.data[q_base + tid] = uint16_t(h3_f32_to_bf16(
+                accumulator / gq_online_state[1]));
+        }
+        return;
+    }
+
     float local_max = -3.402823466e+38f;
     for (uint key_row = tid; key_row < key_count; key_row += 128u) {
         uint k_base = (key_row * kv_heads + kv_head) * head_dim;

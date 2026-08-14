@@ -481,7 +481,8 @@ round-to-nearest-even is bit-exact):
 - Qwen3 text encoder: `text_qk_rope` bf16 (per-head Q/K RMS + RoPE from
   separate inputs, KV sharing), in-place `rope_text` bf16 with F32 tables,
   and causal GQA `gqa_causal` bf16 (scale applied to Q before the
-  contraction, scores kept in threadgroup memory, sequence capped at 4096)
+  contraction; full-score arithmetic through 4096 rows and bounded-memory
+  tiled online softmax for longer combined text/vision contexts)
 - weight residency: `h3_gpu_tensor_load_*` allocates device-local memory
   and transfers through host staging buffers (one-shot copy command
   buffer); device-local readbacks download through staging

@@ -3811,6 +3811,53 @@ static void test_gqa_causal_bf16(h3_gpu *gpu) {
     h3_gpu_tensor_free(tv); h3_gpu_tensor_free(out);
 }
 
+static void test_gqa_causal_long_bf16(h3_gpu *gpu) {
+    enum { SEQ = 4097, HEADS = 1, DIM = 1 };
+    uint16_t *q = calloc(SEQ * HEADS * DIM, sizeof(*q));
+    uint16_t *k = calloc(SEQ * HEADS * DIM, sizeof(*k));
+    uint16_t *v = malloc(SEQ * HEADS * DIM * sizeof(*v));
+    uint16_t *expected = malloc(SEQ * HEADS * DIM * sizeof(*expected));
+    uint16_t *got = malloc(SEQ * HEADS * DIM * sizeof(*got));
+    CHECK(q && k && v && expected && got);
+    h3_gpu_tensor *tq = NULL;
+    h3_gpu_tensor *tk = NULL;
+    h3_gpu_tensor *tv = NULL;
+    h3_gpu_tensor *out = NULL;
+    if (q && k && v && expected && got) {
+        float prefix = 0.0f;
+        for (size_t row = 0; row < SEQ; row++) {
+            float value = (float)(row % 7) * 0.125f;
+            v[row] = bf16_bits(value);
+            prefix += value;
+            expected[row] = bf16_bits(prefix / (float)(row + 1));
+        }
+        tq = h3_gpu_tensor_from_bf16(gpu, q, SEQ * HEADS * DIM);
+        tk = h3_gpu_tensor_from_bf16(gpu, k, SEQ * HEADS * DIM);
+        tv = h3_gpu_tensor_from_bf16(gpu, v, SEQ * HEADS * DIM);
+        out = h3_gpu_tensor_new_bf16(gpu, SEQ * HEADS * DIM);
+        CHECK(tq && tk && tv && out);
+        if (tq && tk && tv && out) {
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_gqa_causal_bf16(gpu, out, tq, tk, tv, SEQ,
+                                         HEADS, HEADS, DIM, 0.5f) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
+            CHECK(h3_gpu_tensor_read_bf16(out, got,
+                                          SEQ * HEADS * DIM) == 1);
+            CHECK(memcmp(got, expected,
+                         SEQ * HEADS * DIM * sizeof(*got)) == 0);
+        }
+    }
+    h3_gpu_tensor_free(tq);
+    h3_gpu_tensor_free(tk);
+    h3_gpu_tensor_free(tv);
+    h3_gpu_tensor_free(out);
+    free(q);
+    free(k);
+    free(v);
+    free(expected);
+    free(got);
+}
+
 static void test_continue_chain(h3_gpu *gpu) {
     /* Two command buffers chained without a wait must preserve order:
      * add, then silu of the add result, all inside one begin/submit. */
@@ -3911,6 +3958,7 @@ int main(int argc, char **argv) {
     test_text_qk_rope_bf16(gpu);
     test_rope_text_bf16(gpu);
     test_gqa_causal_bf16(gpu);
+    test_gqa_causal_long_bf16(gpu);
     test_continue_chain(gpu);
     h3_gpu_free(gpu);
     if (failed) {

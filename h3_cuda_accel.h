@@ -52,9 +52,9 @@ int h3_cuda_accel_linear_int8_grouped_bf16(
     uint32_t group_size, uint32_t groups, int *used,
     h3_cuda_accel_stats *stats, char *error, size_t error_size);
 
-/* Tiled online-softmax attention. Q/K/V are row-major
- * [sequence,heads,head_dim]; output may retain that layout or use the native
- * [heads,sequence,head_dim] form consumed by the int8 output projection. */
+/* Fused cuDNN BF16 SDPA with a tiled online-softmax fallback. Q/K/V are
+ * row-major [sequence,heads,head_dim]; output may retain that layout or use
+ * the native [heads,sequence,head_dim] form consumed by the int8 projection. */
 int h3_cuda_accel_sdpa_bf16(
     h3_cuda_accel *accel, void *stream, void *output, const void *query,
     const void *key, const void *value, uint32_t sequence, uint32_t heads,

@@ -91,6 +91,39 @@ static int check_bf16_ulp_abs(const uint16_t *got, const uint16_t *expected,
     return ok;
 }
 
+static int check_bf16_rel_l2_abs(const uint16_t *got,
+                                 const uint16_t *expected, size_t count,
+                                 double max_relative_l2,
+                                 double max_absolute, const char *name) {
+    double error_squared = 0.0;
+    double reference_squared = 0.0;
+    double worst_absolute = 0.0;
+    size_t worst_index = 0;
+    for (size_t index = 0; index < count; index++) {
+        double got_value = (double)bf16_value(got[index]);
+        double expected_value = (double)bf16_value(expected[index]);
+        double difference = got_value - expected_value;
+        double absolute = fabs(difference);
+        error_squared += difference * difference;
+        reference_squared += expected_value * expected_value;
+        if (absolute > worst_absolute) {
+            worst_absolute = absolute;
+            worst_index = index;
+        }
+    }
+    double relative_l2 =
+        reference_squared > 0.0 ? sqrt(error_squared / reference_squared)
+                                : sqrt(error_squared);
+    if (relative_l2 <= max_relative_l2 && worst_absolute <= max_absolute)
+        return 1;
+    fprintf(stderr,
+            "  %s: rel-L2 %.6g (limit %.6g), max-abs %.6g @[%zu] "
+            "(limit %.6g)\n",
+            name, relative_l2, max_relative_l2, worst_absolute, worst_index,
+            max_absolute);
+    return 0;
+}
+
 /* BF16-aware comparison: within `max_ulp` BF16 units. */
 static int check_bf16_ulp(const uint16_t *got, const uint16_t *expected,
                           size_t count, uint32_t max_ulp, const char *name) {
@@ -3333,10 +3366,11 @@ static void test_sdpa_flash_bf16(h3_gpu *gpu) {
             uint16_t *got = malloc(count * 2);
             CHECK(got);
             CHECK(h3_gpu_tensor_read_bf16(out, got, count) == 1);
-            /* The flash kernel reduces dots with a tree instead of the
-             * linear FMA order, so allow a few more ulps. */
-            CHECK(check_bf16_ulp_abs(got, expected, count, 8, 2e-7f,
-                                      "sdpa_flash"));
+            /* Vendor fused attention uses BF16 Tensor Cores for both
+             * products, so compare aggregate error to the scalar F32 oracle.
+             * The deterministic fallback below retains the tighter bound. */
+            CHECK(check_bf16_rel_l2_abs(got, expected, count, 0.04, 2e-4,
+                                         "sdpa_fused"));
             h3_gpu_tensor *head_out = h3_gpu_tensor_new_bf16(gpu, count);
             uint16_t *head_got = malloc(count * 2);
             CHECK(head_out && head_got);
@@ -3363,6 +3397,22 @@ static void test_sdpa_flash_bf16(h3_gpu *gpu) {
                         }
                 CHECK(same);
             }
+            const char *disabled_value = getenv("H3_DISABLE_CUDNN_SDPA");
+            char *saved_disabled =
+                disabled_value ? strdup(disabled_value) : NULL;
+            setenv("H3_DISABLE_CUDNN_SDPA", "1", 1);
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
+                                   scale) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
+            if (saved_disabled)
+                setenv("H3_DISABLE_CUDNN_SDPA", saved_disabled, 1);
+            else
+                unsetenv("H3_DISABLE_CUDNN_SDPA");
+            free(saved_disabled);
+            CHECK(h3_gpu_tensor_read_bf16(out, got, count) == 1);
+            CHECK(check_bf16_ulp_abs(got, expected, count, 8, 2e-7f,
+                                      "sdpa_fallback"));
             h3_gpu_tensor_free(head_out);
             free(head_got);
             free(got);
@@ -3395,13 +3445,17 @@ static void test_sdpa_flash_bench(h3_gpu *gpu) {
         CHECK(tq && tk && tv && out);
         if (!failed) {
             h3_gpu_stats before, after;
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
+                                   1.0f / sqrtf((float)DIM)) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
             CHECK(h3_gpu_get_stats(gpu, &before) == 1);
             h3_gpu_begin(gpu);
             CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
                                    1.0f / sqrtf((float)DIM)) == 1);
             CHECK(h3_gpu_submit(gpu) == 1);
             CHECK(h3_gpu_get_stats(gpu, &after) == 1);
-            printf("SDPA seq=%d heads=%d: flash kernel %.1f ms GPU\n",
+            printf("SDPA seq=%d heads=%d: fused kernel %.1f ms GPU\n",
                    SEQ, HEADS,
                    (after.gpu_seconds - before.gpu_seconds) * 1e3);
         }

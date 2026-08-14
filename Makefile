@@ -11,6 +11,8 @@ CUDNN ?= $(shell { test -f /usr/include/cudnn.h || \
 	test -f "$(CUDA_HOME)/include/cudnn.h"; } && \
 	{ ldconfig -p 2>/dev/null | grep -q 'libcudnn\.so' || \
 	test -f "$(CUDA_HOME)/lib64/libcudnn.so"; } && echo 1)
+CUDNN_FRONTEND ?= $(shell { test -f /usr/include/cudnn_frontend.h || \
+	test -f "$(CUDA_HOME)/include/cudnn_frontend.h"; } && echo 1)
 
 # Feature-test macros expose POSIX functions (strdup, setenv, mkdtemp) under
 # strict -std=c11 on both platforms.
@@ -59,6 +61,10 @@ ifeq ($(CUDNN),1)
 CFLAGS += -DH3_HAVE_CUDNN
 NVCCFLAGS += -DH3_HAVE_CUDNN
 LDLIBS += -lcudnn
+ifeq ($(CUDNN_FRONTEND),1)
+NVCCFLAGS += -DH3_HAVE_CUDNN_FRONTEND
+LDLIBS += -lnvrtc -lcuda
+endif
 endif
 else ifeq ($(GPU),stub)
 GPU_STUB := h3_gpu_stub.c h3_metal_stub.c
@@ -81,7 +87,7 @@ LIB_M :=
 endif
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o) $(GPU_STUB:.c=.o) $(GPU_EXTRA_OBJ)
 CLI_OBJ := main.o h3_cli.o linenoise.o
-BUILD_CONFIG := .build-config-$(UNAME_S)-$(GPU)-$(CUDNN)
+BUILD_CONFIG := .build-config-$(UNAME_S)-$(GPU)-$(CUDNN)-$(CUDNN_FRONTEND)
 
 .PHONY: all test parity real-parity clean
 

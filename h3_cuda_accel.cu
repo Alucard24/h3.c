@@ -1,4 +1,4 @@
-/* cuBLASLt-backed hot paths for the native CUDA backend.
+/* cuBLASLt/cuDNN-backed hot paths for the native CUDA backend.
  *
  * cuBLASLt performs exact int8 x int8 -> int32 Tensor Core GEMMs. Small CUDA
  * epilogues apply H3's per-row/per-channel scales and its precise BF16/SwiGLU
@@ -14,6 +14,14 @@
 #include <mma.h>
 #if defined(H3_HAVE_CUDNN)
 #include <cudnn.h>
+#endif
+#if defined(H3_HAVE_CUDNN_FRONTEND)
+#include <cudnn_frontend.h>
+
+#include <exception>
+#include <memory>
+#include <unordered_map>
+#include <vector>
 #endif
 
 #include <errno.h>
@@ -32,6 +40,8 @@
 #define H3_LT_MAX_SCRATCH_MIB 512u
 #define H3_CUDNN_DEFAULT_WORKSPACE_MIB 256u
 #define H3_CUDNN_MAX_WORKSPACE_MIB 1024u
+#define H3_CUDNN_SDPA_PLAN_CACHE 32u
+#define H3_CUDNN_SDPA_MIN_SEQUENCE 128u
 #define H3_LT_THREADS 256u
 
 typedef struct {
@@ -47,6 +57,26 @@ typedef struct {
     cublasLtMatrixLayout_t output_layout;
     cublasLtMatmulAlgo_t algorithm;
 } h3_lt_plan;
+
+#if defined(H3_HAVE_CUDNN_FRONTEND)
+typedef struct {
+    int supported;
+    uint32_t sequence;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t scale_bits;
+    int head_major_output;
+    int64_t workspace_bytes;
+    std::shared_ptr<cudnn_frontend::graph::Graph> graph;
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> query;
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> key;
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> value;
+    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> output;
+    std::unordered_map<
+        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, void *>
+        bindings;
+} h3_cudnn_sdpa_plan;
+#endif
 
 struct h3_cuda_accel {
     int available;
@@ -68,6 +98,10 @@ struct h3_cuda_accel {
     void *cudnn_workspace;
     size_t cudnn_workspace_bytes;
     size_t cudnn_workspace_limit;
+#endif
+#if defined(H3_HAVE_CUDNN_FRONTEND)
+    h3_cudnn_sdpa_plan *sdpa_plans[H3_CUDNN_SDPA_PLAN_CACHE];
+    uint32_t sdpa_plan_count;
 #endif
 };
 
@@ -104,6 +138,8 @@ static size_t h3_lt_scratch_limit(void) {
 }
 
 #if defined(H3_HAVE_CUDNN)
+static int h3_cudnn_ensure_workspace(h3_cuda_accel *accel, size_t bytes);
+
 static size_t h3_cudnn_workspace_limit(void) {
     unsigned long long mib = H3_CUDNN_DEFAULT_WORKSPACE_MIB;
     const char *value = getenv("H3_CUDA_CUDNN_WORKSPACE_MB");
@@ -208,6 +244,10 @@ void h3_cuda_accel_free(h3_cuda_accel *accel) {
         return;
     if (accel->scratch)
         (void)cudaFree(accel->scratch);
+#if defined(H3_HAVE_CUDNN_FRONTEND)
+    for (uint32_t index = 0; index < accel->sdpa_plan_count; index++)
+        delete accel->sdpa_plans[index];
+#endif
 #if defined(H3_HAVE_CUDNN)
     if (accel->cudnn_workspace)
         (void)cudaFree(accel->cudnn_workspace);
@@ -1085,6 +1125,201 @@ int h3_cuda_accel_linear_int8_grouped_bf16(
     return 1;
 }
 
+#if defined(H3_HAVE_CUDNN_FRONTEND)
+static int h3_cudnn_sdpa_debug_enabled(void) {
+    const char *value = getenv("H3_CUDA_CUDNN_SDPA_DEBUG");
+    return value && *value && strcmp(value, "0") != 0;
+}
+
+static void h3_cudnn_sdpa_log_failure(
+    const char *step, cudnn_frontend::error_t status, uint32_t sequence,
+    uint32_t heads, uint32_t head_dim) {
+    if (!h3_cudnn_sdpa_debug_enabled())
+        return;
+    fprintf(stderr, "h3: cuDNN SDPA %s failed for %ux%ux%u: %s\n", step,
+            sequence, heads, head_dim, status.get_message().c_str());
+}
+
+static int h3_cudnn_get_sdpa_plan(
+    h3_cuda_accel *accel, uint32_t sequence, uint32_t heads,
+    uint32_t head_dim, float scale, int head_major_output,
+    h3_cudnn_sdpa_plan **result) {
+    *result = NULL;
+    uint32_t scale_bits = 0;
+    memcpy(&scale_bits, &scale, sizeof(scale_bits));
+    for (uint32_t index = 0; index < accel->sdpa_plan_count; index++) {
+        h3_cudnn_sdpa_plan *plan = accel->sdpa_plans[index];
+        if (plan->sequence == sequence && plan->heads == heads &&
+            plan->head_dim == head_dim && plan->scale_bits == scale_bits &&
+            plan->head_major_output == head_major_output) {
+            if (plan->supported)
+                *result = plan;
+            return 1;
+        }
+    }
+    if (accel->sdpa_plan_count >= H3_CUDNN_SDPA_PLAN_CACHE)
+        return 1;
+    h3_cudnn_sdpa_plan *plan = new (std::nothrow) h3_cudnn_sdpa_plan();
+    if (!plan)
+        return 1;
+    plan->sequence = sequence;
+    plan->heads = heads;
+    plan->head_dim = head_dim;
+    plan->scale_bits = scale_bits;
+    plan->head_major_output = head_major_output;
+    accel->sdpa_plans[accel->sdpa_plan_count++] = plan;
+
+    uint64_t element_count = (uint64_t)sequence * heads * head_dim;
+    if (element_count > (uint64_t)INT64_MAX)
+        return 1;
+    int64_t elements = (int64_t)element_count;
+    int64_t sequence_i64 = (int64_t)sequence;
+    int64_t heads_i64 = (int64_t)heads;
+    int64_t head_dim_i64 = (int64_t)head_dim;
+    try {
+        using cudnn_frontend::DataType_t;
+        using cudnn_frontend::HeurMode_t;
+        using cudnn_frontend::graph::Graph;
+        using cudnn_frontend::graph::SDPA_attributes;
+        using cudnn_frontend::graph::Tensor_attributes;
+
+        plan->graph = std::make_shared<Graph>();
+        plan->graph->set_io_data_type(DataType_t::BFLOAT16)
+            .set_intermediate_data_type(DataType_t::FLOAT)
+            .set_compute_data_type(DataType_t::FLOAT);
+        std::vector<int64_t> dimensions = {1, heads_i64, sequence_i64,
+                                           head_dim_i64};
+        std::vector<int64_t> input_strides = {
+            elements, head_dim_i64, heads_i64 * head_dim_i64, 1};
+        plan->query = plan->graph->tensor(
+            Tensor_attributes()
+                .set_name("Q")
+                .set_dim(dimensions)
+                .set_stride(input_strides));
+        plan->key = plan->graph->tensor(
+            Tensor_attributes()
+                .set_name("K")
+                .set_dim(dimensions)
+                .set_stride(input_strides));
+        plan->value = plan->graph->tensor(
+            Tensor_attributes()
+                .set_name("V")
+                .set_dim(dimensions)
+                .set_stride(input_strides));
+        auto outputs = plan->graph->sdpa(
+            plan->query, plan->key, plan->value,
+            SDPA_attributes()
+                .set_name("h3_sdpa")
+                .set_generate_stats(false)
+                .set_attn_scale(scale));
+        plan->output = outputs[0];
+        std::vector<int64_t> output_strides =
+            head_major_output
+                ? std::vector<int64_t>{elements,
+                                       sequence_i64 * head_dim_i64,
+                                       head_dim_i64, 1}
+                : input_strides;
+        plan->output->set_output(true)
+            .set_dim(dimensions)
+            .set_stride(output_strides);
+
+        auto status = plan->graph->validate();
+        if (status.is_bad()) {
+            h3_cudnn_sdpa_log_failure("validation", status, sequence, heads,
+                                      head_dim);
+            return 1;
+        }
+        auto operation_status =
+            plan->graph->build_operation_graph(accel->cudnn);
+        if (operation_status.is_bad()) {
+            h3_cudnn_sdpa_log_failure("operation graph", operation_status,
+                                      sequence, heads, head_dim);
+            return 1;
+        }
+        auto heuristic_status =
+            plan->graph->create_execution_plans({HeurMode_t::A});
+        if (heuristic_status.is_bad()) {
+            h3_cudnn_sdpa_log_failure("heuristics", heuristic_status,
+                                      sequence, heads, head_dim);
+            return 1;
+        }
+        auto support_status = plan->graph->check_support(accel->cudnn);
+        if (support_status.is_bad()) {
+            h3_cudnn_sdpa_log_failure("support check", support_status,
+                                      sequence, heads, head_dim);
+            return 1;
+        }
+        auto build_status = plan->graph->build_plans(
+            accel->cudnn,
+            cudnn_frontend::BuildPlanPolicy_t::HEURISTICS_CHOICE);
+        if (build_status.is_bad()) {
+            h3_cudnn_sdpa_log_failure("plan build", build_status, sequence,
+                                      heads, head_dim);
+            return 1;
+        }
+        auto workspace_status =
+            plan->graph->get_workspace_size(plan->workspace_bytes);
+        if (workspace_status.is_bad() || plan->workspace_bytes < 0 ||
+            (uint64_t)plan->workspace_bytes > accel->cudnn_workspace_limit) {
+            if (workspace_status.is_bad())
+                h3_cudnn_sdpa_log_failure("workspace query",
+                                          workspace_status, sequence, heads,
+                                          head_dim);
+            return 1;
+        }
+        plan->bindings.reserve(4);
+        void *empty = nullptr;
+        plan->bindings.emplace(plan->query, empty);
+        plan->bindings.emplace(plan->key, empty);
+        plan->bindings.emplace(plan->value, empty);
+        plan->bindings.emplace(plan->output, empty);
+        plan->supported = 1;
+        *result = plan;
+    } catch (const std::exception &exception) {
+        if (h3_cudnn_sdpa_debug_enabled())
+            fprintf(stderr,
+                    "h3: cuDNN SDPA plan exception for %ux%ux%u: %s\n",
+                    sequence, heads, head_dim, exception.what());
+    }
+    return 1;
+}
+
+static int h3_cudnn_sdpa_bf16(
+    h3_cuda_accel *accel, void *stream_handle, void *output,
+    const void *query, const void *key, const void *value, uint32_t sequence,
+    uint32_t heads, uint32_t head_dim, float scale, int head_major_output,
+    int *used, char *error, size_t error_size) {
+    *used = 0;
+    h3_cudnn_sdpa_plan *plan = NULL;
+    if (!h3_cudnn_get_sdpa_plan(accel, sequence, heads, head_dim, scale,
+                                head_major_output, &plan))
+        return 0;
+    if (!plan || !h3_cudnn_ensure_workspace(
+                     accel, (size_t)plan->workspace_bytes))
+        return 1;
+    cudnnStatus_t cudnn_status = cudnnSetStream(
+        accel->cudnn, static_cast<cudaStream_t>(stream_handle));
+    if (cudnn_status != CUDNN_STATUS_SUCCESS) {
+        h3_lt_error(error, error_size, "cuDNN SDPA stream failed: %s",
+                    cudnnGetErrorString(cudnn_status));
+        return 0;
+    }
+    plan->bindings[plan->query] = const_cast<void *>(query);
+    plan->bindings[plan->key] = const_cast<void *>(key);
+    plan->bindings[plan->value] = const_cast<void *>(value);
+    plan->bindings[plan->output] = output;
+    auto status = plan->graph->execute(accel->cudnn, plan->bindings,
+                                       accel->cudnn_workspace);
+    if (status.is_bad()) {
+        h3_lt_error(error, error_size, "cuDNN SDPA execution failed: %s",
+                    status.get_message().c_str());
+        return 0;
+    }
+    *used = 1;
+    return 1;
+}
+#endif
+
 int h3_cuda_accel_sdpa_bf16(
     h3_cuda_accel *accel, void *stream_handle, void *output,
     const void *query, const void *key, const void *value, uint32_t sequence,
@@ -1096,6 +1331,28 @@ int h3_cuda_accel_sdpa_bf16(
         !heads || (head_dim != 64u && head_dim != 128u) ||
         (disabled && *disabled && strcmp(disabled, "0") != 0))
         return 1;
+#if defined(H3_HAVE_CUDNN_FRONTEND)
+    const char *cudnn_disabled = getenv("H3_DISABLE_CUDNN");
+    const char *sdpa_disabled = getenv("H3_DISABLE_CUDNN_SDPA");
+    if (accel->cudnn && sequence >= H3_CUDNN_SDPA_MIN_SEQUENCE &&
+        isfinite(scale) &&
+        !(cudnn_disabled && *cudnn_disabled &&
+          strcmp(cudnn_disabled, "0") != 0) &&
+        !(sdpa_disabled && *sdpa_disabled &&
+          strcmp(sdpa_disabled, "0") != 0)) {
+        int cudnn_used = 0;
+        if (!h3_cudnn_sdpa_bf16(
+                accel, stream_handle, output, query, key, value, sequence,
+                heads, head_dim, scale, head_major_output, &cudnn_used, error,
+                error_size))
+            return 0;
+        if (cudnn_used) {
+            stats->attention_launches++;
+            *used = 1;
+            return 1;
+        }
+    }
+#endif
     cudaStream_t stream = static_cast<cudaStream_t>(stream_handle);
     dim3 grid((sequence + 15u) / 16u, heads, 1u);
     if (head_dim == 64u) {
@@ -1114,7 +1371,7 @@ int h3_cuda_accel_sdpa_bf16(
             head_major_output);
     }
     if (!h3_lt_launch_result(cudaPeekAtLastError(), error, error_size,
-                             "CUDA tiled BF16 attention"))
+                             "CUDA tiled fallback BF16 attention"))
         return 0;
     stats->attention_launches++;
     *used = 1;

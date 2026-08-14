@@ -628,10 +628,15 @@ make GPU=cuda smoke
 The build searches `PATH` and `/opt/cuda/bin` for `nvcc`. `CUDA_HOME` may point
 to another toolkit, `CUDA_ARCH` overrides nvcc's default `native` target (for
 example `CUDA_ARCH=sm_120`), and `H3_CUDA_DEVICE=N` selects a device at runtime.
-The tested configuration is CUDA 12.8, driver 610.57.04, and an RTX 5070 Ti
-(`sm_120`, 16 GB). cuBLASLt is required by the optimized CUDA build. cuDNN is
-automatically enabled when `/usr/include/cudnn.h` is present; use
-`make GPU=cuda CUDNN=0` to build and test the portable fallback without it.
+The tested configuration is CUDA 12.8, driver 610.57.04, cuDNN 9.8, cuDNN
+Frontend 1.27, and an RTX 5070 Ti (`sm_120`, 16 GB). cuBLASLt is required by
+the optimized CUDA build. cuDNN is automatically enabled when
+`/usr/include/cudnn.h` is present. If `cudnn_frontend.h` is also installed,
+h3 enables fused BF16 SDPA and links NVRTC automatically. On Arch Linux the
+optional header is provided by `cudnn-frontend`. Use
+`make GPU=cuda CUDNN_FRONTEND=0` to retain cuDNN Conv3D but use h3's tiled
+attention, or `make GPU=cuda CUDNN=0 CUDNN_FRONTEND=0` for the fully portable
+CUDA fallback.
 
 `h3_gpu_cuda.c` owns CUDA device allocations, file staging, one ordered
 nonblocking stream, CUDA-event timing, submission/error handling, and
@@ -642,14 +647,19 @@ oracle. Hot paths live separately in `h3_cuda_accel.cu`:
 - cuBLASLt Tensor Core `int8 x int8 -> int32` for QKV, attention output, FC1,
   row-FC2, and grouped-per-1024 FC2, followed by exact H3 scale/BF16 epilogues;
 - cuBLASLt pedantic-F32 projections for the visual VAE transformer;
-- tiled online-softmax BF16 and F32 attention, processing 16 query/key rows per
-  block instead of synchronizing once per key;
+- cuDNN Frontend fused BF16 SDPA for sequences of at least 128 rows, with
+  cached plans and direct row-major or head-major output strides;
+- tiled online-softmax BF16 and F32 attention as the dependency-free fallback,
+  processing 16 query/key rows per block instead of synchronizing once per key;
 - optional deterministic cuDNN Conv3D for the visual reference encoder.
 
 The old generated kernels remain automatic fallbacks for unsupported shapes.
 `H3_DISABLE_CUBLASLT=1`, `H3_DISABLE_CUBLASLT_F32=1`,
-`H3_DISABLE_CUDA_FLASH2=1`, `H3_DISABLE_CUDA_FLASH2_F32=1`, and
-`H3_DISABLE_CUDNN=1` isolate the corresponding optimized paths.
+`H3_DISABLE_CUDA_FLASH2=1`, `H3_DISABLE_CUDA_FLASH2_F32=1`,
+`H3_DISABLE_CUDNN_SDPA=1`, and `H3_DISABLE_CUDNN=1` isolate the corresponding
+optimized paths. `H3_CUDA_CUDNN_SDPA_DEBUG=1` prints why a shape fell back.
+The cuDNN plan is keyed by sequence, head geometry, scale, and output layout;
+unsupported shapes are cached as fallbacks rather than retried every block.
 
 ### Persistent CUDA caches
 
@@ -670,11 +680,11 @@ one cache. `H3_INT8_CACHE_DIR` and `H3_ADALN_CACHE_DIR` relocate them. Removing
 
 ### CUDA validation and measured speedup
 
-The optimized CUDA build passes 1,767 host checks, **517 CUDA GPU checks** with
-cuDNN (516 without it), 20 complete DiT-block checks, and 34 tokenizer checks
-with zero strict-C warnings. The same source passes 516 Vulkan GPU checks and
-the full Vulkan regression suite. The CUDA/cuDNN and Vulkan counts differ by
-one accelerated-convolution assertion.
+The optimized CUDA build passes 1,767 host checks, **523 CUDA GPU checks** with
+cuDNN Frontend (522 without cuDNN), 20 complete DiT-block checks, and 34
+tokenizer checks with zero strict-C warnings. The same source passes 522 Vulkan
+GPU checks and the full Vulkan regression suite. Builds with cuDNN Frontend,
+cuDNN without Frontend, no cuDNN, Vulkan, and the Linux stub are all validated.
 
 The fixed real-checkpoint smoke uses seed 42, 256x256, 8 requested frames, 5
 steps, `--reuse 3`, and 35 active layers, producing a 22-frame H.264/AAC file:
@@ -693,7 +703,8 @@ Representative kernel measurements on the same card:
 | INT8 linear, `528 x 5376 x 5376` | **63.7x** |
 | full INT8 MLP, 528 rows | **44.3x** |
 | full INT8 MLP, 8192 rows | **38.4x** |
-| BF16 attention, `8192 x 42 x 128` | **21.1x** |
+| BF16 SDPA, `9000 x 56 x 128` | tiled 308.2 ms -> **cuDNN 24.3 ms (12.7x)** |
+| 50-layer long-shape DiT forward | tiled 17.99 s -> **cuDNN 5.09 s (3.53x)** |
 | F32 attention, `2053 x 32 x 64` | **8.1x** |
 | DiT denoising phase | 16.0 s -> **0.42 s** |
 | visual VAE decoder | 22.5 s -> **7.9 s** (GPU 15.7 s -> 0.86 s) |
@@ -703,9 +714,10 @@ Tensor Core INT8 outputs are byte-identical to the generated integer kernels in
 the linear and full-MLP benchmarks. Cache-build and cache-hit videos were also
 pixel-identical (`PSNR = infinity`). The reordered F32 VAE math measured 52.33
 dB decoded-video PSNR against its generated fallback, with unchanged mean
-luminance and first-frame color count. Tiled attention uses a different valid
-reduction order, so diffusion details can change; use the disable variables
-above for close-reference diagnosis.
+luminance and first-frame color count. Vendor fused attention uses BF16 Tensor
+Cores for both products and therefore is not bit-identical to h3's scalar-F32
+online softmax. Use `H3_DISABLE_CUDNN_SDPA=1` for close-reference diagnosis; the
+fallback remains covered by the tighter F32-oracle test.
 
 For a 16 GB CUDA card, the best resident speed/capacity compromise remains the
 default all-INT8 DiT projection path when the selected layers fit:
@@ -731,8 +743,9 @@ speech (mean -0.000029, RMS 0.0384, peak 0.287, no clipped samples) transcribed
 as `Io sono una pipa.` for the requested `Io sono una PIPPA!`. Use:
 
 ```sh
-./h3 --profile -d MiniMax-H3 -p "$(cat prompt.txt)" \
-  --width 256 --height 256 --frames 39 --steps 20 \
+H3_CUDA_LT_SCRATCH_MB=512 ./h3 --profile \
+  -d MiniMax-H3 -p "$(cat prompt.txt)" \
+  --width 512 --height 512 --frames 107 --steps 20 \
   --layers 50 --reuse 1 --core-reuse 1 --int8-streaming \
   --ref-image portrait.jpg --ref-audio voice.mp3 \
   -o outputs/talking-portrait.mp4
@@ -740,13 +753,30 @@ as `Io sono una pipa.` for the requested `Io sono una PIPPA!`. Use:
 
 `--int8-streaming` keeps two complete quantized block slots in VRAM, reads
 weights and F32 scales from the source-validated persistent cache, and overlaps
-the next upload with the current block. The first run builds missing cache
-entries; later runs reuse them. On RTX 5070 Ti, the validated 50-block render
-completed in 320 seconds with a reported DiT peak of 1.65 GiB. Its denoising
-phase read 359.5 GiB at 1.39 GiB/s over 20 steps; SSD waits dominated runtime,
-so this mode prioritizes model depth and memory capacity rather than speed.
-A same-shape one-forward test used 1.49 GiB and produced identical video/audio
-hashes to the resident INT8 path at the same layer count.
+the next upload with the current block. The first run builds missing entries;
+later runs reuse them. `H3_CUDA_LT_SCRATCH_MB` controls the bounded INT32
+cuBLASLt arena (default 64 MiB, range 8-512 MiB). On a 16 GB card, 512 MiB is
+the recommended throughput setting for long INT8-streaming renders: it reduced
+this test from 154,000 to 23,000 cuBLASLt launches while keeping peak DiT memory
+at 2.92 GiB.
+
+The production Ref2VA validation used seed 42, 512x512, 107 frames, 20 steps,
+all 50 blocks, and reference image plus voice. Relative to the previous tiled
+attention/default-scratch build, fused SDPA plus the 512 MiB arena measured:
+
+| RTX 5070 Ti phase | Before | Fused SDPA | Speedup |
+|---|---:|---:|---:|
+| complete render | 585 s | **187 s** | **3.13x** |
+| DiT total | 521.1 s | **125.2 s** | **4.16x** |
+| Euler denoise | 519.3 s | **110.2 s** | **4.71x** |
+
+The denoise read 359.5 GiB at 3.27 GiB/s; only 19.9 s remained as unhidden I/O,
+so SSD/pinned-host streaming is now the next major optimization target. The new
+file retained clean speech (RMS 0.0309, peak 0.269, zero clipping and negligible
+DC) and Whisper transcribed the requested `Io sono una pippa.` exactly. Against
+the close-reference file, decoded video measured SSIM 0.9807 and PSNR 36.22 dB;
+mean luma was 139.75 vs 139.21 and mean inter-frame luma change was unchanged
+at 1.15.
 
 `--int8-streaming` is CUDA-only, mutually exclusive with `--ssd-streaming`, and
 cannot be combined with the three `--use-slower-bf16-*` projection overrides.

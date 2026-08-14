@@ -1675,11 +1675,6 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            uint32_t head_dim, float scale) {
     if (!h3_cuda_check_tensors(gpu, 4, output, query, key, value))
         return 0;
-    if (sequence > 4096) {
-        h3_cuda_set_error(gpu, "GQA sequence exceeds the 4096-row score "
-                               "threadgroup buffer");
-        return 0;
-    }
     gpu->args->rows = sequence;
     gpu->args->width = query_heads;
     gpu->args->input_dim = kv_heads;

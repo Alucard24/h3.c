@@ -474,10 +474,11 @@ round-to-nearest-even is bit-exact):
 - attention: `grouped_qkv_rope` bf16 (checkpoint `[head, q/k/v, dim]` rows
   and the plain `[q/k/v, head, dim]` variant, Q/K RMS + RoPE to
   `[row, head, dim]`) and `sdpa` bf16 with maximum subtraction and F32
-  accumulation: the one-thread-per-output naive kernel below 128 rows
-  (bit-exact reference order), a 128-thread flash kernel with online
-  softmax and tree-reduced dots at and above 128 rows, and a head-major
-  output variant for layout-aware projections
+  accumulation: the scalar reference below 128 rows; a portable 16-query
+  tiled online-softmax kernel above it; and, when BF16
+  `VK_KHR_cooperative_matrix` is available, a 64-query kernel whose four
+  QK subgroups use Tensor Cores while softmax/P*V remain F32. Row-major and
+  head-major outputs are both written directly
 - Qwen3 text encoder: `text_qk_rope` bf16 (per-head Q/K RMS + RoPE from
   separate inputs, KV sharing), in-place `rope_text` bf16 with F32 tables,
   and causal GQA `gqa_causal` bf16 (scale applied to Q before the
@@ -507,6 +508,45 @@ gate, MLP AdaLN, fused fc1/SwiGLU/fc2, gate) at production shapes
 verified against a CPU reference with the same arithmetic order: the
 modulated attention lands within 1 BF16 ulp and the final hidden within
 0.5% relative max.
+
+### Cooperative-matrix SDPA and tiled INT8 projections
+
+The device probe enables `VK_KHR_cooperative_matrix`,
+`VK_KHR_shader_bfloat16`, the Vulkan memory model, and 16-bit storage only
+when the selected device advertises a BF16 `16x16x16 -> F32` subgroup
+configuration. The optional pipeline is compiled with shaderc performance
+optimization. Missing driver features, older shader compilers, or pipeline
+creation failures fall back automatically to the portable 16-query shader.
+
+Idle-GPU timings on the RTX 5070 Ti (driver 610.57.04) were:
+
+| BF16 SDPA shape | original one-row | portable tiled | cooperative QK |
+|---|---:|---:|---:|
+| `2048 x 8 x 128` | 162.1 ms | 13.24 ms | **5.44 ms** |
+| `9000 x 56 x 128` | watchdog-risk; not run | 1.919 s | **0.532 s** |
+
+That is **29.8x** over the original kernel on the test shape and **3.61x**
+over the portable tiled kernel on the long Ref2VA-like shape.
+
+The INT8 linear, FC1/SwiGLU, and grouped-FC2 kernels were also retiled from
+`16 rows x 16 columns x 16 K` with 32-bit shared elements to
+`32 rows x 8 columns x 32 K` with packed signed-8-bit shared elements. This
+reuses each weight across twice as many rows and halves synchronization rounds
+without changing exact int32 accumulation. On a synthetic representative DiT
+projection (`512x5376` by `16128x5376`), median time fell from **330.3 ms to
+160.1 ms** (**2.06x**). The 512x512, 7-latent-frame, 25-block real-checkpoint
+DiT forward fell from **144.6 s to 86.2 s** (**1.68x**, excluding load).
+The same seed-42, 256x256, 5-step, 35-layer end-to-end render used below fell
+from **354 s to 240 s** (**1.48x**) and produced valid 22-frame H.264 plus AAC
+output.
+
+`H3_DISABLE_VK_COOPMAT=1` selects the portable tiled SDPA path.
+`H3_DISABLE_VK_TILED_SDPA=1` restores the original one-row SDPA kernel for
+A/B diagnosis. Tests cover 64- and 128-wide heads, both output layouts, all
+three attention paths within 8 BF16 ulps of the scalar-F32 oracle, and INT8
+projection tiles spanning complete and partial 32-row workgroups. The current
+suite reports 1,765 host checks, **921 Vulkan kernel checks**, 20 complete
+DiT-block checks, and 30 tokenizer checks with validation-layer runs clean.
 
 ## End-to-end on Linux (Vulkan)
 
@@ -541,11 +581,13 @@ SwiGLU activation independently in 1,024-channel groups and dequantizes each
 partial product before the final BF16 rounding. The optional row-FC2 path uses
 one scale across the complete activation row.
 
-The current Vulkan int8 kernels use portable scalar integer products inside
-16x16 tiles; they do not yet use NVIDIA integer dot-product instructions.
-Consequently, int8 is primarily a **memory-capacity path** on NVIDIA, not the
-fastest arithmetic path. Resident BF16 projections can be faster when they fit
-in VRAM. This differs from M5 Metal, where native TensorOps make int8 faster.
+The current Vulkan int8 kernels use portable scalar integer products in
+32-row x 8-column tiles with a K tile of 32 and packed int8 shared storage.
+They are substantially faster than the original 16x16 implementation, but do
+not depend on vendor-specific integer dot-product instructions. Int8 remains
+primarily a **memory-capacity path** on NVIDIA; resident BF16 projections can
+still be faster when they fit in VRAM. This differs from M5 Metal, where native
+TensorOps make int8 faster.
 
 | Control | Effect |
 |---|---|
@@ -570,23 +612,26 @@ measured on decoded RGB frames against the same-seed all-BF16
 
 | Resident projection mix | Extra CLI flags | Wall time | vs default | PSNR vs BF16 | RGB relative L2 |
 |---|---|---:|---:|---:|---:|
-| all int8 (default) | none | 354 s | baseline | 18.58 dB | 0.1763 |
-| **QKV BF16, rest int8** | `--use-slower-bf16-qkv` | **328 s** | **7.3% faster** | **23.01 dB** | **0.1058** |
-| attention output BF16, rest int8 | `--use-slower-bf16-attention-output` | 331 s | 6.5% faster | 20.45 dB | 0.1420 |
-| QKV + attention output BF16, MLP int8 | both flags above | 308 s | 13.0% faster | 20.94 dB | 0.1342 |
+| all int8 (default) | none | 240 s | baseline | 19.03 dB | 0.1661 |
+| QKV BF16, rest int8 | `--use-slower-bf16-qkv` | 218 s | 9.2% faster | 20.80 dB | 0.1355 |
+| **attention output BF16, rest int8** | `--use-slower-bf16-attention-output` | **229 s** | **4.6% faster** | **24.30 dB** | **0.0906** |
+| QKV + attention output BF16, MLP int8 | both flags above | 205 s | 14.6% faster | 23.01 dB | 0.1050 |
+| all BF16, SSD streamed | `--ssd-streaming` | 429 s | 78.8% slower | reference | reference |
 
-For this Vulkan backend, **QKV BF16 with int8 MLP and int8 attention output is
-the recommended quality/performance compromise**. QKV errors enter the
-attention softmax and had the largest effect on final-frame fidelity; keeping
-only QKV in BF16 reduced decoded-frame relative L2 by about 40% while also
-shortening this end-to-end run. The two-BF16-projection result was faster but
-not closer on this seed because iterative denoising is nonlinear, so fidelity
-is not guaranteed to improve monotonically as individual projections change.
-Validate additional seeds before changing a production preset.
+For this Vulkan backend, **BF16 attention output with int8 QKV and int8 MLP is
+the recommended quality/performance compromise** on a 16 GB card. It used
+only about 1.26 GiB more resident weight storage, cut decoded-frame relative
+L2 by 45% on this seed, and was also slightly faster. Keeping both attention
+projections in BF16 gave the shortest run but needed about 5.02 GiB more
+weight storage and was not closer to the all-BF16 reference. Iterative
+denoising is nonlinear, so fidelity is not guaranteed to improve monotonically
+as individual projections change; validate additional seeds before changing a
+production preset.
 
 ```sh
 ./h3 -d MiniMax-H3 -p "A red fox walking through snow" \
-  --use-slower-bf16-qkv -o outputs/fox-vulkan-mixed.mp4
+  --use-slower-bf16-attention-output \
+  -o outputs/fox-vulkan-mixed.mp4
 ```
 
 The tradeoff is resident weight storage. Replacing int8 weights with BF16 adds
@@ -599,9 +644,9 @@ approximately the following capacity (scale arrays are negligible):
 | QKV + attention output | +5.02 GiB | +7.18 GiB |
 | MLP | +7.54 GiB | +10.77 GiB |
 
-The recommended QKV-BF16 configuration completed the 35-layer test on the
-16 GB card. Larger resolutions, longer sequences, or 50 resident layers may
-require returning QKV to int8 or using all-BF16 `--ssd-streaming`. Runtime
+The recommended attention-output-BF16 configuration completed the 35-layer
+test on the 16 GB card. Larger resolutions, longer sequences, or 50 resident
+layers may require returning it to int8 or using all-BF16 `--ssd-streaming`. Runtime
 weight quantization also adds startup time. For an all-int8/all-BF16 A-B, run
 the same seed with the defaults and then with `--ssd-streaming`, which disables
 all three int8 projection paths; quantization can change fine details even

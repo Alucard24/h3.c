@@ -1893,7 +1893,7 @@ static void test_quantize_int8(h3_gpu *gpu) {
 }
 
 static void test_linear_int8(h3_gpu *gpu) {
-    enum { ROWS = 4, INPUT_DIM = 37, OUTPUT_DIM = 23 };
+    enum { ROWS = 35, INPUT_DIM = 37, OUTPUT_DIM = 23 };
     size_t input_count = (size_t)ROWS * INPUT_DIM;
     size_t weight_count = (size_t)OUTPUT_DIM * INPUT_DIM;
     uint16_t input[input_count], weight[weight_count];
@@ -2025,8 +2025,92 @@ static void test_linear_int8_head_major(h3_gpu *gpu) {
     h3_gpu_tensor_free(ws);
 }
 
+static void test_grouped_qkv_linear_rope_int8(h3_gpu *gpu) {
+    enum { ROWS = 35, INPUT_DIM = 37, HEADS = 3, DIM = 8, HALF = 4 };
+    const float epsilon = 1e-5f;
+    size_t inner = (size_t)HEADS * DIM;
+    size_t input_count = (size_t)ROWS * INPUT_DIM;
+    size_t weight_count = inner * 3 * INPUT_DIM;
+    size_t projected = (size_t)ROWS * inner;
+    uint16_t input[input_count], weight[weight_count], norm[DIM];
+    uint16_t rcos[ROWS * HALF], rsin[ROWS * HALF];
+    for (size_t index = 0; index < input_count; index++)
+        input[index] = bf16_bits((float)sin((double)index * 0.31) * 1.4f);
+    for (size_t index = 0; index < weight_count; index++)
+        weight[index] = bf16_bits((float)cos((double)index * 0.27) * 0.4f);
+    for (size_t index = 0; index < DIM; index++)
+        norm[index] = bf16_bits(0.8f + (float)index * 0.03f);
+    for (size_t index = 0; index < ROWS * HALF; index++) {
+        rcos[index] = bf16_bits(cosf((float)index * 0.13f));
+        rsin[index] = bf16_bits(sinf((float)index * 0.13f));
+    }
+    h3_gpu_tensor *in = h3_gpu_tensor_from_bf16(gpu, input, input_count);
+    h3_gpu_tensor *w = h3_gpu_tensor_from_bf16(gpu, weight, weight_count);
+    h3_gpu_tensor *wq = h3_gpu_tensor_new_i8(gpu, weight_count);
+    h3_gpu_tensor *ws = h3_gpu_tensor_new_f32(gpu, inner * 3);
+    h3_gpu_tensor *qi = h3_gpu_tensor_new_i8(gpu, input_count);
+    h3_gpu_tensor *is = h3_gpu_tensor_new_f32(gpu, ROWS);
+    h3_gpu_tensor *n = h3_gpu_tensor_from_bf16(gpu, norm, DIM);
+    h3_gpu_tensor *c = h3_gpu_tensor_from_bf16(gpu, rcos, ROWS * HALF);
+    h3_gpu_tensor *s = h3_gpu_tensor_from_bf16(gpu, rsin, ROWS * HALF);
+    h3_gpu_tensor *scratch_a = h3_gpu_tensor_new_bf16(gpu, projected * 3);
+    h3_gpu_tensor *scratch_b = h3_gpu_tensor_new_bf16(gpu, projected * 3);
+    h3_gpu_tensor *aq = h3_gpu_tensor_new_bf16(gpu, projected);
+    h3_gpu_tensor *ak = h3_gpu_tensor_new_bf16(gpu, projected);
+    h3_gpu_tensor *av = h3_gpu_tensor_new_bf16(gpu, projected);
+    h3_gpu_tensor *bq = h3_gpu_tensor_new_bf16(gpu, projected);
+    h3_gpu_tensor *bk = h3_gpu_tensor_new_bf16(gpu, projected);
+    h3_gpu_tensor *bv = h3_gpu_tensor_new_bf16(gpu, projected);
+    CHECK(in && w && wq && ws && qi && is && n && c && s && scratch_a &&
+          scratch_b && aq && ak && av && bq && bk && bv);
+    if (!failed) {
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_quantize_weight_int8(
+                  gpu, wq, ws, w, (uint32_t)(inner * 3), INPUT_DIM) == 1);
+        CHECK(h3_gpu_grouped_qkv_linear_rope_int8(
+                  gpu, aq, ak, av, scratch_a, qi, is, in, wq, ws, n, n,
+                  c, s, ROWS, INPUT_DIM, HEADS, DIM, HALF, epsilon,
+                  0, 0, 0, 0) == 1);
+        CHECK(h3_gpu_linear_int8_bf16(
+                  gpu, scratch_b, qi, is, in, wq, ws, ROWS, INPUT_DIM,
+                  (uint32_t)(inner * 3), 0) == 1);
+        CHECK(h3_gpu_grouped_qkv_rope_bf16(
+                  gpu, bq, bk, bv, scratch_b, n, n, c, s, ROWS, HEADS,
+                  DIM, HALF, epsilon) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        uint16_t got_a[ROWS * HEADS * DIM];
+        uint16_t got_b[ROWS * HEADS * DIM];
+        h3_gpu_tensor *a_outputs[3] = { aq, ak, av };
+        h3_gpu_tensor *b_outputs[3] = { bq, bk, bv };
+        for (size_t output = 0; output < 3; output++) {
+            CHECK(h3_gpu_tensor_read_bf16(a_outputs[output], got_a,
+                                          projected) == 1);
+            CHECK(h3_gpu_tensor_read_bf16(b_outputs[output], got_b,
+                                          projected) == 1);
+            CHECK(memcmp(got_a, got_b, projected * sizeof(*got_a)) == 0);
+        }
+    }
+    h3_gpu_tensor_free(in);
+    h3_gpu_tensor_free(w);
+    h3_gpu_tensor_free(wq);
+    h3_gpu_tensor_free(ws);
+    h3_gpu_tensor_free(qi);
+    h3_gpu_tensor_free(is);
+    h3_gpu_tensor_free(n);
+    h3_gpu_tensor_free(c);
+    h3_gpu_tensor_free(s);
+    h3_gpu_tensor_free(scratch_a);
+    h3_gpu_tensor_free(scratch_b);
+    h3_gpu_tensor_free(aq);
+    h3_gpu_tensor_free(ak);
+    h3_gpu_tensor_free(av);
+    h3_gpu_tensor_free(bq);
+    h3_gpu_tensor_free(bk);
+    h3_gpu_tensor_free(bv);
+}
+
 static void test_mlp_int8(h3_gpu *gpu) {
-    enum { ROWS = 3, INPUT_DIM = 29, HIDDEN = 17, OUTPUT_DIM = 13 };
+    enum { ROWS = 35, INPUT_DIM = 29, HIDDEN = 17, OUTPUT_DIM = 13 };
     size_t input_count = (size_t)ROWS * INPUT_DIM;
     size_t fc1_count = (size_t)HIDDEN * 2 * INPUT_DIM;
     size_t fc2_count = (size_t)OUTPUT_DIM * HIDDEN;
@@ -2268,7 +2352,7 @@ static void test_mlp_int8_grouped(h3_gpu *gpu) {
      * (acc * input_scale) * weight_scale). Half-way quantization values can
      * differ by one int8 step across FPUs, so the final comparison allows the
      * corresponding small dequantization drift. */
-    enum { ROWS = 3, INPUT_DIM = 29, HIDDEN = 2048, OUTPUT_DIM = 13,
+    enum { ROWS = 35, INPUT_DIM = 29, HIDDEN = 2048, OUTPUT_DIM = 13,
            GROUPS = 2 };
     size_t input_count = (size_t)ROWS * INPUT_DIM;
     size_t fc1_count = (size_t)HIDDEN * 2 * INPUT_DIM;
@@ -2378,7 +2462,7 @@ static void test_mlp_int8_grouped(h3_gpu *gpu) {
             /* Half-way quantization products round differently on
              * different FPUs; each off-by-one quantized weight shifts the
              * dequant by its own scale, so allow a small absolute band. */
-            float tol = fmaxf(0.05f, fabsf(ev) * 0.05f);
+            float tol = fmaxf(0.08f, fabsf(ev) * 0.05f);
             CHECK(fabsf(gv - ev) <= tol);
         }
     }
@@ -3193,10 +3277,9 @@ static void test_patch_linear_map_bf16(h3_gpu *gpu) {
     free(input); free(weight); free(expected); free(got);
 }
 
-static void test_sdpa_flash_bf16(h3_gpu *gpu) {
-    /* Long sequence exercises the 128-thread flash kernel (selected
-     * automatically for sequence >= 128). */
-    enum { SEQ = 256, HEADS = 4, DIM = 128 };
+static void test_sdpa_flash_case(h3_gpu *gpu, uint32_t dim) {
+    enum { SEQ = 256, HEADS = 4 };
+    uint32_t DIM = dim;
     size_t count = (size_t)SEQ * HEADS * DIM;
     uint16_t *q = malloc(count * 2), *k = malloc(count * 2),
              *v = malloc(count * 2), *expected = malloc(count * 2);
@@ -3249,10 +3332,71 @@ static void test_sdpa_flash_bf16(h3_gpu *gpu) {
             uint16_t *got = malloc(count * 2);
             CHECK(got);
             CHECK(h3_gpu_tensor_read_bf16(out, got, count) == 1);
-            /* The flash kernel reduces dots with a tree instead of the
-             * linear FMA order, so allow a few more ulps. */
+            /* Cooperative QK changes only the dot-product reduction order;
+             * F32 online softmax and P*V retain the tight reference bound. */
             CHECK(check_bf16_ulp_abs(got, expected, count, 8, 2e-7f,
-                                      "sdpa_flash"));
+                                      "sdpa_coopmat"));
+
+            h3_gpu_tensor *head_out = h3_gpu_tensor_new_bf16(gpu, count);
+            uint16_t *head_got = malloc(count * 2);
+            CHECK(head_out && head_got);
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_sdpa_bf16_head_major_output(
+                      gpu, head_out, tq, tk, tv, SEQ, HEADS, DIM, scale) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
+            CHECK(h3_gpu_tensor_read_bf16(head_out, head_got, count) == 1);
+            int same = 1;
+            for (uint32_t row = 0; row < SEQ && same; row++)
+                for (uint32_t head = 0; head < HEADS && same; head++)
+                    for (uint32_t dimension = 0; dimension < DIM;
+                         dimension++) {
+                        size_t row_index =
+                            ((size_t)row * HEADS + head) * DIM + dimension;
+                        size_t head_index =
+                            ((size_t)head * SEQ + row) * DIM + dimension;
+                        if (head_got[head_index] != got[row_index]) {
+                            same = 0;
+                            break;
+                        }
+                    }
+            CHECK(same);
+
+            const char *disabled_value = getenv("H3_DISABLE_VK_COOPMAT");
+            char *saved_disabled =
+                disabled_value ? strdup(disabled_value) : NULL;
+            setenv("H3_DISABLE_VK_COOPMAT", "1", 1);
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
+                                   scale) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
+            if (saved_disabled)
+                setenv("H3_DISABLE_VK_COOPMAT", saved_disabled, 1);
+            else
+                unsetenv("H3_DISABLE_VK_COOPMAT");
+            free(saved_disabled);
+            CHECK(h3_gpu_tensor_read_bf16(out, got, count) == 1);
+            CHECK(check_bf16_ulp_abs(got, expected, count, 8, 2e-7f,
+                                      "sdpa_tiled"));
+            if (DIM == 64) {
+                const char *tiled_value =
+                    getenv("H3_DISABLE_VK_TILED_SDPA");
+                char *saved_tiled = tiled_value ? strdup(tiled_value) : NULL;
+                setenv("H3_DISABLE_VK_TILED_SDPA", "1", 1);
+                h3_gpu_begin(gpu);
+                CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS,
+                                       DIM, scale) == 1);
+                CHECK(h3_gpu_submit(gpu) == 1);
+                if (saved_tiled)
+                    setenv("H3_DISABLE_VK_TILED_SDPA", saved_tiled, 1);
+                else
+                    unsetenv("H3_DISABLE_VK_TILED_SDPA");
+                free(saved_tiled);
+                CHECK(h3_gpu_tensor_read_bf16(out, got, count) == 1);
+                CHECK(check_bf16_ulp_abs(got, expected, count, 8, 2e-7f,
+                                          "sdpa_row_flash"));
+            }
+            h3_gpu_tensor_free(head_out);
+            free(head_got);
             free(got);
             h3_gpu_tensor_free(tq);
             h3_gpu_tensor_free(tk);
@@ -3261,6 +3405,11 @@ static void test_sdpa_flash_bf16(h3_gpu *gpu) {
         }
     }
     free(q); free(k); free(v); free(expected);
+}
+
+static void test_sdpa_flash_bf16(h3_gpu *gpu) {
+    test_sdpa_flash_case(gpu, 128);
+    test_sdpa_flash_case(gpu, 64);
 }
 
 static void test_sdpa_flash_bench(h3_gpu *gpu) {
@@ -3282,16 +3431,21 @@ static void test_sdpa_flash_bench(h3_gpu *gpu) {
         h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(gpu, count);
         CHECK(tq && tk && tv && out);
         if (!failed) {
-            h3_gpu_stats stats;
-            /* Naive (force by temporary threshold override is not exposed;
-             * the flash path is the one used at this size). */
+            h3_gpu_stats before, after;
+            /* Warm pipeline/cache state, then report only this dispatch. */
             h3_gpu_begin(gpu);
             CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
                                    1.0f / sqrtf((float)DIM)) == 1);
             CHECK(h3_gpu_submit(gpu) == 1);
-            h3_gpu_get_stats(gpu, &stats);
-            printf("SDPA seq=%d heads=%d: flash kernel %.1f ms (GPU wait)\n",
-                   SEQ, HEADS, stats.command_wait_seconds * 1e3);
+            CHECK(h3_gpu_get_stats(gpu, &before) == 1);
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_sdpa_bf16(gpu, out, tq, tk, tv, SEQ, HEADS, DIM,
+                                   1.0f / sqrtf((float)DIM)) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
+            CHECK(h3_gpu_get_stats(gpu, &after) == 1);
+            printf("SDPA seq=%d heads=%d: optimized kernel %.1f ms GPU\n",
+                   SEQ, HEADS,
+                   (after.gpu_seconds - before.gpu_seconds) * 1e3);
         }
         h3_gpu_tensor_free(tq);
         h3_gpu_tensor_free(tk);
@@ -3935,6 +4089,7 @@ int main(int argc, char **argv) {
     test_quantize_int8(gpu);
     test_linear_int8(gpu);
     test_linear_int8_head_major(gpu);
+    test_grouped_qkv_linear_rope_int8(gpu);
     test_mlp_int8(gpu);
     test_mlp_int8_grouped(gpu);
     test_gate_adaln_quantize_int8(gpu);

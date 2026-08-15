@@ -13,6 +13,12 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#if defined(H3_COOPMAT_BF16)
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_bfloat16 : require
+#endif
 
 #define H3_BF16_TO_F32(value) uintBitsToFloat(uint(value) << 16)
 
@@ -78,6 +84,8 @@ layout(set = 0, binding = 1) writeonly buffer OutBF16 { uint16_t data[]; } out_b
 
 #if defined(H3_LS16)
 layout(local_size_x = 16, local_size_y = 16) in;
+#elif defined(H3_LS8X32)
+layout(local_size_x = 8, local_size_y = 32) in;
 #elif defined(H3_LS128)
 layout(local_size_x = 128) in;
 #elif defined(H3_LS512)
@@ -895,10 +903,11 @@ void main_sdpa_flash_bf16() {
     uint seq = args.data.rows;
     uint heads = args.data.width;
     uint dim = args.data.input_dim;
-    if (row >= seq || head >= heads || d >= dim) return;
+    if (row >= seq || head >= heads) return;
     float scale = args.data.left_scale;
     uint qbase = (row * heads + head) * dim;
-    fl_q_shared[d] = H3_BF16_TO_F32(fl_q.data[qbase + d]);
+    fl_q_shared[d] = d < dim ?
+        H3_BF16_TO_F32(fl_q.data[qbase + d]) : 0.0f;
     fl_acc[d] = 0.0f;
     if (d == 0u) {
         fl_max = -3.402823466e+38f;
@@ -907,8 +916,9 @@ void main_sdpa_flash_bf16() {
     barrier();
     for (uint s = 0u; s < seq; s++) {
         uint kbase = (s * heads + head) * dim;
-        fl_dots[d] = fma(fl_q_shared[d],
-                         H3_BF16_TO_F32(fl_k.data[kbase + d]), 0.0f);
+        fl_dots[d] = d < dim ?
+            fma(fl_q_shared[d],
+                H3_BF16_TO_F32(fl_k.data[kbase + d]), 0.0f) : 0.0f;
         barrier();
         for (uint stride = 64u; stride > 0u; stride >>= 1) {
             if (d < stride) fl_dots[d] += fl_dots[d + stride];
@@ -925,20 +935,295 @@ void main_sdpa_flash_bf16() {
         barrier();
         float p = exp(fl_old_max - fl_max);
         float w = exp(fl_dots[0] * scale - fl_max);
-        fl_acc[d] = fl_acc[d] * p +
-                    w * H3_BF16_TO_F32(fl_v.data[kbase + d]);
+        float value = d < dim ?
+            H3_BF16_TO_F32(fl_v.data[kbase + d]) : 0.0f;
+        fl_acc[d] = fl_acc[d] * p + w * value;
         barrier();
     }
-    uint oindex = args.data.grouped != 0u ?
-        (head * seq + row) * dim + d : qbase + d;
-    fl_out.data[oindex] = uint16_t(h3_f32_to_bf16(fl_acc[d] / fl_sum));
+    if (d < dim) {
+        uint oindex = args.data.grouped != 0u ?
+            (head * seq + row) * dim + d : qbase + d;
+        fl_out.data[oindex] =
+            uint16_t(h3_f32_to_bf16(fl_acc[d] / fl_sum));
+    }
 }
 
-/* 16x16 tiled int8 matmuls: integer accumulation is exact and order
- * independent, so the dequantized result is bit-identical to the naive
- * kernel while the weights are staged through shared memory. */
-shared int lin8_in_tile[16][16];
-shared int lin8_w_tile[16][16];
+#if defined(H3_COOPMAT_BF16)
+/* Tensor-Core SDPA for devices exposing BF16 VK_KHR_cooperative_matrix.
+ * One 256-thread workgroup owns 64 query rows. Four subgroups form QK tiles
+ * concurrently; online softmax and P*V remain F32 SIMT work, avoiding the
+ * extra cooperative-matrix barriers and preserving probability precision. */
+layout(set = 0, binding = 0) readonly buffer CmQ { bfloat16_t data[]; } cm_q;
+layout(set = 0, binding = 1) readonly buffer CmK { bfloat16_t data[]; } cm_k;
+layout(set = 0, binding = 2) readonly buffer CmV { bfloat16_t data[]; } cm_v;
+
+shared bfloat16_t cm_query[64 * 128];
+shared bfloat16_t cm_key[16 * 128];
+shared bfloat16_t cm_value[16 * 128];
+shared float cm_probabilities[64 * 16];
+shared float cm_scores[64 * 16];
+shared float cm_row_maximum[64];
+shared float cm_row_sum[64];
+shared float cm_row_alpha[64];
+
+void main_sdpa_coopmat_bf16() {
+    uint tid = gl_LocalInvocationID.x;
+    uint query_start = gl_WorkGroupID.x * 64u;
+    uint head = gl_WorkGroupID.y;
+    uint seq = args.data.rows;
+    uint heads = args.data.width;
+    uint dim = args.data.input_dim;
+    uint query_elements = 64u * dim;
+    uint key_elements = 16u * dim;
+    float output_values[32];
+    for (uint slot = 0u; slot < 32u; slot++) output_values[slot] = 0.0f;
+
+    for (uint index = tid; index < query_elements; index += 256u) {
+        uint tile_row = index / dim;
+        uint dimension = index - tile_row * dim;
+        uint row = query_start + tile_row;
+        cm_query[tile_row * 128u + dimension] =
+            row < seq && head < heads ?
+            cm_q.data[(row * heads + head) * dim + dimension] :
+            bfloat16_t(0.0f);
+    }
+    if (tid < 64u) {
+        cm_row_maximum[tid] = -3.402823466e+38f;
+        cm_row_sum[tid] = 0.0f;
+        cm_row_alpha[tid] = 0.0f;
+    }
+    barrier();
+
+    for (uint key_start = 0u; key_start < seq; key_start += 16u) {
+        for (uint index = tid; index < key_elements; index += 256u) {
+            uint tile_row = index / dim;
+            uint dimension = index - tile_row * dim;
+            uint row = key_start + tile_row;
+            uint source = (row * heads + head) * dim + dimension;
+            cm_key[tile_row * 128u + dimension] =
+                row < seq && head < heads ? cm_k.data[source] :
+                                            bfloat16_t(0.0f);
+            cm_value[tile_row * 128u + dimension] =
+                row < seq && head < heads ? cm_v.data[source] :
+                                            bfloat16_t(0.0f);
+        }
+        barrier();
+
+        if (gl_SubgroupID < 4u) {
+            uint query_tile = gl_SubgroupID;
+            coopmat<float, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseAccumulator> score_matrix =
+                coopmat<float, gl_ScopeSubgroup, 16, 16,
+                        gl_MatrixUseAccumulator>(0.0f);
+            for (uint inner = 0u; inner < dim; inner += 16u) {
+                coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16,
+                        gl_MatrixUseA> query_matrix;
+                coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16,
+                        gl_MatrixUseB> key_matrix;
+                coopMatLoad(query_matrix, cm_query,
+                            query_tile * 16u * 128u + inner, 128u,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(key_matrix, cm_key, inner, 128u,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                score_matrix = coopMatMulAdd(query_matrix, key_matrix,
+                                              score_matrix);
+            }
+            coopMatStore(score_matrix, cm_scores, query_tile * 16u * 16u,
+                         16u, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+
+        if (tid < 64u) {
+            uint valid_keys = min(16u, seq - key_start);
+            float tile_maximum = -3.402823466e+38f;
+            for (uint column = 0u; column < valid_keys; column++) {
+                float score = cm_scores[tid * 16u + column] *
+                              args.data.left_scale;
+                cm_scores[tid * 16u + column] = score;
+                tile_maximum = max(tile_maximum, score);
+            }
+            float old_maximum = cm_row_maximum[tid];
+            float new_maximum = max(old_maximum, tile_maximum);
+            float alpha = cm_row_sum[tid] > 0.0f ?
+                          exp(old_maximum - new_maximum) : 0.0f;
+            float tile_sum = 0.0f;
+            for (uint column = 0u; column < 16u; column++) {
+                float probability = column < valid_keys ?
+                    exp(cm_scores[tid * 16u + column] - new_maximum) : 0.0f;
+                cm_probabilities[tid * 16u + column] = probability;
+                tile_sum += probability;
+            }
+            cm_row_alpha[tid] = alpha;
+            cm_row_sum[tid] = cm_row_sum[tid] * alpha + tile_sum;
+            cm_row_maximum[tid] = new_maximum;
+        }
+        barrier();
+
+        for (uint slot = 0u; slot < 32u; slot++) {
+            uint index = tid + slot * 256u;
+            if (index < query_elements) {
+                uint tile_row = index / dim;
+                uint dimension = index - tile_row * dim;
+                float partial = 0.0f;
+                for (uint column = 0u; column < 16u; column++) {
+                    partial = fma(
+                        cm_probabilities[tile_row * 16u + column],
+                        float(cm_value[column * 128u + dimension]), partial);
+                }
+                output_values[slot] = fma(
+                    output_values[slot], cm_row_alpha[tile_row], partial);
+            }
+        }
+        barrier();
+    }
+
+    for (uint slot = 0u; slot < 32u; slot++) {
+        uint index = tid + slot * 256u;
+        if (index < query_elements) {
+            uint tile_row = index / dim;
+            uint dimension = index - tile_row * dim;
+            uint row = query_start + tile_row;
+            if (row < seq && head < heads) {
+                uint destination = args.data.grouped != 0u ?
+                    (head * seq + row) * dim + dimension :
+                    (row * heads + head) * dim + dimension;
+                fl_out.data[destination] = uint16_t(h3_f32_to_bf16(
+                    output_values[slot] / cm_row_sum[tile_row]));
+            }
+        }
+    }
+}
+#endif
+
+/* Long-sequence SDPA: one 16x16 workgroup owns 16 query rows for one
+ * attention head. Q, K, and V tiles are staged once in shared memory; each
+ * thread computes one score, then cooperatively accumulates eight output
+ * dimensions in F32. This removes the old kernel's reduction barriers for
+ * every individual source row and reuses each K/V tile across 16 queries. */
+shared float sdt_query[16][128];
+/* Dimension-major K avoids 16-way shared-bank conflicts while a subgroup
+ * evaluates two score rows. V stays row-major for contiguous P*V loads. */
+shared float sdt_key[128][16];
+shared float sdt_value[16][128];
+shared float sdt_scores[16][16];
+shared float sdt_probabilities[16][16];
+shared float sdt_row_maximum[16];
+shared float sdt_row_sum[16];
+shared float sdt_row_alpha[16];
+
+void main_sdpa_tiled_bf16() {
+    uint local_query = gl_LocalInvocationID.y;
+    uint local_key = gl_LocalInvocationID.x;
+    uint tid = local_query * 16u + local_key;
+    uint query_start = gl_WorkGroupID.x * 16u;
+    uint head = gl_WorkGroupID.y;
+    uint seq = args.data.rows;
+    uint heads = args.data.width;
+    uint dim = args.data.input_dim;
+    uint tile_elements = 16u * dim;
+    float output_values[8];
+    for (uint slot = 0u; slot < 8u; slot++) output_values[slot] = 0.0f;
+
+    for (uint index = tid; index < tile_elements; index += 256u) {
+        uint tile_row = index / dim;
+        uint dimension = index - tile_row * dim;
+        uint row = query_start + tile_row;
+        sdt_query[tile_row][dimension] =
+            row < seq && head < heads ?
+            H3_BF16_TO_F32(fl_q.data[(row * heads + head) * dim + dimension]) :
+            0.0f;
+    }
+    if (tid < 16u) {
+        sdt_row_maximum[tid] = -3.402823466e+38f;
+        sdt_row_sum[tid] = 0.0f;
+        sdt_row_alpha[tid] = 0.0f;
+    }
+    barrier();
+
+    for (uint key_start = 0u; key_start < seq; key_start += 16u) {
+        for (uint index = tid; index < tile_elements; index += 256u) {
+            uint tile_row = index / dim;
+            uint dimension = index - tile_row * dim;
+            uint row = key_start + tile_row;
+            uint source = (row * heads + head) * dim + dimension;
+            sdt_key[dimension][tile_row] =
+                row < seq && head < heads ?
+                H3_BF16_TO_F32(fl_k.data[source]) : 0.0f;
+            sdt_value[tile_row][dimension] =
+                row < seq && head < heads ?
+                H3_BF16_TO_F32(fl_v.data[source]) : 0.0f;
+        }
+        barrier();
+
+        float score = 0.0f;
+        for (uint dimension = 0u; dimension < dim; dimension++) {
+            score = fma(sdt_query[local_query][dimension],
+                        sdt_key[dimension][local_key], score);
+        }
+        sdt_scores[local_query][local_key] = score * args.data.left_scale;
+        barrier();
+
+        if (tid < 16u) {
+            uint valid_keys = min(16u, seq - key_start);
+            float tile_maximum = -3.402823466e+38f;
+            for (uint column = 0u; column < valid_keys; column++) {
+                tile_maximum = max(tile_maximum, sdt_scores[tid][column]);
+            }
+            float old_maximum = sdt_row_maximum[tid];
+            float new_maximum = max(old_maximum, tile_maximum);
+            float alpha = sdt_row_sum[tid] > 0.0f ?
+                          exp(old_maximum - new_maximum) : 0.0f;
+            float tile_sum = 0.0f;
+            for (uint column = 0u; column < 16u; column++) {
+                float probability = column < valid_keys ?
+                    exp(sdt_scores[tid][column] - new_maximum) : 0.0f;
+                sdt_probabilities[tid][column] = probability;
+                tile_sum += probability;
+            }
+            sdt_row_alpha[tid] = alpha;
+            sdt_row_sum[tid] = sdt_row_sum[tid] * alpha + tile_sum;
+            sdt_row_maximum[tid] = new_maximum;
+        }
+        barrier();
+
+        for (uint slot = 0u; slot < 8u; slot++) {
+            uint index = tid + slot * 256u;
+            if (index < tile_elements) {
+                uint tile_row = index / dim;
+                uint dimension = index - tile_row * dim;
+                float partial = 0.0f;
+                for (uint column = 0u; column < 16u; column++) {
+                    partial = fma(sdt_probabilities[tile_row][column],
+                                  sdt_value[column][dimension], partial);
+                }
+                output_values[slot] =
+                    fma(output_values[slot], sdt_row_alpha[tile_row], partial);
+            }
+        }
+        barrier();
+    }
+
+    for (uint slot = 0u; slot < 8u; slot++) {
+        uint index = tid + slot * 256u;
+        if (index < tile_elements) {
+            uint tile_row = index / dim;
+            uint dimension = index - tile_row * dim;
+            uint row = query_start + tile_row;
+            if (row < seq && head < heads) {
+                uint destination = args.data.grouped != 0u ?
+                    (head * seq + row) * dim + dimension :
+                    (row * heads + head) * dim + dimension;
+                fl_out.data[destination] = uint16_t(h3_f32_to_bf16(
+                    output_values[slot] / sdt_row_sum[tile_row]));
+            }
+        }
+    }
+}
+
+/* 32-row x 8-column int8 tiles reuse each weight across twice as many rows.
+ * Integer accumulation is exact and order independent. */
+shared int8_t lin8_in_tile[32][32];
+shared int8_t lin8_w_tile[32][8];
 layout(set = 0, binding = 0) readonly buffer L8In { int8_t data[]; } l8_in;
 layout(set = 0, binding = 1) readonly buffer L8W { int8_t data[]; } l8_w;
 layout(set = 0, binding = 2) readonly buffer L8IS { float data[]; } l8_is;
@@ -950,39 +1235,41 @@ layout(set = 0, binding = 4) writeonly buffer L8Out { uint16_t data[]; } l8_out;
  * in f32 with a single BF16 rounding, matching the reference order
  * (acc * input_scale) * weight_scale. */
 void main_linear_int8_grouped_bf16() {
-    uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
-    uint row = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
-    /* args: rows/input_dim/output_dim as usual; width = group size,
-     * elements = number of groups. */
+    uint local_column = gl_LocalInvocationID.x;
+    uint local_row = gl_LocalInvocationID.y;
+    uint column = gl_WorkGroupID.x * 8u + local_column;
+    uint row = gl_WorkGroupID.y * 32u + local_row;
     uint groups = args.data.elements;
     uint group_size = args.data.width;
     if (groups > 16u) return;
     int acc[16];
-    for (uint g = 0u; g < groups; g++) acc[g] = 0;
-    uint tile_count = (args.data.input_dim + 15u) / 16u;
+    for (uint group = 0u; group < groups; group++) acc[group] = 0;
+    uint tile_count = (args.data.input_dim + 31u) / 32u;
     for (uint tile = 0u; tile < tile_count; tile++) {
-        uint input_k = tile * 16u + gl_LocalInvocationID.x;
-        lin8_in_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
-            (row < args.data.rows && input_k < args.data.input_dim) ?
-            int(l8_in.data[row * args.data.input_dim + input_k]) : 0;
-        uint weight_k = tile * 16u + gl_LocalInvocationID.y;
-        lin8_w_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
-            (column < args.data.output_dim && weight_k < args.data.input_dim) ?
-            int(l8_w.data[column * args.data.input_dim + weight_k]) : 0;
-        barrier();
-        uint group = (tile * 16u) / group_size;
-        for (uint k = 0u; k < 16u; k++) {
-            acc[group] += lin8_in_tile[gl_LocalInvocationID.y][k] *
-                          lin8_w_tile[k][gl_LocalInvocationID.x];
+        for (uint part = 0u; part < 4u; part++) {
+            uint tile_k = local_column + part * 8u;
+            uint input_k = tile * 32u + tile_k;
+            lin8_in_tile[local_row][tile_k] =
+                row < args.data.rows && input_k < args.data.input_dim ?
+                l8_in.data[row * args.data.input_dim + input_k] : int8_t(0);
         }
+        uint weight_k = tile * 32u + local_row;
+        lin8_w_tile[local_row][local_column] =
+            column < args.data.output_dim &&
+            weight_k < args.data.input_dim ?
+            l8_w.data[column * args.data.input_dim + weight_k] : int8_t(0);
+        barrier();
+        uint group = (tile * 32u) / group_size;
+        for (uint k = 0u; k < 32u; k++)
+            acc[group] += int(lin8_in_tile[local_row][k]) *
+                          int(lin8_w_tile[k][local_column]);
         barrier();
     }
     if (row < args.data.rows && column < args.data.output_dim) {
         float total = 0.0f;
-        for (uint g = 0u; g < groups; g++) {
-            total += float(acc[g]) * l8_is.data[row * groups + g] *
-                     l8_ws.data[column];
-        }
+        for (uint group = 0u; group < groups; group++)
+            total += float(acc[group]) *
+                     l8_is.data[row * groups + group] * l8_ws.data[column];
         l8_out.data[row * args.data.output_dim + column] =
             uint16_t(h3_f32_to_bf16(total));
     }
@@ -1003,10 +1290,10 @@ void main_sdpa_flash_f32() {
     uint seq = args.data.rows;
     uint heads = args.data.width;
     uint dim = args.data.input_dim;
-    if (row >= seq || head >= heads || d >= dim) return;
+    if (row >= seq || head >= heads) return;
     float scale = args.data.left_scale;
     uint qbase = (row * heads + head) * dim;
-    fl_q_shared[d] = flf_q.data[qbase + d];
+    fl_q_shared[d] = d < dim ? flf_q.data[qbase + d] : 0.0f;
     fl_acc[d] = 0.0f;
     if (d == 0u) {
         fl_max = -3.402823466e+38f;
@@ -1015,7 +1302,8 @@ void main_sdpa_flash_f32() {
     barrier();
     for (uint s = 0u; s < seq; s++) {
         uint kbase = (s * heads + head) * dim;
-        fl_dots[d] = fma(fl_q_shared[d], flf_k.data[kbase + d], 0.0f);
+        fl_dots[d] = d < dim ?
+            fma(fl_q_shared[d], flf_k.data[kbase + d], 0.0f) : 0.0f;
         barrier();
         for (uint stride = 64u; stride > 0u; stride >>= 1) {
             if (d < stride) fl_dots[d] += fl_dots[d + stride];
@@ -1032,12 +1320,15 @@ void main_sdpa_flash_f32() {
         barrier();
         float p = exp(fl_old_max - fl_max);
         float w = exp(fl_dots[0] * scale - fl_max);
-        fl_acc[d] = fl_acc[d] * p + w * flf_v.data[kbase + d];
+        float value = d < dim ? flf_v.data[kbase + d] : 0.0f;
+        fl_acc[d] = fl_acc[d] * p + w * value;
         barrier();
     }
-    uint oindex = args.data.grouped != 0u ?
-        (head * seq + row) * dim + d : qbase + d;
-    flf_out.data[oindex] = fl_acc[d] / fl_sum;
+    if (d < dim) {
+        uint oindex = args.data.grouped != 0u ?
+            (head * seq + row) * dim + d : qbase + d;
+        flf_out.data[oindex] = fl_acc[d] / fl_sum;
+    }
 }
 
 
@@ -2208,24 +2499,29 @@ void main_quantize_head_major_rows_bf16_i8() {
 
 
 void main_linear_int8_bf16() {
-    uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
-    uint row = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    uint local_column = gl_LocalInvocationID.x;
+    uint local_row = gl_LocalInvocationID.y;
+    uint column = gl_WorkGroupID.x * 8u + local_column;
+    uint row = gl_WorkGroupID.y * 32u + local_row;
     int acc = 0;
-    uint tile_count = (args.data.input_dim + 15u) / 16u;
+    uint tile_count = (args.data.input_dim + 31u) / 32u;
     for (uint tile = 0u; tile < tile_count; tile++) {
-        uint input_k = tile * 16u + gl_LocalInvocationID.x;
-        lin8_in_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
-            (row < args.data.rows && input_k < args.data.input_dim) ?
-            int(l8_in.data[row * args.data.input_dim + input_k]) : 0;
-        uint weight_k = tile * 16u + gl_LocalInvocationID.y;
-        lin8_w_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
-            (column < args.data.output_dim && weight_k < args.data.input_dim) ?
-            int(l8_w.data[column * args.data.input_dim + weight_k]) : 0;
-        barrier();
-        for (uint k = 0u; k < 16u; k++) {
-            acc += lin8_in_tile[gl_LocalInvocationID.y][k] *
-                   lin8_w_tile[k][gl_LocalInvocationID.x];
+        for (uint part = 0u; part < 4u; part++) {
+            uint tile_k = local_column + part * 8u;
+            uint input_k = tile * 32u + tile_k;
+            lin8_in_tile[local_row][tile_k] =
+                row < args.data.rows && input_k < args.data.input_dim ?
+                l8_in.data[row * args.data.input_dim + input_k] : int8_t(0);
         }
+        uint weight_k = tile * 32u + local_row;
+        lin8_w_tile[local_row][local_column] =
+            column < args.data.output_dim &&
+            weight_k < args.data.input_dim ?
+            l8_w.data[column * args.data.input_dim + weight_k] : int8_t(0);
+        barrier();
+        for (uint k = 0u; k < 32u; k++)
+            acc += int(lin8_in_tile[local_row][k]) *
+                   int(lin8_w_tile[k][local_column]);
         barrier();
     }
     if (row < args.data.rows && column < args.data.output_dim) {
@@ -2283,42 +2579,47 @@ void main_quantize_rows_groups_bf16_i8() {
 /* Fused fc1 (gate|up halves) -> SwiGLU in int8 with per-column weight
  * scales; one BF16 rounding after the dequantized product.  Tiled like the
  * linear kernel; the exact integer sums keep the bit-exact semantics. */
-shared int fc1_in_tile[16][16];
-shared int fc1_g_tile[16][16];
-shared int fc1_u_tile[16][16];
+shared int8_t fc1_in_tile[32][32];
+shared int8_t fc1_g_tile[32][8];
+shared int8_t fc1_u_tile[32][8];
 
 void main_fc1_swiglu_int8_bf16() {
-    uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
-    uint row = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    uint local_column = gl_LocalInvocationID.x;
+    uint local_row = gl_LocalInvocationID.y;
+    uint column = gl_WorkGroupID.x * 8u + local_column;
+    uint row = gl_WorkGroupID.y * 32u + local_row;
     uint hidden = args.data.output_dim;
     int acc_gate = 0;
     int acc_up = 0;
-    uint tile_count = (args.data.input_dim + 15u) / 16u;
+    uint tile_count = (args.data.input_dim + 31u) / 32u;
     for (uint tile = 0u; tile < tile_count; tile++) {
-        uint input_k = tile * 16u + gl_LocalInvocationID.x;
-        fc1_in_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
-            (row < args.data.rows && input_k < args.data.input_dim) ?
-            int(l8_in.data[row * args.data.input_dim + input_k]) : 0;
-        uint weight_k = tile * 16u + gl_LocalInvocationID.y;
-        int gate_w = (column < hidden && weight_k < args.data.input_dim) ?
-            int(l8_w.data[column * args.data.input_dim + weight_k]) : 0;
-        int up_w = (column < hidden && weight_k < args.data.input_dim) ?
-            int(l8_w.data[(hidden + column) * args.data.input_dim +
-                          weight_k]) : 0;
-        fc1_g_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = gate_w;
-        fc1_u_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = up_w;
+        for (uint part = 0u; part < 4u; part++) {
+            uint tile_k = local_column + part * 8u;
+            uint input_k = tile * 32u + tile_k;
+            fc1_in_tile[local_row][tile_k] =
+                row < args.data.rows && input_k < args.data.input_dim ?
+                l8_in.data[row * args.data.input_dim + input_k] : int8_t(0);
+        }
+        uint weight_k = tile * 32u + local_row;
+        fc1_g_tile[local_row][local_column] =
+            column < hidden && weight_k < args.data.input_dim ?
+            l8_w.data[column * args.data.input_dim + weight_k] : int8_t(0);
+        fc1_u_tile[local_row][local_column] =
+            column < hidden && weight_k < args.data.input_dim ?
+            l8_w.data[(hidden + column) * args.data.input_dim + weight_k] :
+            int8_t(0);
         barrier();
-        for (uint k = 0u; k < 16u; k++) {
-            int value = fc1_in_tile[gl_LocalInvocationID.y][k];
-            acc_gate += value * fc1_g_tile[k][gl_LocalInvocationID.x];
-            acc_up += value * fc1_u_tile[k][gl_LocalInvocationID.x];
+        for (uint k = 0u; k < 32u; k++) {
+            int value = int(fc1_in_tile[local_row][k]);
+            acc_gate += value * int(fc1_g_tile[k][local_column]);
+            acc_up += value * int(fc1_u_tile[k][local_column]);
         }
         barrier();
     }
     if (row < args.data.rows && column < hidden) {
         float input_scale = l8_is.data[row];
-        /* Metal materializes the gate cooperative fragment in BF16 before
-         * applying SiLU; the up fragment remains F32 until the final product. */
+        /* Match Metal: materialize the gate fragment in BF16 before SiLU;
+         * keep the up fragment in F32 until the final product. */
         float gate = H3_BF16_TO_F32(h3_f32_to_bf16(
             float(acc_gate) * input_scale * l8_ws.data[column]));
         float up = float(acc_up) * input_scale * l8_ws.data[hidden + column];

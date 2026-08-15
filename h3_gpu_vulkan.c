@@ -109,6 +109,8 @@ typedef enum {
     H3_VK_KERNEL_GROUPED_QKV_ROPE_BF16,
     H3_VK_KERNEL_SDPA_BF16,
     H3_VK_KERNEL_SDPA_FLASH_BF16,
+    H3_VK_KERNEL_SDPA_TILED_BF16,
+    H3_VK_KERNEL_SDPA_COOPMAT_BF16,
     H3_VK_KERNEL_PATCH_LINEAR_BF16,
     H3_VK_KERNEL_PATCH_LINEAR_BF16_MAP,
     H3_VK_KERNEL_TOKEN_POOL_BF16,
@@ -175,6 +177,8 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_grouped_qkv_rope_bf16",
     "main_sdpa_bf16",
     "main_sdpa_flash_bf16",
+    "main_sdpa_tiled_bf16",
+    "main_sdpa_coopmat_bf16",
     "main_patch_linear_bf16",
     "main_patch_linear_bf16_map",
     "main_token_pool_bf16",
@@ -216,13 +220,13 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
 /* Highest storage-buffer binding used by each kernel plus one (bindings
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
-    2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2, 5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2, 6, 2, 4, 4, 4, 4, 3, 3, 6, 7, 2, 4, 4, 4, 6, 3, 5, 5, 9, 3, 5, 3
+    2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2, 5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2, 6, 2, 4, 4, 4, 4, 3, 3, 6, 7, 2, 4, 4, 4, 6, 3, 5, 5, 9, 3, 5, 3
 };
 
 /* Workgroup layout per kernel: 0 = 256 threads, 1 = 16x16 tiles,
- * 2 = 128 threads (SDPA flash). */
+ * 2 = 128 threads (SDPA flash), 3 = 8x32 tiles. */
 static const int h3_vk_kernel_layout[H3_VK_KERNEL_COUNT] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1, 1, 1, 0, 0, 2, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1, 1, 1, 0, 0, 2, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 3, 3, 0, 0, 3, 0
 };
 
 struct h3_gpu {
@@ -238,6 +242,7 @@ struct h3_gpu {
     VkDescriptorSetLayout set_layout;
     VkPipelineLayout pipeline_layout;
     VkPipeline pipelines[H3_VK_KERNEL_COUNT];
+    int has_cooperative_bf16;
     VkDescriptorPool desc_pool;
     VkDescriptorPool desc_pools[32];
     uint32_t desc_pool_count;
@@ -420,6 +425,124 @@ static int h3_vk_pick_device(h3_gpu *gpu, char *error, size_t error_size) {
     return 1;
 }
 
+static int h3_vk_device_has_extension(VkPhysicalDevice physical,
+                                      const char *name) {
+    uint32_t count = 0;
+    if (vkEnumerateDeviceExtensionProperties(physical, NULL, &count, NULL) !=
+            VK_SUCCESS || count == 0)
+        return 0;
+    VkExtensionProperties *properties = calloc(count, sizeof(*properties));
+    if (!properties) return 0;
+    if (vkEnumerateDeviceExtensionProperties(physical, NULL, &count,
+                                              properties) != VK_SUCCESS) {
+        free(properties);
+        return 0;
+    }
+    int found = 0;
+    for (uint32_t index = 0; index < count; index++) {
+        if (strcmp(properties[index].extensionName, name) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    free(properties);
+    return found;
+}
+
+static int h3_vk_supports_cooperative_bf16(h3_gpu *gpu) {
+#if defined(VK_KHR_shader_bfloat16) && defined(VK_KHR_cooperative_matrix)
+    if (!h3_vk_device_has_extension(
+            gpu->physical, VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME) ||
+        !h3_vk_device_has_extension(
+            gpu->physical, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME))
+        return 0;
+    VkPhysicalDevice16BitStorageFeatures storage = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES
+    };
+    VkPhysicalDeviceShaderFloat16Int8Features arithmetic = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+        .pNext = &storage
+    };
+    VkPhysicalDeviceVulkanMemoryModelFeatures memory_model = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES,
+        .pNext = &arithmetic
+    };
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+        .pNext = &memory_model
+    };
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR,
+        .pNext = &cooperative
+    };
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &bfloat
+    };
+    vkGetPhysicalDeviceFeatures2(gpu->physical, &features);
+    if (!bfloat.shaderBFloat16Type ||
+        !bfloat.shaderBFloat16CooperativeMatrix ||
+        !cooperative.cooperativeMatrix || !memory_model.vulkanMemoryModel ||
+        !arithmetic.shaderFloat16 || !storage.storageBuffer16BitAccess)
+        return 0;
+
+    VkPhysicalDeviceSubgroupProperties subgroup = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES
+    };
+    VkPhysicalDeviceProperties2 properties = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &subgroup
+    };
+    vkGetPhysicalDeviceProperties2(gpu->physical, &properties);
+    if (subgroup.subgroupSize != 32u ||
+        !(subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
+        properties.properties.limits.maxComputeWorkGroupInvocations < 256u)
+        return 0;
+
+    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get_properties =
+        (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+            vkGetInstanceProcAddr(
+                gpu->instance,
+                "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+    if (!get_properties) return 0;
+    uint32_t count = 0;
+    if (get_properties(gpu->physical, &count, NULL) != VK_SUCCESS ||
+        count == 0)
+        return 0;
+    VkCooperativeMatrixPropertiesKHR *matrix =
+        calloc(count, sizeof(*matrix));
+    if (!matrix) return 0;
+    for (uint32_t index = 0; index < count; index++) {
+        matrix[index].sType =
+            VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    }
+    int supported = 0;
+    if (get_properties(gpu->physical, &count, matrix) == VK_SUCCESS) {
+        for (uint32_t index = 0; index < count; index++) {
+            if (matrix[index].MSize == 16u && matrix[index].NSize == 16u &&
+                matrix[index].KSize == 16u &&
+                matrix[index].AType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
+                matrix[index].BType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
+                matrix[index].CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                matrix[index].ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                matrix[index].scope == VK_SCOPE_SUBGROUP_KHR) {
+                supported = 1;
+                break;
+            }
+        }
+    }
+    free(matrix);
+    return supported;
+#else
+    (void)gpu;
+    return 0;
+#endif
+}
+
 static int h3_vk_create_device(h3_gpu *gpu, char *error, size_t error_size) {
     uint32_t family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(gpu->physical, &family_count,
@@ -448,13 +571,59 @@ static int h3_vk_create_device(h3_gpu *gpu, char *error, size_t error_size) {
         .queueCount = 1,
         .pQueuePriorities = &priority
     };
-    VkPhysicalDeviceFeatures features = {0};
-    features.shaderInt16 = VK_TRUE;
+    gpu->has_cooperative_bf16 = h3_vk_supports_cooperative_bf16(gpu);
+    const char *extensions[2] = { NULL, NULL };
+    uint32_t extension_count = 0;
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .features = { .shaderInt16 = VK_TRUE }
+    };
+#if defined(VK_KHR_shader_bfloat16) && \
+    defined(VK_KHR_cooperative_matrix)
+    VkPhysicalDevice16BitStorageFeatures storage = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+        .storageBuffer16BitAccess = VK_TRUE
+    };
+    VkPhysicalDeviceShaderFloat16Int8Features arithmetic = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+        .pNext = &storage,
+        .shaderFloat16 = VK_TRUE
+    };
+    VkPhysicalDeviceVulkanMemoryModelFeatures memory_model = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES,
+        .pNext = &arithmetic,
+        .vulkanMemoryModel = VK_TRUE
+    };
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+        .pNext = &memory_model,
+        .cooperativeMatrix = VK_TRUE
+    };
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR,
+        .pNext = &cooperative,
+        .shaderBFloat16Type = VK_TRUE,
+        .shaderBFloat16CooperativeMatrix = VK_TRUE
+    };
+    if (gpu->has_cooperative_bf16) {
+        extensions[extension_count++] =
+            VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME;
+        extensions[extension_count++] =
+            VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+        features.pNext = &bfloat;
+    }
+#endif
     VkDeviceCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = &features,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queue_info,
-        .pEnabledFeatures = &features
+        .enabledExtensionCount = extension_count,
+        .ppEnabledExtensionNames = extensions
     };
     VkResult result = vkCreateDevice(gpu->physical, &info, NULL,
                                      &gpu->device);
@@ -480,8 +649,13 @@ static VkShaderModule h3_vk_compile(h3_gpu *gpu, const char *source,
         shaderc_compile_options_set_target_env(
             options, shaderc_target_env_vulkan,
             shaderc_env_version_vulkan_1_3);
+        int cooperative_bf16_shader =
+            strcmp(entry_point, "main_sdpa_coopmat_bf16") == 0;
+        int optimized_shader = cooperative_bf16_shader ||
+            strcmp(entry_point, "main_sdpa_tiled_bf16") == 0;
         shaderc_compile_options_set_optimization_level(
-            options, shaderc_optimization_level_zero);
+            options, optimized_shader ? shaderc_optimization_level_performance
+                                      : shaderc_optimization_level_zero);
         shaderc_compile_options_add_macro_definition(
             options, "H3_ENTRY", strlen("H3_ENTRY"), entry_point,
             strlen(entry_point));
@@ -491,6 +665,13 @@ static VkShaderModule h3_vk_compile(h3_gpu *gpu, const char *source,
         else if (layout == 2)
             shaderc_compile_options_add_macro_definition(
                 options, "H3_LS128", strlen("H3_LS128"), "1", 1);
+        else if (layout == 3)
+            shaderc_compile_options_add_macro_definition(
+                options, "H3_LS8X32", strlen("H3_LS8X32"), "1", 1);
+        if (cooperative_bf16_shader)
+            shaderc_compile_options_add_macro_definition(
+                options, "H3_COOPMAT_BF16", strlen("H3_COOPMAT_BF16"),
+                "1", 1);
         result = shaderc_compile_into_spv(
             gpu->shaderc, source, source_size,
             shaderc_compute_shader, "h3_vulkan_shaders.comp",
@@ -552,10 +733,19 @@ static int h3_vk_create_pipelines(h3_gpu *gpu, const char *source,
         return 0;
     }
     for (int kernel = 0; kernel < H3_VK_KERNEL_COUNT; kernel++) {
+        int cooperative_bf16 =
+            kernel == H3_VK_KERNEL_SDPA_COOPMAT_BF16;
+        if (cooperative_bf16 && !gpu->has_cooperative_bf16)
+            continue;
         VkShaderModule module = h3_vk_compile(gpu, source, source_size,
                                               h3_vk_kernel_names[kernel],
                                               h3_vk_kernel_layout[kernel]);
         if (module == VK_NULL_HANDLE) {
+            if (cooperative_bf16) {
+                gpu->has_cooperative_bf16 = 0;
+                gpu->error[0] = '\0';
+                continue;
+            }
             if (error && error_size)
                 snprintf(error, error_size, "%s", gpu->error);
             return 0;
@@ -576,6 +766,10 @@ static int h3_vk_create_pipelines(h3_gpu *gpu, const char *source,
             &gpu->pipelines[kernel]);
         vkDestroyShaderModule(gpu->device, module, NULL);
         if (result != VK_SUCCESS) {
+            if (cooperative_bf16) {
+                gpu->has_cooperative_bf16 = 0;
+                continue;
+            }
             if (error && error_size)
                 snprintf(error, error_size,
                          "vkCreateComputePipelines(%s) failed: %d",
@@ -2062,16 +2256,32 @@ static int h3_vk_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
     gpu->args->input_dim = head_dim;
     gpu->args->left_scale = scale;
     gpu->args->grouped = head_major_output ? 1u : 0u;
-    /* Long sequences use the 128-thread flash kernel; short ones keep the
-     * one-thread-per-output naive kernel, whose bit-exact reference order
-     * is what the parity tests compare against. */
+    /* Long sequences prefer a 64-query cooperative-QK kernel, with a
+     * portable 16-query tiled fallback. The original one-row implementation
+     * remains available for A/B diagnosis. */
     int flash = sequence >= 128 && head_dim <= 128;
-    h3_vk_kernel kernel = flash ? H3_VK_KERNEL_SDPA_FLASH_BF16
-                                : H3_VK_KERNEL_SDPA_BF16;
+    const char *disable_tiled = getenv("H3_DISABLE_VK_TILED_SDPA");
+    int tiled_family = flash && !(disable_tiled && *disable_tiled &&
+                                  strcmp(disable_tiled, "0") != 0);
+    const char *disable_cooperative = getenv("H3_DISABLE_VK_COOPMAT");
+    int cooperative_disabled =
+        disable_cooperative && *disable_cooperative &&
+        strcmp(disable_cooperative, "0") != 0;
+    int cooperative = tiled_family && gpu->has_cooperative_bf16 &&
+                      (head_dim == 64 || head_dim == 128) &&
+                      !cooperative_disabled;
+    h3_vk_kernel kernel = cooperative ? H3_VK_KERNEL_SDPA_COOPMAT_BF16 :
+                          tiled_family ? H3_VK_KERNEL_SDPA_TILED_BF16 :
+                          flash ? H3_VK_KERNEL_SDPA_FLASH_BF16 :
+                                  H3_VK_KERNEL_SDPA_BF16;
     const h3_gpu_tensor *tensors[4] = { query, key, value, output };
     VkDescriptorSet set = h3_vk_prepare(gpu, kernel, tensors, 4);
     if (set == VK_NULL_HANDLE) return 0;
-    return h3_vk_dispatch(gpu, kernel, set, heads, sequence, 1);
+    uint32_t query_groups = cooperative ?
+                            (sequence + 63) / 64 : (sequence + 15) / 16;
+    return tiled_family ?
+        h3_vk_dispatch(gpu, kernel, set, query_groups, heads, 1) :
+        h3_vk_dispatch(gpu, kernel, set, heads, sequence, 1);
 }
 
 int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
@@ -3164,11 +3374,12 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     {
         const h3_gpu_tensor *l[5] = { quantized_input, weight, input_scales,
                                       weight_scales, output };
-        VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16,
-                                            l, 5);
+        VkDescriptorSet set = h3_vk_prepare(
+            gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, l, 5);
         if (set == VK_NULL_HANDLE) return 0;
         return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
-                              (output_dim + 15) / 16, (rows + 15) / 16, 1);
+                              (output_dim + 7) / 8,
+                              (rows + 31) / 32, 1);
     }
 }
 int h3_gpu_linear_int8_head_major_bf16(
@@ -3221,11 +3432,12 @@ int h3_gpu_linear_int8_head_major_bf16(
     {
         const h3_gpu_tensor *l[5] = { quantized_input, weight, input_scales,
                                       weight_scales, output };
-        VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16,
-                                            l, 5);
+        VkDescriptorSet set = h3_vk_prepare(
+            gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, l, 5);
         if (set == VK_NULL_HANDLE) return 0;
         return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
-                              (output_dim + 15) / 16, (rows + 15) / 16, 1);
+                              (output_dim + 7) / 8,
+                              (rows + 31) / 32, 1);
     }
 }
 
@@ -3306,7 +3518,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
             gpu, H3_VK_KERNEL_FC1_SWIGLU_INT8_BF16, f, 5);
         if (set == VK_NULL_HANDLE) return 0;
         if (h3_vk_dispatch(gpu, H3_VK_KERNEL_FC1_SWIGLU_INT8_BF16, set,
-                           (hidden_dim + 15) / 16, (rows + 15) / 16, 1) == 0)
+                           (hidden_dim + 7) / 8,
+                           (rows + 31) / 32, 1) == 0)
             return 0;
     }
     if (use_int8_row_fc2) {
@@ -3335,8 +3548,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                 gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, l, 5);
             if (set == VK_NULL_HANDLE) return 0;
             return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
-                                  (output_dim + 15) / 16,
-                                  (rows + 15) / 16, 1);
+                                  (output_dim + 7) / 8,
+                                  (rows + 31) / 32, 1);
         }
     }
     /* Default grouped FC2 (Metal grouped_nax path): one max-abs scale per
@@ -3367,8 +3580,9 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         VkDescriptorSet set = h3_vk_prepare(
             gpu, H3_VK_KERNEL_LINEAR_INT8_GROUPED_BF16, l, 5);
         if (set == VK_NULL_HANDLE) return 0;
-        return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_GROUPED_BF16, set,
-                              (output_dim + 15) / 16, (rows + 15) / 16, 1);
+        return h3_vk_dispatch(
+            gpu, H3_VK_KERNEL_LINEAR_INT8_GROUPED_BF16, set,
+            (output_dim + 7) / 8, (rows + 31) / 32, 1);
     }
 }
 
@@ -3557,7 +3771,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                             l, 5);
         if (set == VK_NULL_HANDLE) return 0;
         if (h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
-                           (inner * 3 + 15) / 16, (rows + 15) / 16, 1) == 0)
+                           (inner * 3 + 7) / 8, (rows + 31) / 32, 1) == 0)
             return 0;
     }
     return h3_gpu_grouped_qkv_rope_bf16(

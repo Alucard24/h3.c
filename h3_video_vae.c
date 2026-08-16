@@ -119,6 +119,16 @@ static void free_tensor(h3_gpu_tensor **tensor) {
     *tensor = NULL;
 }
 
+static h3_gpu_tensor *device_f32_from(h3_gpu *gpu, const float *values,
+                                      size_t elements) {
+    h3_gpu_tensor *tensor = h3_gpu_tensor_new_stream_f32(gpu, elements);
+    if (tensor && !h3_gpu_tensor_write_f32(tensor, values, elements)) {
+        h3_gpu_tensor_free(tensor);
+        tensor = NULL;
+    }
+    return tensor;
+}
+
 static h3_gpu_tensor *load_f32(vae_context *vae, const char *name, int ndim,
                                const uint64_t *shape, char *error,
                                size_t error_size) {
@@ -340,7 +350,7 @@ static int prepare_input(vae_context *vae, const float *input,
                                   mean[channel];
                 }
     }
-    vae->latent = h3_gpu_tensor_from_f32(vae->gpu, rows, patch_elements);
+    vae->latent = device_f32_from(vae->gpu, rows, patch_elements);
     free(rows);
     return vae->latent != NULL;
 }
@@ -383,8 +393,8 @@ static int prepare_rope(vae_context *vae, char *error, size_t error_size) {
         }
         row++;
     }
-    vae->rope_cos = h3_gpu_tensor_from_f32(vae->gpu, cosines, count);
-    vae->rope_sin = h3_gpu_tensor_from_f32(vae->gpu, sines, count);
+    vae->rope_cos = device_f32_from(vae->gpu, cosines, count);
+    vae->rope_sin = device_f32_from(vae->gpu, sines, count);
     free(cosines); free(sines);
     if (!vae->rope_cos || !vae->rope_sin) {
         fail(error, error_size, "cannot allocate video VAE RoPE: %s",
@@ -397,7 +407,8 @@ static int prepare_rope(vae_context *vae, char *error, size_t error_size) {
 static int allocate_activations(vae_context *vae, char *error,
                                 size_t error_size) {
     size_t patches = vae->patches, sequence = vae->sequence;
-#define F32(field, elements) (vae->field = h3_gpu_tensor_new_f32(vae->gpu, (elements)))
+#define F32(field, elements) \
+    (vae->field = h3_gpu_tensor_new_stream_f32(vae->gpu, (elements)))
     h3_gpu_tensor *all[] = {
         F32(post, patches * LATENT_CHANNELS),
         F32(patch_hidden, patches * HIDDEN),
@@ -460,7 +471,7 @@ static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
                        size_t error_size) {
     float zeros[HIDDEN];
     memset(zeros, 0, sizeof(zeros));
-    h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
+    h3_gpu_tensor *zero = device_f32_from(vae->gpu, zeros, HIDDEN);
     if (!zero) {
         fail(error, error_size, "cannot allocate video VAE suffix token");
         return 0;
@@ -534,7 +545,7 @@ static int run_resident_tile(vae_context *vae, char *error,
                              size_t error_size) {
     float zeros[HIDDEN];
     memset(zeros, 0, sizeof(zeros));
-    h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
+    h3_gpu_tensor *zero = device_f32_from(vae->gpu, zeros, HIDDEN);
     if (!zero) {
         fail(error, error_size, "cannot allocate video VAE suffix token");
         return 0;

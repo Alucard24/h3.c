@@ -121,9 +121,10 @@ static h3_gpu_tensor *load_2d(load_context *load, const char *name,
                                             load->error_size));
 }
 
-static int text_prefetch_threads(void) {
+static int text_prefetch_threads(const h3_gpu *gpu) {
     const char *value = getenv("H3_QWEN_PREFETCH");
-    if (!value || !*value) return 8;
+    if (!value || !*value)
+        return h3_gpu_supports_host_weight_prefetch(gpu) ? 8 : 0;
     if (!strcmp(value, "0")) return 0;
     char *tail = NULL;
     long threads = strtol(value, &tail, 10);
@@ -576,16 +577,22 @@ static int text_encode_bf16_impl(
         gpu, sines, token_count * TEXT_ROPE_HALF);
     free(cosines);
     free(sines);
-    h3_gpu_tensor *hidden = h3_gpu_tensor_new_bf16(gpu, hidden_count);
-    h3_gpu_tensor *norm = h3_gpu_tensor_new_bf16(gpu, hidden_count);
-    h3_gpu_tensor *query = h3_gpu_tensor_new_bf16(gpu, query_count);
-    h3_gpu_tensor *key = h3_gpu_tensor_new_bf16(gpu, kv_count);
-    h3_gpu_tensor *value = h3_gpu_tensor_new_bf16(gpu, kv_count);
-    h3_gpu_tensor *attention_heads = h3_gpu_tensor_new_bf16(gpu, query_count);
-    h3_gpu_tensor *attention_output = h3_gpu_tensor_new_bf16(gpu, hidden_count);
-    h3_gpu_tensor *gate = h3_gpu_tensor_new_bf16(gpu, intermediate_count);
-    h3_gpu_tensor *up = h3_gpu_tensor_new_bf16(gpu, intermediate_count);
-    h3_gpu_tensor *mlp_output = h3_gpu_tensor_new_bf16(gpu, hidden_count);
+    h3_gpu_tensor *hidden =
+        h3_gpu_tensor_new_stream_bf16(gpu, hidden_count);
+    h3_gpu_tensor *norm = h3_gpu_tensor_new_stream_bf16(gpu, hidden_count);
+    h3_gpu_tensor *query = h3_gpu_tensor_new_stream_bf16(gpu, query_count);
+    h3_gpu_tensor *key = h3_gpu_tensor_new_stream_bf16(gpu, kv_count);
+    h3_gpu_tensor *value = h3_gpu_tensor_new_stream_bf16(gpu, kv_count);
+    h3_gpu_tensor *attention_heads =
+        h3_gpu_tensor_new_stream_bf16(gpu, query_count);
+    h3_gpu_tensor *attention_output =
+        h3_gpu_tensor_new_stream_bf16(gpu, hidden_count);
+    h3_gpu_tensor *gate = h3_gpu_tensor_new_stream_bf16(
+        gpu, intermediate_count);
+    h3_gpu_tensor *up = h3_gpu_tensor_new_stream_bf16(
+        gpu, intermediate_count);
+    h3_gpu_tensor *mlp_output =
+        h3_gpu_tensor_new_stream_bf16(gpu, hidden_count);
     h3_gpu_tensor *deepstack[3] = {NULL, NULL, NULL};
     if (span_count) {
         uint16_t *values = calloc(hidden_count, sizeof(*values));
@@ -647,7 +654,7 @@ static int text_encode_bf16_impl(
         }
     }
 
-    int prefetch_threads = text_prefetch_threads();
+    int prefetch_threads = text_prefetch_threads(gpu);
     int prefetch_layers = prefetch_threads > 0 && layer_count > 1;
     int prefetch_depth = prefetch_layers ? text_prefetch_depth(gpu) : 0;
     text_prefetch_slot slots[6];

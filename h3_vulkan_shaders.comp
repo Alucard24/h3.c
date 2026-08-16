@@ -382,36 +382,67 @@ layout(set = 0, binding = 1) readonly buffer LinW { uint16_t data[]; } lin_w;
 layout(set = 0, binding = 2) readonly buffer LinB { uint16_t data[]; } lin_b;
 layout(set = 0, binding = 3) writeonly buffer LinOut { uint16_t data[]; } lin_out;
 
-shared float lin_input_tile[16][16];
-shared float lin_weight_tile[16][16];
+shared float lin_input_tile[64][17];
+shared float lin_weight_tile[64][17];
 
 void main_linear_bf16() {
-    uint column = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
-    uint row = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
-    float sum = (args.data.has_bias != 0u && column < args.data.output_dim) ?
-        H3_BF16_TO_F32(lin_b.data[column]) : 0.0f;
-    uint tile_count = (args.data.input_dim + 15u) / 16u;
-    for (uint tile = 0u; tile < tile_count; tile++) {
-        uint input_k = tile * 16u + gl_LocalInvocationID.x;
-        lin_input_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
-            (row < args.data.rows && input_k < args.data.input_dim) ?
-            H3_BF16_TO_F32(lin_in.data[row * args.data.input_dim + input_k]) :
-            0.0f;
-        uint weight_k = tile * 16u + gl_LocalInvocationID.y;
-        lin_weight_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
-            (column < args.data.output_dim && weight_k < args.data.input_dim) ?
-            H3_BF16_TO_F32(lin_w.data[column * args.data.input_dim +
-                                       weight_k]) : 0.0f;
+    uint local_k = gl_LocalInvocationID.x;
+    uint local_index = gl_LocalInvocationID.y;
+    uint row_base = gl_WorkGroupID.y * 64u + local_index;
+    uint column_base = gl_WorkGroupID.x * 64u + local_k;
+    float sums[16];
+    for (uint row_part = 0u; row_part < 4u; row_part++) {
+        for (uint column_part = 0u; column_part < 4u; column_part++) {
+            uint column = column_base + column_part * 16u;
+            sums[row_part * 4u + column_part] =
+                args.data.has_bias != 0u && column < args.data.output_dim ?
+                H3_BF16_TO_F32(lin_b.data[column]) : 0.0f;
+        }
+    }
+    for (uint tile = 0u; tile < args.data.input_dim; tile += 16u) {
+        uint k = tile + local_k;
+        for (uint part = 0u; part < 4u; part++) {
+            uint offset = local_index + part * 16u;
+            uint row = gl_WorkGroupID.y * 64u + offset;
+            uint weight_row = gl_WorkGroupID.x * 64u + offset;
+            lin_input_tile[offset][local_k] =
+                row < args.data.rows && k < args.data.input_dim ?
+                H3_BF16_TO_F32(
+                    lin_in.data[row * args.data.input_dim + k]) : 0.0f;
+            lin_weight_tile[offset][local_k] =
+                weight_row < args.data.output_dim && k < args.data.input_dim ?
+                H3_BF16_TO_F32(
+                    lin_w.data[weight_row * args.data.input_dim + k]) : 0.0f;
+        }
         barrier();
-        for (uint k = 0u; k < 16u; k++) {
-            sum = fma(lin_input_tile[gl_LocalInvocationID.y][k],
-                      lin_weight_tile[k][gl_LocalInvocationID.x], sum);
+        uint count = min(16u, args.data.input_dim - tile);
+        for (uint inner = 0u; inner < count; inner++) {
+            float inputs[4];
+            float weights[4];
+            for (uint part = 0u; part < 4u; part++) {
+                inputs[part] =
+                    lin_input_tile[local_index + part * 16u][inner];
+                weights[part] =
+                    lin_weight_tile[local_k + part * 16u][inner];
+            }
+            for (uint row_part = 0u; row_part < 4u; row_part++)
+                for (uint column_part = 0u; column_part < 4u; column_part++)
+                    sums[row_part * 4u + column_part] =
+                        fma(inputs[row_part], weights[column_part],
+                            sums[row_part * 4u + column_part]);
         }
         barrier();
     }
-    if (row < args.data.rows && column < args.data.output_dim) {
-        lin_out.data[row * args.data.output_dim + column] =
-            uint16_t(h3_f32_to_bf16(sum));
+    for (uint row_part = 0u; row_part < 4u; row_part++) {
+        uint row = row_base + row_part * 16u;
+        if (row >= args.data.rows) continue;
+        for (uint column_part = 0u; column_part < 4u; column_part++) {
+            uint column = column_base + column_part * 16u;
+            if (column < args.data.output_dim)
+                lin_out.data[row * args.data.output_dim + column] =
+                    uint16_t(h3_f32_to_bf16(
+                        sums[row_part * 4u + column_part]));
+        }
     }
 }
 
@@ -1220,15 +1251,373 @@ void main_sdpa_tiled_bf16() {
     }
 }
 
-/* 32-row x 8-column int8 tiles reuse each weight across twice as many rows.
- * Integer accumulation is exact and order independent. */
+/* Register-blocked int8 tiles. Integer accumulation remains exact and
+ * order-independent while each input tile serves multiple output columns. */
 shared int8_t lin8_in_tile[32][32];
-shared int8_t lin8_w_tile[32][8];
+shared int8_t lin8_w_tile[32][32];
 layout(set = 0, binding = 0) readonly buffer L8In { int8_t data[]; } l8_in;
 layout(set = 0, binding = 1) readonly buffer L8W { int8_t data[]; } l8_w;
 layout(set = 0, binding = 2) readonly buffer L8IS { float data[]; } l8_is;
 layout(set = 0, binding = 3) readonly buffer L8WS { float data[]; } l8_ws;
-layout(set = 0, binding = 4) writeonly buffer L8Out { uint16_t data[]; } l8_out;
+layout(set = 0, binding = 4) buffer L8Out { uint16_t data[]; } l8_out;
+
+#if defined(H3_COOPMAT_BF16)
+/* Eight subgroup Tensor-Core tiles produce a 16x128 output slab. Input and
+ * transposed checkpoint-weight tiles are staged with explicit tail padding;
+ * int32 accumulation is mathematically identical to the scalar path. */
+shared int8_t cm8_input[16 * 32];
+shared int8_t cm8_weight[8 * 16 * 32];
+shared int cm8_accumulator[8 * 16 * 16];
+shared int cmfc_accumulator_up[8 * 16 * 16];
+
+void main_linear_int8_coop_bf16() {
+    uint tid = gl_LocalInvocationID.x;
+    uint subgroup = gl_SubgroupID;
+    uint row_start = gl_WorkGroupID.y * 16u;
+    uint column_group = gl_WorkGroupID.x * 128u;
+    coopmat<int, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator> accumulator =
+        coopmat<int, gl_ScopeSubgroup, 16, 16,
+                gl_MatrixUseAccumulator>(0);
+    for (uint tile = 0u; tile < args.data.input_dim; tile += 32u) {
+        for (uint index = tid; index < 16u * 32u; index += 256u) {
+            uint tile_row = index / 32u;
+            uint tile_k = index - tile_row * 32u;
+            uint row = row_start + tile_row;
+            uint k = tile + tile_k;
+            cm8_input[index] = row < args.data.rows &&
+                               k < args.data.input_dim ?
+                l8_in.data[row * args.data.input_dim + k] : int8_t(0);
+        }
+        for (uint index = tid; index < 8u * 16u * 32u; index += 256u) {
+            uint subgroup_tile = index / (16u * 32u);
+            uint within = index - subgroup_tile * 16u * 32u;
+            uint tile_column = within / 32u;
+            uint tile_k = within - tile_column * 32u;
+            uint column = column_group + subgroup_tile * 16u + tile_column;
+            uint k = tile + tile_k;
+            cm8_weight[index] = column < args.data.output_dim &&
+                                k < args.data.input_dim ?
+                l8_w.data[column * args.data.input_dim + k] : int8_t(0);
+        }
+        barrier();
+        coopmat<int8_t, gl_ScopeSubgroup, 16, 32,
+                gl_MatrixUseA> input_matrix;
+        coopmat<int8_t, gl_ScopeSubgroup, 32, 16,
+                gl_MatrixUseB> weight_matrix;
+        coopMatLoad(input_matrix, cm8_input, 0u, 32u,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(weight_matrix, cm8_weight, subgroup * 16u * 32u, 32u,
+                    gl_CooperativeMatrixLayoutColumnMajor);
+        accumulator = coopMatMulAdd(input_matrix, weight_matrix, accumulator);
+        barrier();
+    }
+    coopMatStore(accumulator, cm8_accumulator,
+                 subgroup * 16u * 16u, 16u,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint index = tid; index < 8u * 16u * 16u; index += 256u) {
+        uint subgroup_tile = index / (16u * 16u);
+        uint within = index - subgroup_tile * 16u * 16u;
+        uint tile_row = within / 16u;
+        uint tile_column = within - tile_row * 16u;
+        uint row = row_start + tile_row;
+        uint column = column_group + subgroup_tile * 16u + tile_column;
+        if (row < args.data.rows && column < args.data.output_dim) {
+            float dequant = float(cm8_accumulator[index]) *
+                            l8_is.data[row] * l8_ws.data[column];
+            l8_out.data[row * args.data.output_dim + column] =
+                uint16_t(h3_f32_to_bf16(dequant));
+        }
+    }
+}
+
+/* One FC1 half per dispatch avoids keeping two cooperative accumulators live.
+ * The gate pass materializes BF16; the up pass consumes it and applies SwiGLU
+ * while retaining the up projection in F32. */
+void h3_fc1_half_int8_coop_bf16(bool gate_phase) {
+    uint tid = gl_LocalInvocationID.x;
+    uint subgroup = gl_SubgroupID;
+    uint row_start = gl_WorkGroupID.y * 16u;
+    uint column_group = gl_WorkGroupID.x * 128u;
+    uint hidden = args.data.output_dim;
+    coopmat<int, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator> accumulator =
+        coopmat<int, gl_ScopeSubgroup, 16, 16,
+                gl_MatrixUseAccumulator>(0);
+    for (uint tile = 0u; tile < args.data.input_dim; tile += 32u) {
+        for (uint index = tid; index < 16u * 32u; index += 256u) {
+            uint tile_row = index / 32u;
+            uint tile_k = index - tile_row * 32u;
+            uint row = row_start + tile_row;
+            uint k = tile + tile_k;
+            cm8_input[index] = row < args.data.rows &&
+                               k < args.data.input_dim ?
+                l8_in.data[row * args.data.input_dim + k] : int8_t(0);
+        }
+        for (uint index = tid; index < 8u * 16u * 32u; index += 256u) {
+            uint subgroup_tile = index / (16u * 32u);
+            uint within = index - subgroup_tile * 16u * 32u;
+            uint tile_column = within / 32u;
+            uint tile_k = within - tile_column * 32u;
+            uint column = column_group + subgroup_tile * 16u + tile_column;
+            uint weight_column = gate_phase ? column : hidden + column;
+            uint k = tile + tile_k;
+            cm8_weight[index] = column < hidden &&
+                                k < args.data.input_dim ?
+                l8_w.data[weight_column * args.data.input_dim + k] :
+                int8_t(0);
+        }
+        barrier();
+        coopmat<int8_t, gl_ScopeSubgroup, 16, 32,
+                gl_MatrixUseA> input_matrix;
+        coopmat<int8_t, gl_ScopeSubgroup, 32, 16,
+                gl_MatrixUseB> weight_matrix;
+        coopMatLoad(input_matrix, cm8_input, 0u, 32u,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(weight_matrix, cm8_weight,
+                    subgroup * 16u * 32u, 32u,
+                    gl_CooperativeMatrixLayoutColumnMajor);
+        accumulator = coopMatMulAdd(input_matrix, weight_matrix, accumulator);
+        barrier();
+    }
+    coopMatStore(accumulator, cm8_accumulator,
+                 subgroup * 16u * 16u, 16u,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint index = tid; index < 8u * 16u * 16u; index += 256u) {
+        uint subgroup_tile = index / (16u * 16u);
+        uint within = index - subgroup_tile * 16u * 16u;
+        uint tile_row = within / 16u;
+        uint tile_column = within - tile_row * 16u;
+        uint row = row_start + tile_row;
+        uint column = column_group + subgroup_tile * 16u + tile_column;
+        if (row < args.data.rows && column < hidden) {
+            float projected = float(cm8_accumulator[index]) *
+                              l8_is.data[row] *
+                              l8_ws.data[(gate_phase ? 0u : hidden) + column];
+            uint output_index = row * hidden + column;
+            if (gate_phase) {
+                l8_out.data[output_index] =
+                    uint16_t(h3_f32_to_bf16(projected));
+            } else {
+                float gate = H3_BF16_TO_F32(l8_out.data[output_index]);
+                l8_out.data[output_index] = uint16_t(h3_f32_to_bf16(
+                    gate / (1.0f + exp(-gate)) * projected));
+            }
+        }
+    }
+}
+
+void main_fc1_gate_int8_coop_bf16() {
+    h3_fc1_half_int8_coop_bf16(true);
+}
+
+void main_fc1_up_int8_coop_bf16() {
+    h3_fc1_half_int8_coop_bf16(false);
+}
+
+/* Diagnostic dual-accumulator variant retained for shader-level A/B. */
+void main_fc1_swiglu_int8_coop_bf16() {
+    uint tid = gl_LocalInvocationID.x;
+    uint subgroup = gl_SubgroupID;
+    uint row_start = gl_WorkGroupID.y * 16u;
+    uint column_group = gl_WorkGroupID.x * 128u;
+    uint hidden = args.data.output_dim;
+    coopmat<int, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator> gate_accumulator =
+        coopmat<int, gl_ScopeSubgroup, 16, 16,
+                gl_MatrixUseAccumulator>(0);
+    for (uint tile = 0u; tile < args.data.input_dim; tile += 32u) {
+        for (uint index = tid; index < 16u * 32u; index += 256u) {
+            uint tile_row = index / 32u;
+            uint tile_k = index - tile_row * 32u;
+            uint row = row_start + tile_row;
+            uint k = tile + tile_k;
+            cm8_input[index] = row < args.data.rows &&
+                               k < args.data.input_dim ?
+                l8_in.data[row * args.data.input_dim + k] : int8_t(0);
+        }
+        for (uint index = tid; index < 8u * 16u * 32u; index += 256u) {
+            uint subgroup_tile = index / (16u * 32u);
+            uint within = index - subgroup_tile * 16u * 32u;
+            uint tile_column = within / 32u;
+            uint tile_k = within - tile_column * 32u;
+            uint column = column_group + subgroup_tile * 16u + tile_column;
+            uint k = tile + tile_k;
+            cm8_weight[index] = column < hidden &&
+                                k < args.data.input_dim ?
+                l8_w.data[column * args.data.input_dim + k] : int8_t(0);
+        }
+        barrier();
+        coopmat<int8_t, gl_ScopeSubgroup, 16, 32,
+                gl_MatrixUseA> input_matrix;
+        coopmat<int8_t, gl_ScopeSubgroup, 32, 16,
+                gl_MatrixUseB> gate_matrix;
+        coopMatLoad(input_matrix, cm8_input, 0u, 32u,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(gate_matrix, cm8_weight,
+                    subgroup * 16u * 32u, 32u,
+                    gl_CooperativeMatrixLayoutColumnMajor);
+        gate_accumulator =
+            coopMatMulAdd(input_matrix, gate_matrix, gate_accumulator);
+        barrier();
+    }
+    coopMatStore(gate_accumulator, cm8_accumulator,
+                 subgroup * 16u * 16u, 16u,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    coopmat<int, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator> up_accumulator =
+        coopmat<int, gl_ScopeSubgroup, 16, 16,
+                gl_MatrixUseAccumulator>(0);
+    for (uint tile = 0u; tile < args.data.input_dim; tile += 32u) {
+        for (uint index = tid; index < 16u * 32u; index += 256u) {
+            uint tile_row = index / 32u;
+            uint tile_k = index - tile_row * 32u;
+            uint row = row_start + tile_row;
+            uint k = tile + tile_k;
+            cm8_input[index] = row < args.data.rows &&
+                               k < args.data.input_dim ?
+                l8_in.data[row * args.data.input_dim + k] : int8_t(0);
+        }
+        for (uint index = tid; index < 8u * 16u * 32u; index += 256u) {
+            uint subgroup_tile = index / (16u * 32u);
+            uint within = index - subgroup_tile * 16u * 32u;
+            uint tile_column = within / 32u;
+            uint tile_k = within - tile_column * 32u;
+            uint column = column_group + subgroup_tile * 16u + tile_column;
+            uint k = tile + tile_k;
+            cm8_weight[index] = column < hidden &&
+                                k < args.data.input_dim ?
+                l8_w.data[(hidden + column) * args.data.input_dim + k] :
+                int8_t(0);
+        }
+        barrier();
+        coopmat<int8_t, gl_ScopeSubgroup, 16, 32,
+                gl_MatrixUseA> input_matrix;
+        coopmat<int8_t, gl_ScopeSubgroup, 32, 16,
+                gl_MatrixUseB> up_matrix;
+        coopMatLoad(input_matrix, cm8_input, 0u, 32u,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(up_matrix, cm8_weight,
+                    subgroup * 16u * 32u, 32u,
+                    gl_CooperativeMatrixLayoutColumnMajor);
+        up_accumulator =
+            coopMatMulAdd(input_matrix, up_matrix, up_accumulator);
+        barrier();
+    }
+    coopMatStore(up_accumulator, cmfc_accumulator_up,
+                 subgroup * 16u * 16u, 16u,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint index = tid; index < 8u * 16u * 16u; index += 256u) {
+        uint subgroup_tile = index / (16u * 16u);
+        uint within = index - subgroup_tile * 16u * 16u;
+        uint tile_row = within / 16u;
+        uint tile_column = within - tile_row * 16u;
+        uint row = row_start + tile_row;
+        uint column = column_group + subgroup_tile * 16u + tile_column;
+        if (row < args.data.rows && column < hidden) {
+            float input_scale = l8_is.data[row];
+            float gate = H3_BF16_TO_F32(h3_f32_to_bf16(
+                float(cm8_accumulator[index]) * input_scale *
+                l8_ws.data[column]));
+            float up = float(cmfc_accumulator_up[index]) * input_scale *
+                       l8_ws.data[hidden + column];
+            l8_out.data[row * hidden + column] = uint16_t(h3_f32_to_bf16(
+                gate / (1.0f + exp(-gate)) * up));
+        }
+    }
+}
+
+/* Grouped FC2 Tensor-Core path. Each 1024-wide activation group gets an
+ * independent exact int32 matrix accumulation before reference-order F32
+ * dequantization. */
+void main_linear_int8_grouped_coop_bf16() {
+    uint tid = gl_LocalInvocationID.x;
+    uint subgroup = gl_SubgroupID;
+    uint row_start = gl_WorkGroupID.y * 16u;
+    uint column_group = gl_WorkGroupID.x * 128u;
+    float totals[8];
+    for (uint slot = 0u; slot < 8u; slot++) totals[slot] = 0.0f;
+    uint groups = args.data.elements;
+    uint group_size = args.data.width;
+    for (uint group = 0u; group < groups; group++) {
+        coopmat<int, gl_ScopeSubgroup, 16, 16,
+                gl_MatrixUseAccumulator> accumulator =
+            coopmat<int, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseAccumulator>(0);
+        uint group_begin = group * group_size;
+        uint group_end = min(group_begin + group_size, args.data.input_dim);
+        for (uint tile = group_begin; tile < group_end; tile += 32u) {
+            for (uint index = tid; index < 16u * 32u; index += 256u) {
+                uint tile_row = index / 32u;
+                uint tile_k = index - tile_row * 32u;
+                uint row = row_start + tile_row;
+                uint k = tile + tile_k;
+                cm8_input[index] = row < args.data.rows && k < group_end ?
+                    l8_in.data[row * args.data.input_dim + k] : int8_t(0);
+            }
+            for (uint index = tid; index < 8u * 16u * 32u; index += 256u) {
+                uint subgroup_tile = index / (16u * 32u);
+                uint within = index - subgroup_tile * 16u * 32u;
+                uint tile_column = within / 32u;
+                uint tile_k = within - tile_column * 32u;
+                uint column =
+                    column_group + subgroup_tile * 16u + tile_column;
+                uint k = tile + tile_k;
+                cm8_weight[index] = column < args.data.output_dim &&
+                                    k < group_end ?
+                    l8_w.data[column * args.data.input_dim + k] : int8_t(0);
+            }
+            barrier();
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 32,
+                    gl_MatrixUseA> input_matrix;
+            coopmat<int8_t, gl_ScopeSubgroup, 32, 16,
+                    gl_MatrixUseB> weight_matrix;
+            coopMatLoad(input_matrix, cm8_input, 0u, 32u,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(weight_matrix, cm8_weight,
+                        subgroup * 16u * 32u, 32u,
+                        gl_CooperativeMatrixLayoutColumnMajor);
+            accumulator =
+                coopMatMulAdd(input_matrix, weight_matrix, accumulator);
+            barrier();
+        }
+        coopMatStore(accumulator, cm8_accumulator,
+                     subgroup * 16u * 16u, 16u,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        for (uint slot = 0u; slot < 8u; slot++) {
+            uint index = tid + slot * 256u;
+            uint subgroup_tile = index / (16u * 16u);
+            uint within = index - subgroup_tile * 16u * 16u;
+            uint tile_row = within / 16u;
+            uint tile_column = within - tile_row * 16u;
+            uint row = row_start + tile_row;
+            uint column = column_group +
+                          subgroup_tile * 16u + tile_column;
+            if (row < args.data.rows && column < args.data.output_dim)
+                totals[slot] += float(cm8_accumulator[index]) *
+                    l8_is.data[row * groups + group] * l8_ws.data[column];
+        }
+        barrier();
+    }
+    for (uint slot = 0u; slot < 8u; slot++) {
+        uint index = tid + slot * 256u;
+        uint subgroup_tile = index / (16u * 16u);
+        uint within = index - subgroup_tile * 16u * 16u;
+        uint tile_row = within / 16u;
+        uint tile_column = within - tile_row * 16u;
+        uint row = row_start + tile_row;
+        uint column = column_group + subgroup_tile * 16u + tile_column;
+        if (row < args.data.rows && column < args.data.output_dim)
+            l8_out.data[row * args.data.output_dim + column] =
+                uint16_t(h3_f32_to_bf16(totals[slot]));
+    }
+}
+#endif
 
 /* Grouped FC2 (Metal h3_linear_int8_grouped_nax_r128x64): one int
  * accumulator per 1024-wide input group, dequantized per group and summed
@@ -1237,13 +1626,15 @@ layout(set = 0, binding = 4) writeonly buffer L8Out { uint16_t data[]; } l8_out;
 void main_linear_int8_grouped_bf16() {
     uint local_column = gl_LocalInvocationID.x;
     uint local_row = gl_LocalInvocationID.y;
-    uint column = gl_WorkGroupID.x * 8u + local_column;
+    uint column_base = gl_WorkGroupID.x * 16u + local_column;
     uint row = gl_WorkGroupID.y * 32u + local_row;
     uint groups = args.data.elements;
     uint group_size = args.data.width;
     if (groups > 16u) return;
-    int acc[16];
-    for (uint group = 0u; group < groups; group++) acc[group] = 0;
+    int acc[2][16];
+    for (uint part = 0u; part < 2u; part++)
+        for (uint group = 0u; group < groups; group++)
+            acc[part][group] = 0;
     uint tile_count = (args.data.input_dim + 31u) / 32u;
     for (uint tile = 0u; tile < tile_count; tile++) {
         for (uint part = 0u; part < 4u; part++) {
@@ -1254,24 +1645,36 @@ void main_linear_int8_grouped_bf16() {
                 l8_in.data[row * args.data.input_dim + input_k] : int8_t(0);
         }
         uint weight_k = tile * 32u + local_row;
-        lin8_w_tile[local_row][local_column] =
-            column < args.data.output_dim &&
-            weight_k < args.data.input_dim ?
-            l8_w.data[column * args.data.input_dim + weight_k] : int8_t(0);
+        for (uint part = 0u; part < 2u; part++) {
+            uint column = column_base + part * 8u;
+            lin8_w_tile[local_row][local_column + part * 8u] =
+                column < args.data.output_dim &&
+                weight_k < args.data.input_dim ?
+                l8_w.data[column * args.data.input_dim + weight_k] :
+                int8_t(0);
+        }
         barrier();
         uint group = (tile * 32u) / group_size;
-        for (uint k = 0u; k < 32u; k++)
-            acc[group] += int(lin8_in_tile[local_row][k]) *
-                          int(lin8_w_tile[k][local_column]);
+        for (uint k = 0u; k < 32u; k++) {
+            int input_value = int(lin8_in_tile[local_row][k]);
+            for (uint part = 0u; part < 2u; part++)
+                acc[part][group] += input_value *
+                    int(lin8_w_tile[k][local_column + part * 8u]);
+        }
         barrier();
     }
-    if (row < args.data.rows && column < args.data.output_dim) {
-        float total = 0.0f;
-        for (uint group = 0u; group < groups; group++)
-            total += float(acc[group]) *
-                     l8_is.data[row * groups + group] * l8_ws.data[column];
-        l8_out.data[row * args.data.output_dim + column] =
-            uint16_t(h3_f32_to_bf16(total));
+    if (row < args.data.rows) {
+        for (uint part = 0u; part < 2u; part++) {
+            uint column = column_base + part * 8u;
+            if (column >= args.data.output_dim) continue;
+            float total = 0.0f;
+            for (uint group = 0u; group < groups; group++)
+                total += float(acc[part][group]) *
+                         l8_is.data[row * groups + group] *
+                         l8_ws.data[column];
+            l8_out.data[row * args.data.output_dim + column] =
+                uint16_t(h3_f32_to_bf16(total));
+        }
     }
 }
 
@@ -1331,8 +1734,106 @@ void main_sdpa_flash_f32() {
     }
 }
 
+/* F32 version of the 16-query tiled SDPA. K/V tiles are shared by sixteen
+ * queries and QK uses ascending-dimension FMA order. */
+void main_sdpa_tiled_f32() {
+    uint local_query = gl_LocalInvocationID.y;
+    uint local_key = gl_LocalInvocationID.x;
+    uint tid = local_query * 16u + local_key;
+    uint query_start = gl_WorkGroupID.x * 16u;
+    uint head = gl_WorkGroupID.y;
+    uint seq = args.data.rows;
+    uint heads = args.data.width;
+    uint dim = args.data.input_dim;
+    uint tile_elements = 16u * dim;
+    float output_values[8];
+    for (uint slot = 0u; slot < 8u; slot++) output_values[slot] = 0.0f;
 
+    for (uint index = tid; index < tile_elements; index += 256u) {
+        uint tile_row = index / dim;
+        uint dimension = index - tile_row * dim;
+        uint row = query_start + tile_row;
+        sdt_query[tile_row][dimension] =
+            row < seq && head < heads ?
+            flf_q.data[(row * heads + head) * dim + dimension] : 0.0f;
+    }
+    if (tid < 16u) {
+        sdt_row_maximum[tid] = -3.402823466e+38f;
+        sdt_row_sum[tid] = 0.0f;
+        sdt_row_alpha[tid] = 0.0f;
+    }
+    barrier();
 
+    for (uint key_start = 0u; key_start < seq; key_start += 16u) {
+        for (uint index = tid; index < tile_elements; index += 256u) {
+            uint tile_row = index / dim;
+            uint dimension = index - tile_row * dim;
+            uint row = key_start + tile_row;
+            uint source = (row * heads + head) * dim + dimension;
+            sdt_key[dimension][tile_row] =
+                row < seq && head < heads ? flf_k.data[source] : 0.0f;
+            sdt_value[tile_row][dimension] =
+                row < seq && head < heads ? flf_v.data[source] : 0.0f;
+        }
+        barrier();
+
+        float score = 0.0f;
+        for (uint dimension = 0u; dimension < dim; dimension++)
+            score = fma(sdt_query[local_query][dimension],
+                        sdt_key[dimension][local_key], score);
+        sdt_scores[local_query][local_key] = score * args.data.left_scale;
+        barrier();
+
+        if (tid < 16u) {
+            uint valid_keys = min(16u, seq - key_start);
+            float tile_maximum = -3.402823466e+38f;
+            for (uint column = 0u; column < valid_keys; column++)
+                tile_maximum = max(tile_maximum, sdt_scores[tid][column]);
+            float old_maximum = sdt_row_maximum[tid];
+            float new_maximum = max(old_maximum, tile_maximum);
+            float alpha = sdt_row_sum[tid] > 0.0f ?
+                          exp(old_maximum - new_maximum) : 0.0f;
+            float tile_sum = 0.0f;
+            for (uint column = 0u; column < 16u; column++) {
+                float probability = column < valid_keys ?
+                    exp(sdt_scores[tid][column] - new_maximum) : 0.0f;
+                sdt_probabilities[tid][column] = probability;
+                tile_sum += probability;
+            }
+            sdt_row_alpha[tid] = alpha;
+            sdt_row_sum[tid] = sdt_row_sum[tid] * alpha + tile_sum;
+            sdt_row_maximum[tid] = new_maximum;
+        }
+        barrier();
+
+        for (uint slot = 0u; slot < 8u; slot++) {
+            uint index = tid + slot * 256u;
+            if (index < tile_elements) {
+                uint tile_row = index / dim;
+                uint dimension = index - tile_row * dim;
+                float partial = 0.0f;
+                for (uint column = 0u; column < 16u; column++)
+                    partial = fma(sdt_probabilities[tile_row][column],
+                                  sdt_value[column][dimension], partial);
+                output_values[slot] =
+                    fma(output_values[slot], sdt_row_alpha[tile_row], partial);
+            }
+        }
+        barrier();
+    }
+
+    for (uint slot = 0u; slot < 8u; slot++) {
+        uint index = tid + slot * 256u;
+        if (index < tile_elements) {
+            uint tile_row = index / dim;
+            uint dimension = index - tile_row * dim;
+            uint row = query_start + tile_row;
+            if (row < seq && head < heads)
+                flf_out.data[(row * heads + head) * dim + dimension] =
+                    output_values[slot] / sdt_row_sum[tile_row];
+        }
+    }
+}
 
 /* -------------------------------------------------------- token pool */
 
@@ -1805,6 +2306,71 @@ void main_linear_f32() {
     lf_out.data[row * args.data.output_dim + column] = sum;
 }
 
+/* Shared-memory GEMM with the same ascending-K FMA order as the scalar
+ * oracle. Each 16x16 input and weight tile is fetched once instead of once
+ * per output element. Padding the K stride avoids shared-memory bank
+ * conflicts when a subgroup reads different output rows of the weight tile. */
+shared float lft_input_tile[64][17];
+shared float lft_weight_tile[64][17];
+
+void main_linear_f32_tiled() {
+    uint local_k = gl_LocalInvocationID.x;
+    uint local_index = gl_LocalInvocationID.y;
+    uint row_base = gl_WorkGroupID.y * 64u + local_index;
+    uint column_base = gl_WorkGroupID.x * 64u + local_k;
+    float sums[16];
+    for (uint row_part = 0u; row_part < 4u; row_part++) {
+        for (uint column_part = 0u; column_part < 4u; column_part++) {
+            uint column = column_base + column_part * 16u;
+            sums[row_part * 4u + column_part] =
+                args.data.has_bias != 0u && column < args.data.output_dim ?
+                lf_b.data[column] : 0.0f;
+        }
+    }
+    for (uint tile = 0u; tile < args.data.input_dim; tile += 16u) {
+        uint k = tile + local_k;
+        for (uint part = 0u; part < 4u; part++) {
+            uint offset = local_index + part * 16u;
+            uint row = gl_WorkGroupID.y * 64u + offset;
+            uint weight_row = gl_WorkGroupID.x * 64u + offset;
+            lft_input_tile[offset][local_k] =
+                row < args.data.rows && k < args.data.input_dim ?
+                lf_in.data[row * args.data.input_dim + k] : 0.0f;
+            lft_weight_tile[offset][local_k] =
+                weight_row < args.data.output_dim && k < args.data.input_dim ?
+                lf_w.data[weight_row * args.data.input_dim + k] : 0.0f;
+        }
+        barrier();
+        uint count = min(16u, args.data.input_dim - tile);
+        for (uint inner = 0u; inner < count; inner++) {
+            float inputs[4];
+            float weights[4];
+            for (uint part = 0u; part < 4u; part++) {
+                inputs[part] =
+                    lft_input_tile[local_index + part * 16u][inner];
+                weights[part] =
+                    lft_weight_tile[local_k + part * 16u][inner];
+            }
+            for (uint row_part = 0u; row_part < 4u; row_part++)
+                for (uint column_part = 0u; column_part < 4u; column_part++)
+                    sums[row_part * 4u + column_part] =
+                        fma(inputs[row_part], weights[column_part],
+                            sums[row_part * 4u + column_part]);
+        }
+        barrier();
+    }
+    for (uint row_part = 0u; row_part < 4u; row_part++) {
+        uint row = row_base + row_part * 16u;
+        if (row >= args.data.rows) continue;
+        for (uint column_part = 0u; column_part < 4u; column_part++) {
+            uint column = column_base + column_part * 16u;
+            if (column < args.data.output_dim)
+                lf_out.data[row * args.data.output_dim + column] =
+                    sums[row_part * 4u + column_part];
+        }
+    }
+}
+
 /* ---------------------------------------------------------- scale-add f32 */
 
 layout(set = 0, binding = 0) readonly buffer SRes { float data[]; } s_res;
@@ -2067,7 +2633,7 @@ layout(set = 0, binding = 3) writeonly buffer CvOut { float data[]; } cv_out;
 
 void main_conv3d_f32() {
     uint out_x = gl_GlobalInvocationID.x;
-    uint out_y = gl_GlobalInvocationID.y;
+    uint oc = gl_GlobalInvocationID.y;
     uint plane = gl_GlobalInvocationID.z;
     uint batch = args.data.conv_batch;
     uint depth = args.data.conv_depth;
@@ -2089,33 +2655,32 @@ void main_conv3d_f32() {
     uint out_h = spatial % output_height;
     uint batch_index = plane / (output_depth * output_height);
     if (batch_index >= batch || out_t >= output_depth ||
-        out_h >= output_height || out_x >= output_width) return;
-    for (uint oc = 0u; oc < out_channels; oc++) {
-        float sum = args.data.has_bias != 0u ? cv_b.data[oc] : 0.0f;
-        for (uint kt = 0u; kt < kd; kt++) {
-            for (uint khh = 0u; khh < kh; khh++) {
-                for (uint kww = 0u; kww < kw; kww++) {
-                    for (uint ic = 0u; ic < in_channels; ic++) {
-                        uint in_t = out_t * sd + kt;
-                        uint in_h = out_h * sh + khh;
-                        uint in_x = out_x * sw + kww;
-                        uint input_index =
-                            ((((batch_index * depth + in_t) * height + in_h) *
-                              width + in_x) * in_channels + ic);
-                        uint weight_index =
-                            ((((oc * in_channels + ic) * kd + kt) * kh +
-                              khh) * kw + kww);
-                        sum = fma(cv_in.data[input_index],
-                                  cv_w.data[weight_index], sum);
-                    }
+        out_h >= output_height || out_x >= output_width ||
+        oc >= out_channels) return;
+    float sum = args.data.has_bias != 0u ? cv_b.data[oc] : 0.0f;
+    for (uint kt = 0u; kt < kd; kt++) {
+        for (uint khh = 0u; khh < kh; khh++) {
+            for (uint kww = 0u; kww < kw; kww++) {
+                for (uint ic = 0u; ic < in_channels; ic++) {
+                    uint in_t = out_t * sd + kt;
+                    uint in_h = out_h * sh + khh;
+                    uint in_x = out_x * sw + kww;
+                    uint input_index =
+                        ((((batch_index * depth + in_t) * height + in_h) *
+                          width + in_x) * in_channels + ic);
+                    uint weight_index =
+                        ((((oc * in_channels + ic) * kd + kt) * kh +
+                          khh) * kw + kww);
+                    sum = fma(cv_in.data[input_index],
+                              cv_w.data[weight_index], sum);
                 }
             }
         }
-        uint output_index =
-            ((((batch_index * output_depth + out_t) * output_height + out_h) *
-              output_width + out_x) * out_channels + oc);
-        cv_out.data[output_index] = sum;
     }
+    uint output_index =
+        ((((batch_index * output_depth + out_t) * output_height + out_h) *
+          output_width + out_x) * out_channels + oc);
+    cv_out.data[output_index] = sum;
 }
 
 /* --------------------------------------------------------- audio family */
@@ -2369,6 +2934,64 @@ void main_sdpa_causal_f32() {
     }
 }
 
+/* Causal online-softmax SDPA. One 256-thread workgroup owns a
+ * (batch,head,row) tuple and computes each QK dot once. This replaces the
+ * cubic-in-head-dimension reference kernel for long AudioVAE sequences. */
+shared float sdpcf_query[256];
+shared float sdpcf_dots[256];
+shared float sdpcf_accumulator[256];
+shared float sdpcf_maximum;
+shared float sdpcf_old_maximum;
+shared float sdpcf_sum;
+
+void main_sdpa_causal_flash_f32() {
+    uint d = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x;
+    uint row = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+    uint seq = args.data.rows;
+    uint heads = args.data.width;
+    uint dim = args.data.input_dim;
+    if (batch >= args.data.conv_batch || row >= seq || head >= heads) return;
+    uint qbase = ((batch * seq + row) * heads + head) * dim;
+    sdpcf_query[d] = d < dim ? sdpc_q.data[qbase + d] : 0.0f;
+    sdpcf_accumulator[d] = 0.0f;
+    if (d == 0u) {
+        sdpcf_maximum = -3.402823466e+38f;
+        sdpcf_sum = 0.0f;
+    }
+    barrier();
+    for (uint source = 0u; source <= row; source++) {
+        uint kbase = ((batch * seq + source) * heads + head) * dim;
+        sdpcf_dots[d] = d < dim ?
+            fma(sdpcf_query[d], sdpc_k.data[kbase + d], 0.0f) : 0.0f;
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (d < stride)
+                sdpcf_dots[d] += sdpcf_dots[d + stride];
+            barrier();
+        }
+        float score = sdpcf_dots[0] * args.data.left_scale;
+        if (d == 0u) {
+            float new_maximum = max(sdpcf_maximum, score);
+            sdpcf_old_maximum = sdpcf_maximum;
+            sdpcf_maximum = new_maximum;
+            sdpcf_sum = sdpcf_sum *
+                exp(sdpcf_old_maximum - new_maximum) +
+                exp(score - new_maximum);
+        }
+        barrier();
+        float previous_scale = exp(sdpcf_old_maximum - sdpcf_maximum);
+        float probability = exp(score - sdpcf_maximum);
+        float value = d < dim ? sdpc_v.data[kbase + d] : 0.0f;
+        sdpcf_accumulator[d] =
+            sdpcf_accumulator[d] * previous_scale + probability * value;
+        barrier();
+    }
+    if (d < dim)
+        sdpc_out.data[qbase + d] = sdpcf_accumulator[d] / sdpcf_sum;
+}
+
 /* ------------------------------------------------------ vision QKV + RoPE */
 
 layout(set = 0, binding = 0) readonly buffer VisIn { uint16_t data[]; } vis_in;
@@ -2501,9 +3124,10 @@ void main_quantize_head_major_rows_bf16_i8() {
 void main_linear_int8_bf16() {
     uint local_column = gl_LocalInvocationID.x;
     uint local_row = gl_LocalInvocationID.y;
-    uint column = gl_WorkGroupID.x * 8u + local_column;
+    uint column_base = gl_WorkGroupID.x * 32u + local_column;
     uint row = gl_WorkGroupID.y * 32u + local_row;
-    int acc = 0;
+    int acc[4];
+    for (uint part = 0u; part < 4u; part++) acc[part] = 0;
     uint tile_count = (args.data.input_dim + 31u) / 32u;
     for (uint tile = 0u; tile < tile_count; tile++) {
         for (uint part = 0u; part < 4u; part++) {
@@ -2514,20 +3138,34 @@ void main_linear_int8_bf16() {
                 l8_in.data[row * args.data.input_dim + input_k] : int8_t(0);
         }
         uint weight_k = tile * 32u + local_row;
-        lin8_w_tile[local_row][local_column] =
-            column < args.data.output_dim &&
-            weight_k < args.data.input_dim ?
-            l8_w.data[column * args.data.input_dim + weight_k] : int8_t(0);
+        for (uint part = 0u; part < 4u; part++) {
+            uint column = column_base + part * 8u;
+            lin8_w_tile[local_row][local_column + part * 8u] =
+                column < args.data.output_dim &&
+                weight_k < args.data.input_dim ?
+                l8_w.data[column * args.data.input_dim + weight_k] :
+                int8_t(0);
+        }
         barrier();
-        for (uint k = 0u; k < 32u; k++)
-            acc += int(lin8_in_tile[local_row][k]) *
-                   int(lin8_w_tile[k][local_column]);
+        for (uint k = 0u; k < 32u; k++) {
+            int input_value = int(lin8_in_tile[local_row][k]);
+            for (uint part = 0u; part < 4u; part++)
+                acc[part] += input_value *
+                    int(lin8_w_tile[k][local_column + part * 8u]);
+        }
         barrier();
     }
-    if (row < args.data.rows && column < args.data.output_dim) {
-        float dequant = float(acc) * l8_is.data[row] * l8_ws.data[column];
-        l8_out.data[row * args.data.output_dim + column] =
-            uint16_t(h3_f32_to_bf16(dequant));
+    if (row < args.data.rows) {
+        float input_scale = l8_is.data[row];
+        for (uint part = 0u; part < 4u; part++) {
+            uint column = column_base + part * 8u;
+            if (column < args.data.output_dim) {
+                float dequant = float(acc[part]) * input_scale *
+                                l8_ws.data[column];
+                l8_out.data[row * args.data.output_dim + column] =
+                    uint16_t(h3_f32_to_bf16(dequant));
+            }
+        }
     }
 }
 
@@ -2580,17 +3218,21 @@ void main_quantize_rows_groups_bf16_i8() {
  * scales; one BF16 rounding after the dequantized product.  Tiled like the
  * linear kernel; the exact integer sums keep the bit-exact semantics. */
 shared int8_t fc1_in_tile[32][32];
-shared int8_t fc1_g_tile[32][8];
-shared int8_t fc1_u_tile[32][8];
+shared int8_t fc1_g_tile[32][32];
+shared int8_t fc1_u_tile[32][32];
 
 void main_fc1_swiglu_int8_bf16() {
     uint local_column = gl_LocalInvocationID.x;
     uint local_row = gl_LocalInvocationID.y;
-    uint column = gl_WorkGroupID.x * 8u + local_column;
+    uint column_base = gl_WorkGroupID.x * 32u + local_column;
     uint row = gl_WorkGroupID.y * 32u + local_row;
     uint hidden = args.data.output_dim;
-    int acc_gate = 0;
-    int acc_up = 0;
+    int acc_gate[4];
+    int acc_up[4];
+    for (uint part = 0u; part < 4u; part++) {
+        acc_gate[part] = 0;
+        acc_up[part] = 0;
+    }
     uint tile_count = (args.data.input_dim + 31u) / 32u;
     for (uint tile = 0u; tile < tile_count; tile++) {
         for (uint part = 0u; part < 4u; part++) {
@@ -2601,30 +3243,44 @@ void main_fc1_swiglu_int8_bf16() {
                 l8_in.data[row * args.data.input_dim + input_k] : int8_t(0);
         }
         uint weight_k = tile * 32u + local_row;
-        fc1_g_tile[local_row][local_column] =
-            column < hidden && weight_k < args.data.input_dim ?
-            l8_w.data[column * args.data.input_dim + weight_k] : int8_t(0);
-        fc1_u_tile[local_row][local_column] =
-            column < hidden && weight_k < args.data.input_dim ?
-            l8_w.data[(hidden + column) * args.data.input_dim + weight_k] :
-            int8_t(0);
+        for (uint part = 0u; part < 4u; part++) {
+            uint column = column_base + part * 8u;
+            uint shared_column = local_column + part * 8u;
+            fc1_g_tile[local_row][shared_column] =
+                column < hidden && weight_k < args.data.input_dim ?
+                l8_w.data[column * args.data.input_dim + weight_k] :
+                int8_t(0);
+            fc1_u_tile[local_row][shared_column] =
+                column < hidden && weight_k < args.data.input_dim ?
+                l8_w.data[(hidden + column) * args.data.input_dim + weight_k] :
+                int8_t(0);
+        }
         barrier();
         for (uint k = 0u; k < 32u; k++) {
             int value = int(fc1_in_tile[local_row][k]);
-            acc_gate += value * int(fc1_g_tile[k][local_column]);
-            acc_up += value * int(fc1_u_tile[k][local_column]);
+            for (uint part = 0u; part < 4u; part++) {
+                uint shared_column = local_column + part * 8u;
+                acc_gate[part] += value *
+                    int(fc1_g_tile[k][shared_column]);
+                acc_up[part] += value *
+                    int(fc1_u_tile[k][shared_column]);
+            }
         }
         barrier();
     }
-    if (row < args.data.rows && column < hidden) {
+    if (row < args.data.rows) {
         float input_scale = l8_is.data[row];
-        /* Match Metal: materialize the gate fragment in BF16 before SiLU;
-         * keep the up fragment in F32 until the final product. */
-        float gate = H3_BF16_TO_F32(h3_f32_to_bf16(
-            float(acc_gate) * input_scale * l8_ws.data[column]));
-        float up = float(acc_up) * input_scale * l8_ws.data[hidden + column];
-        l8_out.data[row * hidden + column] = uint16_t(h3_f32_to_bf16(
-            gate / (1.0f + exp(-gate)) * up));
+        for (uint part = 0u; part < 4u; part++) {
+            uint column = column_base + part * 8u;
+            if (column >= hidden) continue;
+            /* Match Metal: materialize gate in BF16 before SiLU. */
+            float gate = H3_BF16_TO_F32(h3_f32_to_bf16(
+                float(acc_gate[part]) * input_scale * l8_ws.data[column]));
+            float up = float(acc_up[part]) * input_scale *
+                       l8_ws.data[hidden + column];
+            l8_out.data[row * hidden + column] = uint16_t(h3_f32_to_bf16(
+                gate / (1.0f + exp(-gate)) * up));
+        }
     }
 }
 

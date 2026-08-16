@@ -161,6 +161,7 @@ static void print_help(void) {
     puts("  !core-reuse [N]          Set or show core reuse");
     puts("  !token-reduction [on|off]  Toggle token reduction");
     puts("  !ssd-streaming [on|off]   Toggle original-BF16 SSD streaming");
+    puts("  !int8-streaming [on|off]  Toggle cached-INT8 SSD streaming");
     puts("  !int8-row-fc2 [on|off]    Toggle faster one-scale FC2");
     puts("  !reference-rope [on|off]  Toggle released spatial RoPE");
     puts("  !first [PATH|clear]      Set, show, or clear first frame");
@@ -193,7 +194,8 @@ static void print_status(const h3_cli_state *state) {
            state->params.steps, state->params.denoise_reuse,
            state->params.dit_layers, state->params.core_reuse,
            state->params.token_reduction ? "reduced" : "full",
-           state->params.ssd_streaming ? "SSD BF16" : "resident",
+           state->params.ssd_streaming ? "SSD BF16" :
+           state->params.int8_streaming ? "SSD INT8" : "resident",
            state->params.ssd_streaming ? "BF16" :
            state->params.use_int8_row_fc2 ? "int8 row" : "int8 grouped");
     printf("Spatial RoPE: %s\n", state->params.use_reference_rope ?
@@ -592,9 +594,29 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         else if (value && state->params.use_int8_row_fc2)
             fprintf(stderr,
                     "h3: disable !int8-row-fc2 before SSD streaming\n");
+        else if (value && state->params.int8_streaming)
+            fprintf(stderr,
+                    "h3: disable !int8-streaming before SSD streaming\n");
         else {
             state->params.ssd_streaming = value;
             printf("SSD streaming: %s\n", value ? "on" : "off");
+        }
+    } else if (!strcasecmp(command, "int8-streaming")) {
+        int value;
+        if (!parse_toggle(argument, state->params.int8_streaming, &value))
+            fprintf(stderr, "h3: use on or off\n");
+        else if (value && state->params.ssd_streaming)
+            fprintf(stderr,
+                    "h3: disable !ssd-streaming before INT8 streaming\n");
+        else if (value &&
+                 (state->params.use_slower_bf16_mlp ||
+                  state->params.use_slower_bf16_qkv ||
+                  state->params.use_slower_bf16_attention_output))
+            fprintf(stderr,
+                    "h3: disable BF16 DiT projections before INT8 streaming\n");
+        else {
+            state->params.int8_streaming = value;
+            printf("INT8 streaming: %s\n", value ? "on" : "off");
         }
     } else if (!strcasecmp(command, "int8-row-fc2")) {
         int value;

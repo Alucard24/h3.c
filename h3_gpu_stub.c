@@ -46,6 +46,16 @@ int h3_gpu_has_int8_mlp(const h3_gpu *gpu) {
     return 0;
 }
 
+int h3_gpu_has_int8_streaming(const h3_gpu *gpu) {
+(void)gpu;
+    return 0;
+}
+
+int h3_gpu_supports_host_weight_prefetch(const h3_gpu *gpu) {
+(void)gpu;
+    return 0;
+}
+
 h3_gpu_tensor * h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements) {
 (void)gpu; (void)elements;
     return NULL;
@@ -57,6 +67,21 @@ h3_gpu_tensor * h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements) {
 }
 
 h3_gpu_tensor * h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements) {
+(void)gpu; (void)elements;
+    return NULL;
+}
+
+h3_gpu_tensor * h3_gpu_tensor_new_stream_f32(h3_gpu *gpu, size_t elements) {
+(void)gpu; (void)elements;
+    return NULL;
+}
+
+h3_gpu_tensor * h3_gpu_tensor_new_stream_bf16(h3_gpu *gpu, size_t elements) {
+(void)gpu; (void)elements;
+    return NULL;
+}
+
+h3_gpu_tensor * h3_gpu_tensor_new_stream_i8(h3_gpu *gpu, size_t elements) {
 (void)gpu; (void)elements;
     return NULL;
 }
@@ -91,6 +116,12 @@ h3_gpu_tensor * h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
     return NULL;
 }
 
+h3_gpu_tensor * h3_gpu_tensor_load_i8(h3_gpu *gpu, const char *path,
+                                      uint64_t file_offset, size_t elements) {
+(void)gpu; (void)path; (void)file_offset; (void)elements;
+    return NULL;
+}
+
 int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                  uint64_t file_offset, size_t elements,
                                  char *error, size_t error_size) {
@@ -102,7 +133,14 @@ int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                    uint64_t file_offset, size_t elements,
                                    char *error, size_t error_size) {
 (void)tensor; (void)path; (void)file_offset; (void)elements; (void)error; (void)error_size;
-    return -1;
+    return 0;
+}
+
+int h3_gpu_tensor_stream_file(h3_gpu_tensor *tensor, const char *path,
+                              uint64_t file_offset, size_t elements,
+                              char *error, size_t error_size) {
+(void)tensor; (void)path; (void)file_offset; (void)elements; (void)error; (void)error_size;
+    return 0;
 }
 
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {
@@ -136,6 +174,12 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements) {
 (void)tensor; (void)values; (void)elements;
     return -1;
+}
+
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements) {
+(void)tensor; (void)values; (void)elements;
+    return 0;
 }
 
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,

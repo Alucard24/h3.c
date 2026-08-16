@@ -108,6 +108,18 @@ int main(void) {
         h3_tokenizer_ids_free(ids);
     }
 
+    /* Regression: pre-tokenization must grow beyond its initial 16 slots. */
+    {
+        const char *many_pieces =
+            "x x x x x x x x x x x x x x x x x x x x";
+        uint32_t *many_ids = NULL;
+        size_t many_count = 0;
+        CHECK(h3_tokenizer_encode(tokenizer, many_pieces, 0, &many_ids,
+                                  &many_count, error, sizeof(error)));
+        CHECK(many_count == 39);
+        h3_tokenizer_ids_free(many_ids);
+    }
+
     /* Decode checks. */
     struct { const uint32_t *ids; size_t count; const char *text; } decodes[] = {
         {(uint32_t[]){7}, 1, "hello"},

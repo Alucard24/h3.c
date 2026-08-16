@@ -2,6 +2,7 @@
  * the same arithmetic as h3_shaders.metal. Skips cleanly when no Vulkan
  * device is available. */
 #include "h3_gpu.h"
+#include "h3_int8_cache.h"
 
 #include <fcntl.h>
 #include <math.h>
@@ -1166,7 +1167,7 @@ static void test_vae_group_norm_silu_f32(h3_gpu *gpu) {
 }
 
 static void test_sdpa_f32(h3_gpu *gpu) {
-    enum { SEQ = 9, HEADS = 3, DIM = 8 };
+    enum { SEQ = 33, HEADS = 3, DIM = 8 };
     const float scale = 1.0f / sqrtf((float)DIM);
     size_t count = (size_t)SEQ * HEADS * DIM;
     float *query = malloc(count * sizeof(float));
@@ -1219,6 +1220,15 @@ static void test_sdpa_f32(h3_gpu *gpu) {
         CHECK(h3_gpu_submit(gpu) == 1);
         CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
         CHECK(check_f32(got, expected, count, 1e-5f, "sdpa_f32"));
+        setenv("H3_FORCE_VK_TILED_SDPA_F32", "1", 1);
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_sdpa_f32(gpu, out, q, k, v, SEQ, HEADS, DIM,
+                              scale) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
+        CHECK(check_f32(got, expected, count, 1e-5f,
+                        "sdpa_tiled_f32"));
+        unsetenv("H3_FORCE_VK_TILED_SDPA_F32");
     }
     h3_gpu_tensor_free(q);
     h3_gpu_tensor_free(k);
@@ -1759,6 +1769,15 @@ static void test_sdpa_causal_f32(h3_gpu *gpu) {
         CHECK(h3_gpu_submit(gpu) == 1);
         CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
         CHECK(check_f32(got, expected, count, 1e-5f, "sdpa_causal"));
+        setenv("H3_FORCE_CAUSAL_FLASH", "1", 1);
+        h3_gpu_begin(gpu);
+        CHECK(h3_gpu_sdpa_causal_f32(gpu, out, q, k, v, BATCH, SEQ, HEADS,
+                                     DIM, scale) == 1);
+        CHECK(h3_gpu_submit(gpu) == 1);
+        CHECK(h3_gpu_tensor_read_f32(out, got, count) == 1);
+        CHECK(check_f32(got, expected, count, 1e-5f,
+                        "sdpa_causal_flash"));
+        unsetenv("H3_FORCE_CAUSAL_FLASH");
     }
     h3_gpu_tensor_free(q);
     h3_gpu_tensor_free(k);
@@ -3745,7 +3764,134 @@ static void test_device_local_load(h3_gpu *gpu) {
         h3_gpu_tensor_free(w);
         h3_gpu_tensor_free(in);
         h3_gpu_tensor_free(out);
+
+        float initial[8] = {0.0f, 1.0f, 2.0f, 3.0f,
+                            4.0f, 5.0f, 6.0f, 7.0f};
+        const float patch[3] = {11.0f, 12.0f, 13.0f};
+        const float range_expected[8] = {0.0f, 1.0f, 11.0f, 12.0f,
+                                         13.0f, 5.0f, 6.0f, 7.0f};
+        float range_got[8];
+        h3_gpu_tensor *range = h3_gpu_tensor_new_stream_f32(gpu, 8);
+        CHECK(range != NULL);
+        CHECK(h3_gpu_tensor_write_f32(range, initial, 8) == 1);
+        CHECK(h3_gpu_tensor_write_f32_range(range, 2, patch, 3) == 1);
+        CHECK(h3_gpu_tensor_read_f32(range, range_got, 8) == 1);
+        CHECK(memcmp(range_got, range_expected, sizeof(range_got)) == 0);
+        h3_gpu_tensor_free(range);
         unlink(path);
+    }
+}
+
+static void test_int8_disk_cache(h3_gpu *gpu) {
+    enum { ROWS = 3, COLUMNS = 17, ELEMENTS = ROWS * COLUMNS };
+    char root[] = "/tmp/h3-vk-int8-cache-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    if (!failed) {
+        char source_path[512];
+        char cache_dir[512];
+        snprintf(source_path, sizeof(source_path), "%s/source.bin", root);
+        snprintf(cache_dir, sizeof(cache_dir), "%s/cache", root);
+        uint16_t values[ELEMENTS];
+        for (size_t index = 0; index < ELEMENTS; index++)
+            values[index] = bf16_bits((float)sin((double)index * 0.37) * 1.3f);
+        int descriptor = open(source_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        CHECK(descriptor >= 0);
+        if (descriptor >= 0) {
+            CHECK(write(descriptor, values, sizeof(values)) ==
+                  (ssize_t)sizeof(values));
+            close(descriptor);
+        }
+        h3_gpu_tensor *source = h3_gpu_tensor_from_bf16(
+            gpu, values, ELEMENTS);
+        h3_gpu_tensor *weight = h3_gpu_tensor_new_i8(gpu, ELEMENTS);
+        h3_gpu_tensor *scales = h3_gpu_tensor_new_f32(gpu, ROWS);
+        CHECK(source && weight && scales);
+        if (source && weight && scales) {
+            h3_gpu_begin(gpu);
+            CHECK(h3_gpu_quantize_weight_int8(
+                      gpu, weight, scales, source, ROWS, COLUMNS) == 1);
+            CHECK(h3_gpu_submit(gpu) == 1);
+            uint64_t stored = 0;
+            char error[512];
+            CHECK(h3_int8_cache_save(
+                      cache_dir, "blocks.0.test.weight", source_path, 0,
+                      ROWS, COLUMNS, weight, scales, &stored,
+                      error, sizeof(error)) == 1);
+            CHECK(stored == ELEMENTS + ROWS * sizeof(float));
+            char *cache_path = NULL;
+            uint64_t weight_offset = 0;
+            uint64_t scale_offset = 0;
+            int hit = 0;
+            CHECK(h3_int8_cache_resolve(
+                      cache_dir, "blocks.0.test.weight", source_path, 0,
+                      ROWS, COLUMNS, &cache_path, &weight_offset,
+                      &scale_offset, &hit, error, sizeof(error)) == 1);
+            CHECK(hit == 1 && cache_path && weight_offset == 80 &&
+                  scale_offset == 80 + ELEMENTS);
+            h3_gpu_tensor *stream_weight =
+                h3_gpu_tensor_new_stream_i8(gpu, ELEMENTS);
+            h3_gpu_tensor *stream_scales =
+                h3_gpu_tensor_new_stream_f32(gpu, ROWS);
+            CHECK(stream_weight && stream_scales);
+            if (stream_weight && stream_scales && cache_path) {
+                CHECK(h3_gpu_tensor_stream_file(
+                          stream_weight, cache_path, weight_offset, ELEMENTS,
+                          error, sizeof(error)) == 1);
+                CHECK(h3_gpu_tensor_stream_file(
+                          stream_scales, cache_path, scale_offset, ROWS,
+                          error, sizeof(error)) == 1);
+                int8_t expected_weight[ELEMENTS], got_weight[ELEMENTS];
+                float expected_scales[ROWS], got_scales[ROWS];
+                CHECK(h3_gpu_tensor_read_i8(
+                          weight, expected_weight, ELEMENTS) == 1);
+                CHECK(h3_gpu_tensor_read_i8(
+                          stream_weight, got_weight, ELEMENTS) == 1);
+                CHECK(memcmp(expected_weight, got_weight,
+                             sizeof(got_weight)) == 0);
+                CHECK(h3_gpu_tensor_read_f32(
+                          scales, expected_scales, ROWS) == 1);
+                CHECK(h3_gpu_tensor_read_f32(
+                          stream_scales, got_scales, ROWS) == 1);
+                CHECK(memcmp(expected_scales, got_scales,
+                             sizeof(got_scales)) == 0);
+                h3_gpu_tensor *loaded_weight = NULL;
+                h3_gpu_tensor *loaded_scales = NULL;
+                uint64_t loaded = 0;
+                hit = 0;
+                CHECK(h3_int8_cache_load(
+                          gpu, cache_dir, "blocks.0.test.weight", source_path,
+                          0, ROWS, COLUMNS, &loaded_weight, &loaded_scales,
+                          &hit, &loaded, error, sizeof(error)) == 1);
+                CHECK(hit == 1 && loaded == stored && loaded_weight &&
+                      loaded_scales);
+                h3_gpu_tensor_free(loaded_weight);
+                h3_gpu_tensor_free(loaded_scales);
+            }
+            h3_gpu_tensor_free(stream_weight);
+            h3_gpu_tensor_free(stream_scales);
+            free(cache_path);
+            descriptor = open(source_path, O_WRONLY | O_APPEND);
+            CHECK(descriptor >= 0);
+            if (descriptor >= 0) {
+                uint8_t changed = 1;
+                CHECK(write(descriptor, &changed, 1) == 1);
+                close(descriptor);
+            }
+            cache_path = NULL;
+            hit = 1;
+            CHECK(h3_int8_cache_resolve(
+                      cache_dir, "blocks.0.test.weight", source_path, 0,
+                      ROWS, COLUMNS, &cache_path, &weight_offset,
+                      &scale_offset, &hit, error, sizeof(error)) == 1);
+            CHECK(hit == 0 && cache_path == NULL);
+            free(cache_path);
+        }
+        h3_gpu_tensor_free(source);
+        h3_gpu_tensor_free(weight);
+        h3_gpu_tensor_free(scales);
+        unlink(source_path);
+        rmdir(cache_dir);
+        rmdir(root);
     }
 }
 
@@ -4056,6 +4202,7 @@ int main(int argc, char **argv) {
         printf("SKIP: no Vulkan backend available (%s)\n", error);
         return 0;
     }
+    CHECK(h3_gpu_has_int8_streaming(gpu) == 1);
     test_cast_and_unary(gpu);
     test_silu_bf16(gpu);
     test_add_sub_silu_mul(gpu);
@@ -4110,6 +4257,7 @@ int main(int argc, char **argv) {
     test_token_pool_expand(gpu);
     test_token_pool_adaln(gpu);
     test_device_local_load(gpu);
+    test_int8_disk_cache(gpu);
     test_text_qk_rope_bf16(gpu);
     test_rope_text_bf16(gpu);
     test_gqa_causal_bf16(gpu);

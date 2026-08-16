@@ -485,6 +485,21 @@ static char **h3_pretokenize(const char *text, size_t length, size_t *count,
     size_t index = 0;
     int failed = 0;
     while (index < point_count) {
+        if (piece_count == piece_capacity) {
+            if (piece_capacity > SIZE_MAX / 2 ||
+                piece_capacity * 2 > SIZE_MAX / sizeof(*pieces)) {
+                failed = 1;
+                break;
+            }
+            piece_capacity *= 2;
+            char **grown = realloc(pieces,
+                                   piece_capacity * sizeof(*pieces));
+            if (!grown) {
+                failed = 1;
+                break;
+            }
+            pieces = grown;
+        }
         size_t contraction = h3_contraction(points, point_count, index);
         if (contraction) {
             pieces[piece_count++] = h3_slice(text, points, index,
@@ -558,15 +573,6 @@ static char **h3_pretokenize(const char *text, size_t length, size_t *count,
         /* Unreachable in the Qwen2 grammar; emit the codepoint alone. */
         pieces[piece_count++] = h3_slice(text, points, index, index + 1);
         index++;
-        if (piece_count >= piece_capacity) {
-            piece_capacity *= 2;
-            char **grown = realloc(pieces, piece_capacity * sizeof(*pieces));
-            if (!grown) {
-                failed = 1;
-                break;
-            }
-            pieces = grown;
-        }
     }
     free(points);
     if (failed) {

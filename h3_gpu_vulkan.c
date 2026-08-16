@@ -145,6 +145,11 @@ typedef enum {
     H3_VK_KERNEL_QUANTIZE_ROWS_GROUPS_BF16_I8,
     H3_VK_KERNEL_LINEAR_INT8_GROUPED_BF16,
     H3_VK_KERNEL_QUANTIZE_HEAD_MAJOR_ROWS_BF16_I8,
+    H3_VK_KERNEL_SDPA_CAUSAL_FLASH_F32,
+    H3_VK_KERNEL_LINEAR_F32_TILED,
+    H3_VK_KERNEL_SDPA_TILED_F32,
+    H3_VK_KERNEL_LINEAR_INT8_COOP_BF16,
+    H3_VK_KERNEL_LINEAR_INT8_GROUPED_COOP_BF16,
     H3_VK_KERNEL_COUNT
 } h3_vk_kernel;
 
@@ -212,7 +217,12 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
     "main_gate_adaln_quantize_int8",
     "main_quantize_rows_groups_bf16_i8",
     "main_linear_int8_grouped_bf16",
-    "main_quantize_head_major_rows_bf16_i8"
+    "main_quantize_head_major_rows_bf16_i8",
+    "main_sdpa_causal_flash_f32",
+    "main_linear_f32_tiled",
+    "main_sdpa_tiled_f32",
+    "main_linear_int8_coop_bf16",
+    "main_linear_int8_grouped_coop_bf16"
 };
 
 /* Storage-buffer bindings consumed by each kernel (0..n-1 plus binding 7
@@ -220,13 +230,13 @@ static const char *const h3_vk_kernel_names[H3_VK_KERNEL_COUNT] = {
 /* Highest storage-buffer binding used by each kernel plus one (bindings
  * 0..n-1 carry tensors, binding 7 always carries the args buffer). */
 static const uint32_t h3_vk_kernel_bindings[H3_VK_KERNEL_COUNT] = {
-    2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2, 5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2, 6, 2, 4, 4, 4, 4, 3, 3, 6, 7, 2, 4, 4, 4, 6, 3, 5, 5, 9, 3, 5, 3
+    2, 2, 2, 2, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 4, 4, 2, 5, 5, 8, 2, 8, 2, 8, 4, 4, 4, 4, 4, 5, 6, 10, 6, 10, 8, 4, 4, 4, 4, 2, 6, 2, 4, 4, 4, 4, 3, 3, 6, 7, 2, 4, 4, 4, 6, 3, 5, 5, 9, 3, 5, 3, 4, 4, 4, 5, 5
 };
 
 /* Workgroup layout per kernel: 0 = 256 threads, 1 = 16x16 tiles,
  * 2 = 128 threads (SDPA flash), 3 = 8x32 tiles. */
 static const int h3_vk_kernel_layout[H3_VK_KERNEL_COUNT] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1, 1, 1, 0, 0, 2, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 3, 3, 0, 0, 3, 0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 2, 1, 1, 1, 1, 1, 0, 0, 2, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 3, 3, 0, 0, 3, 0, 0, 1, 1, 0, 0
 };
 
 struct h3_gpu {
@@ -649,10 +659,16 @@ static VkShaderModule h3_vk_compile(h3_gpu *gpu, const char *source,
         shaderc_compile_options_set_target_env(
             options, shaderc_target_env_vulkan,
             shaderc_env_version_vulkan_1_3);
-        int cooperative_bf16_shader =
-            strcmp(entry_point, "main_sdpa_coopmat_bf16") == 0;
-        int optimized_shader = cooperative_bf16_shader ||
-            strcmp(entry_point, "main_sdpa_tiled_bf16") == 0;
+        int cooperative_matrix_shader =
+            strcmp(entry_point, "main_sdpa_coopmat_bf16") == 0 ||
+            strcmp(entry_point, "main_linear_int8_coop_bf16") == 0 ||
+            strcmp(entry_point,
+                   "main_linear_int8_grouped_coop_bf16") == 0;
+        int optimized_shader = cooperative_matrix_shader ||
+            strcmp(entry_point, "main_sdpa_tiled_bf16") == 0 ||
+            strcmp(entry_point, "main_sdpa_tiled_f32") == 0 ||
+            strcmp(entry_point, "main_linear_bf16") == 0 ||
+            strcmp(entry_point, "main_linear_f32_tiled") == 0;
         shaderc_compile_options_set_optimization_level(
             options, optimized_shader ? shaderc_optimization_level_performance
                                       : shaderc_optimization_level_zero);
@@ -668,7 +684,7 @@ static VkShaderModule h3_vk_compile(h3_gpu *gpu, const char *source,
         else if (layout == 3)
             shaderc_compile_options_add_macro_definition(
                 options, "H3_LS8X32", strlen("H3_LS8X32"), "1", 1);
-        if (cooperative_bf16_shader)
+        if (cooperative_matrix_shader)
             shaderc_compile_options_add_macro_definition(
                 options, "H3_COOPMAT_BF16", strlen("H3_COOPMAT_BF16"),
                 "1", 1);
@@ -733,15 +749,17 @@ static int h3_vk_create_pipelines(h3_gpu *gpu, const char *source,
         return 0;
     }
     for (int kernel = 0; kernel < H3_VK_KERNEL_COUNT; kernel++) {
-        int cooperative_bf16 =
-            kernel == H3_VK_KERNEL_SDPA_COOPMAT_BF16;
-        if (cooperative_bf16 && !gpu->has_cooperative_bf16)
+        int cooperative_matrix =
+            kernel == H3_VK_KERNEL_SDPA_COOPMAT_BF16 ||
+            kernel == H3_VK_KERNEL_LINEAR_INT8_COOP_BF16 ||
+            kernel == H3_VK_KERNEL_LINEAR_INT8_GROUPED_COOP_BF16;
+        if (cooperative_matrix && !gpu->has_cooperative_bf16)
             continue;
         VkShaderModule module = h3_vk_compile(gpu, source, source_size,
                                               h3_vk_kernel_names[kernel],
                                               h3_vk_kernel_layout[kernel]);
         if (module == VK_NULL_HANDLE) {
-            if (cooperative_bf16) {
+            if (cooperative_matrix) {
                 gpu->has_cooperative_bf16 = 0;
                 gpu->error[0] = '\0';
                 continue;
@@ -766,7 +784,7 @@ static int h3_vk_create_pipelines(h3_gpu *gpu, const char *source,
             &gpu->pipelines[kernel]);
         vkDestroyShaderModule(gpu->device, module, NULL);
         if (result != VK_SUCCESS) {
-            if (cooperative_bf16) {
+            if (cooperative_matrix) {
                 gpu->has_cooperative_bf16 = 0;
                 continue;
             }
@@ -1075,6 +1093,16 @@ int h3_gpu_has_int8_mlp(const h3_gpu *gpu) {
     return 1;
 }
 
+int h3_gpu_has_int8_streaming(const h3_gpu *gpu) {
+    (void)gpu;
+    return 1;
+}
+
+int h3_gpu_supports_host_weight_prefetch(const h3_gpu *gpu) {
+    (void)gpu;
+    return 0;
+}
+
 const char *h3_gpu_error(const h3_gpu *gpu) {
     return gpu ? gpu->error : "null gpu";
 }
@@ -1172,6 +1200,7 @@ static h3_gpu_tensor *h3_vk_tensor_new_mem(h3_gpu *gpu, size_t elements,
 
 /* One-shot staging transfer through a dedicated command buffer. */
 static int h3_vk_staging_copy(h3_gpu *gpu, VkBuffer destination,
+                              VkDeviceSize destination_offset,
                               VkBuffer source, VkDeviceSize bytes) {
     VkCommandBufferAllocateInfo alloc = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -1189,7 +1218,9 @@ static int h3_vk_staging_copy(h3_gpu *gpu, VkBuffer destination,
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
     };
-    VkBufferCopy region = { .srcOffset = 0, .dstOffset = 0, .size = bytes };
+    VkBufferCopy region = {
+        .srcOffset = 0, .dstOffset = destination_offset, .size = bytes
+    };
     vkBeginCommandBuffer(command, &begin);
     vkCmdCopyBuffer(command, source, destination, 1, &region);
     vkEndCommandBuffer(command);
@@ -1274,6 +1305,18 @@ h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements) {
 
 h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements) {
     return h3_vk_tensor_new(gpu, elements, H3_GPU_I8);
+}
+
+h3_gpu_tensor *h3_gpu_tensor_new_stream_f32(h3_gpu *gpu, size_t elements) {
+    return h3_vk_tensor_new_mem(gpu, elements, H3_GPU_F32, 1);
+}
+
+h3_gpu_tensor *h3_gpu_tensor_new_stream_bf16(h3_gpu *gpu, size_t elements) {
+    return h3_vk_tensor_new_mem(gpu, elements, H3_GPU_BF16, 1);
+}
+
+h3_gpu_tensor *h3_gpu_tensor_new_stream_i8(h3_gpu *gpu, size_t elements) {
+    return h3_vk_tensor_new_mem(gpu, elements, H3_GPU_I8, 1);
 }
 
 static h3_gpu_tensor *h3_vk_tensor_from(h3_gpu *gpu, const void *values,
@@ -1418,6 +1461,12 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
     return h3_vk_tensor_read(tensor->gpu, tensor, 0, values, elements);
 }
 
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements) {
+    if (!tensor || tensor->dtype != H3_GPU_I8) return 0;
+    return h3_vk_tensor_read(tensor->gpu, tensor, 0, values, elements);
+}
+
 static int h3_vk_tensor_write(h3_gpu *gpu, h3_gpu_tensor *tensor,
                               size_t destination_offset, const void *values,
                               size_t elements) {
@@ -1438,7 +1487,8 @@ static int h3_vk_tensor_write(h3_gpu *gpu, h3_gpu_tensor *tensor,
                             &mapped) == 0)
         return 0;
     memcpy(mapped, values, bytes);
-    int ok = h3_vk_staging_copy(gpu, tensor->buffer, staging, bytes) == 1;
+    int ok = h3_vk_staging_copy(gpu, tensor->buffer, byte_offset,
+                                staging, bytes) == 1;
     if (!ok) h3_vk_set_error(gpu, "device-local upload failed");
     h3_vk_staging_free(gpu, staging, staging_memory, mapped);
     return ok ? 1 : 0;
@@ -1509,7 +1559,7 @@ static h3_gpu_tensor *h3_vk_tensor_load(h3_gpu *gpu, const char *path,
         byte_size -= (size_t)got;
     }
     close(fd);
-    if (h3_vk_staging_copy(gpu, tensor->buffer, staging,
+    if (h3_vk_staging_copy(gpu, tensor->buffer, 0, staging,
                            tensor->byte_size) == 0) {
         h3_vk_staging_free(gpu, staging, staging_memory, mapped);
         h3_gpu_tensor_free(tensor);
@@ -1531,11 +1581,17 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
     return h3_vk_tensor_load(gpu, path, file_offset, elements, H3_GPU_F32);
 }
 
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *gpu, const char *path,
+                                     uint64_t file_offset,
+                                     size_t elements) {
+    return h3_vk_tensor_load(gpu, path, file_offset, elements, H3_GPU_I8);
+}
+
 static int h3_vk_tensor_read_file(h3_gpu *gpu, h3_gpu_tensor *tensor,
                                   const char *path, uint64_t file_offset,
                                   size_t elements, char *error,
                                   size_t error_size) {
-    if (!tensor || !elements) return 0;
+    if (!tensor || !elements || elements > tensor->elements) return 0;
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         if (error && error_size)
@@ -1568,7 +1624,7 @@ static int h3_vk_tensor_read_file(h3_gpu *gpu, h3_gpu_tensor *tensor,
     }
     close(fd);
     if (!failed && tensor->device_local)
-        failed = h3_vk_staging_copy(gpu, tensor->buffer, staging,
+        failed = h3_vk_staging_copy(gpu, tensor->buffer, 0, staging,
                                     elements *
                                         h3_vk_dtype_size(tensor->dtype)) == 0;
     if (tensor->device_local)
@@ -1594,6 +1650,14 @@ int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
      * residency. */
     return h3_gpu_tensor_read_file_bf16(tensor, path, file_offset, elements,
                                         error, error_size);
+}
+
+int h3_gpu_tensor_stream_file(h3_gpu_tensor *tensor, const char *path,
+                              uint64_t file_offset, size_t elements,
+                              char *error, size_t error_size) {
+    return tensor ? h3_vk_tensor_read_file(
+                        tensor->gpu, tensor, path, file_offset, elements,
+                        error, error_size) : 0;
 }
 
 /* ------------------------------------------------------------ commands */
@@ -1970,7 +2034,7 @@ static int h3_vk_linear(h3_gpu *gpu, h3_gpu_tensor *output,
                                         tensors, 4);
     if (set == VK_NULL_HANDLE) return 0;
     return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_BF16, set,
-                          (output_dim + 15) / 16, (rows + 15) / 16, 1);
+                          (output_dim + 63) / 64, (rows + 63) / 64, 1);
 }
 
 int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -2642,13 +2706,16 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     gpu->args->input_dim = input_dim;
     gpu->args->output_dim = output_dim;
     gpu->args->has_bias = bias ? 1u : 0u;
+    h3_vk_kernel kernel = getenv("H3_DISABLE_VK_TILED_F32") ?
+        H3_VK_KERNEL_LINEAR_F32 : H3_VK_KERNEL_LINEAR_F32_TILED;
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     const h3_gpu_tensor *tensors[4] = { input, weight, bias_buffer, output };
-    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_F32, tensors,
-                                        4);
+    VkDescriptorSet set = h3_vk_prepare(gpu, kernel, tensors, 4);
     if (set == VK_NULL_HANDLE) return 0;
-    return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_F32, set,
-                          (output_dim + 15) / 16, (rows + 15) / 16, 1);
+    uint32_t tile = kernel == H3_VK_KERNEL_LINEAR_F32_TILED ? 64u : 16u;
+    return h3_vk_dispatch(gpu, kernel, set,
+                          (output_dim + tile - 1) / tile,
+                          (rows + tile - 1) / tile, 1);
 }
 
 static int h3_vk_copy(h3_gpu *gpu, h3_gpu_tensor *destination,
@@ -2743,14 +2810,21 @@ int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     gpu->args->width = heads;
     gpu->args->input_dim = head_dim;
     gpu->args->left_scale = scale;
-    /* Long sequences use the flash kernel; short ones keep the naive
-     * one-thread-per-output kernel, matching the BF16 policy. */
-    h3_vk_kernel kernel = (sequence >= 128 && head_dim <= 128) ?
-        H3_VK_KERNEL_SDPA_FLASH_F32 : H3_VK_KERNEL_SDPA_F32;
+    gpu->args->grouped = 0;
+    int flash = head_dim <= 128 &&
+        (sequence >= 128 || getenv("H3_FORCE_VK_TILED_SDPA_F32"));
+    const char *disable_tiled = getenv("H3_DISABLE_VK_TILED_SDPA_F32");
+    int tiled = flash && !(disable_tiled && *disable_tiled &&
+                           strcmp(disable_tiled, "0") != 0);
+    h3_vk_kernel kernel = tiled ? H3_VK_KERNEL_SDPA_TILED_F32 :
+                          flash ? H3_VK_KERNEL_SDPA_FLASH_F32 :
+                                  H3_VK_KERNEL_SDPA_F32;
     const h3_gpu_tensor *tensors[4] = { query, key, value, output };
     VkDescriptorSet set = h3_vk_prepare(gpu, kernel, tensors, 4);
     if (set == VK_NULL_HANDLE) return 0;
-    return h3_vk_dispatch(gpu, kernel, set, heads, sequence, 1);
+    return tiled ?
+        h3_vk_dispatch(gpu, kernel, set, (sequence + 15) / 16, heads, 1) :
+        h3_vk_dispatch(gpu, kernel, set, heads, sequence, 1);
 }
 
 int h3_gpu_swiglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -3083,12 +3157,14 @@ int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     gpu->args->input_dim = head_dim;
     gpu->args->left_scale = scale;
     gpu->args->conv_batch = batch;
+    int use_flash = head_dim <= 256 &&
+        (sequence >= 128 || getenv("H3_FORCE_CAUSAL_FLASH"));
+    h3_vk_kernel kernel = use_flash ? H3_VK_KERNEL_SDPA_CAUSAL_FLASH_F32 :
+                                      H3_VK_KERNEL_SDPA_CAUSAL_F32;
     const h3_gpu_tensor *tensors[4] = { query, key, value, output };
-    VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_SDPA_CAUSAL_F32,
-                                        tensors, 4);
+    VkDescriptorSet set = h3_vk_prepare(gpu, kernel, tensors, 4);
     if (set == VK_NULL_HANDLE) return 0;
-    return h3_vk_dispatch(gpu, H3_VK_KERNEL_SDPA_CAUSAL_F32, set, heads,
-                          sequence, batch);
+    return h3_vk_dispatch(gpu, kernel, set, heads, sequence, batch);
 }
 
 int h3_gpu_audio_attention_pool_f32(h3_gpu *gpu,
@@ -3219,8 +3295,8 @@ int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
     if (set == VK_NULL_HANDLE) return 0;
     uint32_t planes = batch * output_depth * output_height;
     return h3_vk_dispatch(gpu, H3_VK_KERNEL_CONV3D_F32, set,
-                          (output_width + 15) / 16, (output_height + 15) / 16,
-                          planes);
+                          (output_width + 15) / 16,
+                          (output_channels + 15) / 16, planes);
 }
 
 int h3_gpu_vae_encoder_group_norm_silu_f32(
@@ -3331,6 +3407,28 @@ int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
     return h3_vk_dispatch(gpu, H3_VK_KERNEL_QUANTIZE_ROWS_BF16_I8, set,
                           rows, 1, 1);
 }
+static int h3_vk_int8_cooperative_enabled(const h3_gpu *gpu) {
+    const char *disable = getenv("H3_DISABLE_VK_COOPMAT_INT8");
+    return gpu->has_cooperative_bf16 &&
+        !(disable && *disable && strcmp(disable, "0") != 0);
+}
+
+static int h3_vk_linear_int8_dispatch(
+    h3_gpu *gpu, const h3_gpu_tensor *const tensors[5], uint32_t rows,
+    uint32_t output_dim) {
+    int cooperative = h3_vk_int8_cooperative_enabled(gpu);
+    h3_vk_kernel kernel = cooperative ?
+        H3_VK_KERNEL_LINEAR_INT8_COOP_BF16 :
+        H3_VK_KERNEL_LINEAR_INT8_BF16;
+    VkDescriptorSet set = h3_vk_prepare(gpu, kernel, tensors, 5);
+    if (set == VK_NULL_HANDLE) return 0;
+    return cooperative ?
+        h3_vk_dispatch(gpu, kernel, set, (output_dim + 127) / 128,
+                       (rows + 15) / 16, 1) :
+        h3_vk_dispatch(gpu, kernel, set, (output_dim + 31) / 32,
+                       (rows + 31) / 32, 1);
+}
+
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,
@@ -3374,12 +3472,7 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     {
         const h3_gpu_tensor *l[5] = { quantized_input, weight, input_scales,
                                       weight_scales, output };
-        VkDescriptorSet set = h3_vk_prepare(
-            gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, l, 5);
-        if (set == VK_NULL_HANDLE) return 0;
-        return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
-                              (output_dim + 7) / 8,
-                              (rows + 31) / 32, 1);
+        return h3_vk_linear_int8_dispatch(gpu, l, rows, output_dim);
     }
 }
 int h3_gpu_linear_int8_head_major_bf16(
@@ -3432,12 +3525,7 @@ int h3_gpu_linear_int8_head_major_bf16(
     {
         const h3_gpu_tensor *l[5] = { quantized_input, weight, input_scales,
                                       weight_scales, output };
-        VkDescriptorSet set = h3_vk_prepare(
-            gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, l, 5);
-        if (set == VK_NULL_HANDLE) return 0;
-        return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
-                              (output_dim + 7) / 8,
-                              (rows + 31) / 32, 1);
+        return h3_vk_linear_int8_dispatch(gpu, l, rows, output_dim);
     }
 }
 
@@ -3516,10 +3604,10 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                                       activated };
         VkDescriptorSet set = h3_vk_prepare(
             gpu, H3_VK_KERNEL_FC1_SWIGLU_INT8_BF16, f, 5);
-        if (set == VK_NULL_HANDLE) return 0;
-        if (h3_vk_dispatch(gpu, H3_VK_KERNEL_FC1_SWIGLU_INT8_BF16, set,
-                           (hidden_dim + 7) / 8,
-                           (rows + 31) / 32, 1) == 0)
+        if (set == VK_NULL_HANDLE ||
+            !h3_vk_dispatch(gpu, H3_VK_KERNEL_FC1_SWIGLU_INT8_BF16, set,
+                            (hidden_dim + 31) / 32,
+                            (rows + 31) / 32, 1))
             return 0;
     }
     if (use_int8_row_fc2) {
@@ -3544,12 +3632,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
             const h3_gpu_tensor *l[5] = { quantized_activation, fc2_weight,
                                           activation_scales, fc2_scales,
                                           output };
-            VkDescriptorSet set = h3_vk_prepare(
-                gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, l, 5);
-            if (set == VK_NULL_HANDLE) return 0;
-            return h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
-                                  (output_dim + 7) / 8,
-                                  (rows + 31) / 32, 1);
+            return h3_vk_linear_int8_dispatch(gpu, l, rows, output_dim);
         }
     }
     /* Default grouped FC2 (Metal grouped_nax path): one max-abs scale per
@@ -3577,12 +3660,18 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
     {
         const h3_gpu_tensor *l[5] = { quantized_activation, fc2_weight,
                                       activation_scales, fc2_scales, output };
-        VkDescriptorSet set = h3_vk_prepare(
-            gpu, H3_VK_KERNEL_LINEAR_INT8_GROUPED_BF16, l, 5);
+        int cooperative = rows >= 1024 &&
+            h3_vk_int8_cooperative_enabled(gpu);
+        h3_vk_kernel kernel = cooperative ?
+            H3_VK_KERNEL_LINEAR_INT8_GROUPED_COOP_BF16 :
+            H3_VK_KERNEL_LINEAR_INT8_GROUPED_BF16;
+        VkDescriptorSet set = h3_vk_prepare(gpu, kernel, l, 5);
         if (set == VK_NULL_HANDLE) return 0;
-        return h3_vk_dispatch(
-            gpu, H3_VK_KERNEL_LINEAR_INT8_GROUPED_BF16, set,
-            (output_dim + 7) / 8, (rows + 31) / 32, 1);
+        return cooperative ?
+            h3_vk_dispatch(gpu, kernel, set, (output_dim + 127) / 128,
+                           (rows + 15) / 16, 1) :
+            h3_vk_dispatch(gpu, kernel, set, (output_dim + 15) / 16,
+                           (rows + 31) / 32, 1);
     }
 }
 
@@ -3767,12 +3856,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     {
         const h3_gpu_tensor *l[5] = { quantized_input, weight, input_scales,
                                       weight_scales, qkv_scratch };
-        VkDescriptorSet set = h3_vk_prepare(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16,
-                                            l, 5);
-        if (set == VK_NULL_HANDLE) return 0;
-        if (h3_vk_dispatch(gpu, H3_VK_KERNEL_LINEAR_INT8_BF16, set,
-                           (inner * 3 + 7) / 8, (rows + 31) / 32, 1) == 0)
-            return 0;
+        if (!h3_vk_linear_int8_dispatch(gpu, l, rows, inner * 3)) return 0;
     }
     return h3_gpu_grouped_qkv_rope_bf16(
         gpu, query, key, value, qkv_scratch, q_norm, k_norm, rope_cos,

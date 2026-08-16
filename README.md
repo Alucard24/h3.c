@@ -652,6 +652,20 @@ the same seed with the defaults and then with `--ssd-streaming`, which disables
 all three int8 projection paths; quantization can change fine details even
 after layout and scaling are correct.
 
+### Vulkan performance TODO
+
+The remaining high-impact work is concentrated outside the already optimized
+attention path:
+
+- [ ] Retile Video/Audio VAE `Conv3D`, `Conv1D`, and transposed convolution
+  around shared-memory reuse and cooperative operations.
+- [ ] Overlap INT8 SSD reads and device uploads with the current DiT block by
+  using a transfer queue, ring staging buffers, and timeline semaphores.
+- [ ] Move fused INT8 FC1/SwiGLU and grouped FC2 completely onto cooperative
+  matrices while preserving exact int32 accumulation and BF16 boundaries.
+- [ ] Fuse quantization, GEMM dequantization, activations, and residual
+  epilogues to reduce dispatches, barriers, and VRAM round trips.
+
 ## Implementation and performance notes
 
 The remainder documents the implementation behind the tutorial presets and the
